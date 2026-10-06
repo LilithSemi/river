@@ -125,8 +125,8 @@ packages:
     dependency: "direct overridden"
     description:
       path: "packages/harbor"
-      ref: HEAD
-      resolved-ref: "0cb487c1e56946a75eec9e7e52deffdf7da4bc2b"
+      ref: "9bc45720901ff61694c08ff3b197f6d88e444ef8"
+      resolved-ref: "9bc45720901ff61694c08ff3b197f6d88e444ef8"
       url: "https://git.lilithsemi.com/LilithSemi/harbor"
     source: git
     version: "0.0.1"
