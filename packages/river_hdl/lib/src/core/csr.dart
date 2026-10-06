@@ -19,6 +19,7 @@ class RiscVMstatusCsr extends CsrConfig {
   // popped on trap/MRET.
   RiscVMstatusCsr({
     bool sup = false,
+    bool mprv = false,
     bool sum = false,
     bool mxr = false,
     bool fp = false,
@@ -79,6 +80,13 @@ class RiscVMstatusCsr extends CsrConfig {
                start: 13,
                width: 2,
                name: 'fs',
+               access: CsrFieldAccess.readWrite,
+             ),
+           if (mprv)
+             CsrFieldConfig(
+               start: 17,
+               width: 1,
+               name: 'mprv',
                access: CsrFieldAccess.readWrite,
              ),
            if (sum)
@@ -615,6 +623,9 @@ class RiscVCsrFile extends Module {
       CsrInstanceConfig(
         arch: RiscVMstatusCsr(
           sup: hasSupervisor,
+          // H effective-context selection is not implemented yet. Preserve its
+          // existing read-only-zero MPRV rather than advertise partial support.
+          mprv: hasUser && !hasHypervisor,
           sum: hasSum,
           mxr: hasMxr,
           fp: _hasFloat,
@@ -622,7 +633,7 @@ class RiscVCsrFile extends Module {
           hyp: hasHypervisor,
         ),
         addr: CsrAddress.mstatus.address,
-        resetValue: 0,
+        resetValue: !hasHypervisor && !hasUser ? 3 << 11 : 0,
         width: mxlen.size,
         // Hardware-written on trap entry / xRET; wrEn driven in _wireTrapState.
         isBackdoorWritable: true,
@@ -1257,6 +1268,20 @@ class RiscVCsrFile extends Module {
 
   Logic _maskWriteData(Logic addr12, Logic data) {
     Logic out = data;
+    if (!hasHypervisor) {
+      final mpp = data.slice(12, 11);
+      final legalMpp =
+          mpp.eq(3) |
+          (hasSupervisor ? mpp.eq(1) : Const(0)) |
+          (hasUser ? mpp.eq(0) : Const(0));
+      // WARL policy: reserved or unimplemented privileges become M, never an
+      // unchecked privilege encoding at the data-port permission boundary.
+      out = mux(
+        addr12.eq(CsrAddress.mstatus.address),
+        data.withSet(11, mux(legalMpp, mpp, Const(3, width: 2))),
+        data,
+      );
+    }
 
     // *tvec BASE is the full XLEN address (bits [xlen-1:2]); only the 2-bit MODE
     // field [1:0] is WARL (River implements direct=0). A 0xFFFFFFFC literal here
@@ -1609,7 +1634,9 @@ class RiscVCsrFile extends Module {
     final mRet = mcur
         .withSet(3, mcur[7]) // MIE <- MPIE
         .withSet(7, Const(1, width: 1)) // MPIE <- 1
-        .withSet(11, Const(0, width: 2)); // MPP <- U
+        .withSet(11, Const(!hasHypervisor && !hasUser ? 3 : 0, width: 2))
+        // Use the OLD MPP: MRET to M preserves MPRV even as MPP is reset.
+        .withSet(17, mux(mcur.slice(12, 11).eq(3), mcur[17], Const(0)));
 
     mepcBd.wrEn! <= trapToM;
     mepcBd.wrData! <= _trapPc!;
@@ -1646,7 +1673,8 @@ class RiscVCsrFile extends Module {
       final sRet = mcur
           .withSet(1, mcur[5]) // SIE <- SPIE
           .withSet(5, Const(1, width: 1)) // SPIE <- 1
-          .withSet(8, Const(0, width: 1)); // SPP <- U
+          .withSet(8, Const(0, width: 1)) // SPP <- U
+          .withSet(17, Const(0)); // Every successful SRET returns below M.
 
       // One writer for the one register. A trap and an xRET never retire in the
       // same cycle, so the priority order here only breaks a tie that cannot

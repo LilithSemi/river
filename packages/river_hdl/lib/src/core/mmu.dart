@@ -56,7 +56,8 @@ class RiverMmu extends Module {
     Logic? virtIn,
     Logic? gMode,
     Logic? gRoot,
-    Logic? privMode, // current effective privilege (for U-bit/SUM checks)
+    Logic? privMode, // actual instruction-fetch privilege
+    Logic? dataPrivMode, // effective data privilege; defaults to privMode
     Logic? sum, // mstatus.SUM (supervisor may access user pages)
     Logic? mxr, // mstatus.MXR (loads may read execute-only pages)
     // When true, instruction fetches below machine mode are translated through
@@ -113,6 +114,9 @@ class RiverMmu extends Module {
     // Privilege/permission inputs for leaf checks (U-bit, SUM, MXR). When not
     // wired, the leaf check falls back to R/W only (the pre-existing behavior).
     final priv = privMode == null ? null : addInput('priv', privMode, width: 3);
+    final dataPriv = dataPrivMode == null
+        ? priv
+        : addInput('dataPriv', dataPrivMode, width: 3);
     final sumIn = sum == null ? null : addInput('sum', sum);
     final mxrIn = mxr == null ? null : addInput('mxr', mxr);
     final tlbFlushIn = tlbFlush == null
@@ -236,9 +240,9 @@ class RiverMmu extends Module {
     final satpShadowRoot = Logic(name: 'satpShadowRoot', width: xlen);
     // Shadow of the privilege mode, to detect a context switch for DTLBFC.
     final privShadow = Logic(name: 'privShadow', width: 3);
-    final privChanged = priv == null
+    final privChanged = dataPriv == null
         ? Const(0)
-        : priv.neq(privShadow).named('privChanged');
+        : dataPriv.neq(privShadow).named('privChanged');
 
     // G-stage (hypervisor second-stage) walk state. Under two-stage, every
     // VS-stage bus address (`walkAddr`) is guest-physical and must be G-walked
@@ -303,7 +307,15 @@ class RiverMmu extends Module {
         pte[1] | (mxrEff & pte[3]), // read -> R | (MXR & X)
       );
       final permOk = mux(isFetch, pte[3], dataPerm); // fetch -> X
-      final privEff = atPriv ?? priv;
+      final privEff =
+          atPriv ??
+          (priv == null && dataPriv == null
+              ? null
+              : mux(
+                  isFetch,
+                  priv ?? Const(3, width: 3),
+                  dataPriv ?? Const(3, width: 3),
+                ));
       if (privEff == null) return ~permOk;
       final isUser = privEff.eq(Const(PrivilegeMode.user.id, width: 3));
       final isSup = privEff.eq(Const(PrivilegeMode.supervisor.id, width: 3));
@@ -373,20 +385,12 @@ class RiverMmu extends Module {
               priv.neq(Const(PrivilegeMode.machine.id, width: 3)) &
               (virtIn == null ? Const(1) : ~virtIn));
 
-    // Data (load/store) translation is ALSO off in machine mode. River does not
-    // implement mstatus.MPRV, so the effective data privilege is just the
-    // current privilege: an M-mode load/store is always physical. Without this
-    // gate, once supervisor enables paging (satp.MODE != 0) an M-mode access
-    // (e.g. the SBI firmware restoring its own stack in a trap handler) would be
-    // walked through the SUPERVISOR page tables - its physical address is not a
-    // valid supervisor VA, so the walk faults or the bus access never returns
-    // and the core hangs. The one M-mode exception is an explicit virtualized
-    // access (HLV/HSV): those carry [virtIn] and must translate through the
-    // guest tables regardless of the current privilege, so OR virtIn back in.
-    final dataPagingOn = priv == null
+    // MPRV can select S/U data translation while fetch remains physical in M.
+    // Retain the existing HLV/HSV override for callers using guest accesses.
+    final dataPagingOn = dataPriv == null
         ? pagingOn
         : (pagingOn &
-              (priv.neq(Const(PrivilegeMode.machine.id, width: 3)) |
+              (dataPriv.neq(Const(PrivilegeMode.machine.id, width: 3)) |
                   (virtIn ?? Const(0))));
 
     // Fetch-TLB lookup for the requested fetch address.
@@ -534,7 +538,7 @@ class RiverMmu extends Module {
           dpFaultGuestR < 0,
           ifFaultR < 0,
           justCompleted < 0,
-          privShadow < (priv ?? Const(0, width: 3)),
+          privShadow < (dataPriv ?? Const(0, width: 3)),
           // Track satp so the fetch-TLB self-invalidates when it changes, and
           // flush it on sfence.vma (tlbFlushIn).
           if (hasPaging) ...[
@@ -657,7 +661,9 @@ class RiverMmu extends Module {
                         wbDatMiso,
                         isFetchWalk,
                         reqWe,
-                        atPriv: priv == null ? null : reqPriv,
+                        atPriv: priv == null && dataPriv == null
+                            ? null
+                            : reqPriv,
                         atSum: sumIn == null ? null : reqSum,
                         atMxr: mxrIn == null ? null : reqMxr,
                       ),
@@ -941,7 +947,7 @@ class RiverMmu extends Module {
                         // Freeze the privilege state this access was made at,
                         // so the leaf check at the end of the walk judges the
                         // requester and not whoever is running by then.
-                        reqPriv < (priv ?? Const(0, width: 3)),
+                        reqPriv < (dataPriv ?? Const(3, width: 3)),
                         reqSum < (sumIn ?? Const(0)),
                         reqMxr < (mxrIn ?? Const(0)),
                         walkArmed < 1,
@@ -1027,7 +1033,7 @@ class RiverMmu extends Module {
                         reqSize < Const(3, width: 3),
                         // See the data port above: the fetch is judged by the
                         // privilege it was requested at.
-                        reqPriv < (priv ?? Const(0, width: 3)),
+                        reqPriv < (priv ?? Const(3, width: 3)),
                         reqSum < (sumIn ?? Const(0)),
                         reqMxr < (mxrIn ?? Const(0)),
                         walkArmed < 1,
@@ -1075,13 +1081,11 @@ class RiverMmu extends Module {
     //
     //   bit 0  everUser       the core was in user mode at all
     //   bit 1  userWalk       it was in user mode while a page-table walk ran
-    //   bit 2  latchMismatch  a walk accepted in user mode returned its leaf
-    //                         while the core was no longer in user mode. This
-    //                         is the EXACT condition under which the
-    //                         grant-time privilege latch judges an access
-    //                         differently from the live-privilege check it
-    //                         replaced.
-    //   bit 3  userFault      such a walk actually raised a page fault
+    //   bit 2  latchMismatch  a walk accepted at effective U privilege returned
+    //                         its leaf while the live access privilege was no
+    //                         longer U (including MPRV/MPP changes).
+    //   bit 3  userFault      an effective-U walk raised a page fault
+    // Bits 0/1 track actual execution mode, not MPRV data privilege.
     //
     // It is a SEPARATE sequential block on purpose: it adds no input to the
     // walk FSM's condition cone, so it cannot slow down the logic it measures.
@@ -1106,7 +1110,11 @@ class RiverMmu extends Module {
           orElse: [
             If(priv.eq(userId), then: [everUser < 1]),
             If(priv.eq(userId) & walking, then: [userWalk < 1]),
-            If(acceptedInUser & priv.neq(userId), then: [latchMismatch < 1]),
+            If(
+              acceptedInUser &
+                  mux(isFetchWalk, priv, dataPriv ?? priv).neq(userId),
+              then: [latchMismatch < 1],
+            ),
             If(
               acceptedInUser &
                   leafPermFault(

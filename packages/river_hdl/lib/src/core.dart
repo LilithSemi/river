@@ -302,6 +302,7 @@ class RiverCore extends BridgeModule {
 
     final enableMxr = Logic(name: 'enableMxr');
     final enableSum = Logic(name: 'enableSum');
+    final effectiveDataPriv = Logic(name: 'effectiveDataPriv', width: 3);
     // DTLBFC (rpipelinectl[3]): drives the MMU's flush-data-TLB-on-priv-change.
     // Forward-declared here, driven from the CSR file below (mirrors enableMxr).
     final dtlbFlushOnPriv = Logic(name: 'dtlbFlushOnPriv');
@@ -426,12 +427,10 @@ class RiverCore extends BridgeModule {
     // does not flush the cache on every trap, which whole-cache invalidation on
     // a privilege change would.
     //
-    // Fetch permission depends on the privilege mode only. A load also depends
-    // on sstatus.SUM, so the D-cache carries that bit too. Two mode bits
-    // separate U (0), S (1) and M (3), which matters as well because machine
-    // mode is untranslated and its addresses are physical. sstatus.SUM only
-    // exists with the CSR file, so drop that bit when there is none: the
-    // privilege bits alone are still correct, just coarser.
+    // Fetch uses actual privilege; data uses effective privilege and, for
+    // non-H cores, SUM/MXR. Two privilege bits separate U (0), S (1) and M (3),
+    // including translated S/U addresses from physical M addresses. Without
+    // CSRs the permission controls are tied low.
     final privContext =
         (useICache || useDCache) && (config.hasSupervisor || config.hasUser);
     Logic? iCtx;
@@ -439,15 +438,14 @@ class RiverCore extends BridgeModule {
     if (privContext) {
       final privTag = mode.slice(1, 0);
       iCtx = virt == null ? privTag : [virt, privTag].swizzle();
-      // sstatus.SUM is deliberately left out. It only separates an S-mode access
-      // made with SUM set from one made with SUM clear, which is a narrow
-      // permission hole and not a data-corruption path for a correct kernel. The
-      // privilege bits alone catch the case that corrupts Linux, where a kernel
-      // virtual address and a user virtual address share a tag because the tag
-      // holds no address bit above 31. Each tag bit widens the comparator, and
-      // that comparator is this core's FPGA critical path, so the bit is not
-      // free: including SUM measurably hurt routing on xc7s50.
-      dCtx = [if (guestAccessWire != null) guestAccessWire, privTag].swizzle();
+      // A data hit bypasses the MMU. A change to MPRV/MPP, SUM or MXR must
+      // therefore miss under the old authorization, without a software fence.
+      // H keeps its existing context until guest permission selection is wired.
+      dCtx = [
+        if (guestAccessWire != null) guestAccessWire,
+        if (!config.hasHypervisor) ...[enableSum, enableMxr],
+        effectiveDataPriv.slice(1, 0),
+      ].swizzle();
     }
 
     // Significant low address bits BOTH L1 caches must tag on.
@@ -565,6 +563,7 @@ class RiverCore extends BridgeModule {
       gMode: config.hasHypervisor ? gModeWire : null,
       gRoot: config.hasHypervisor ? gRootWire : null,
       privMode: config.mmu.hasPaging ? mode : null,
+      dataPrivMode: config.mmu.hasPaging ? effectiveDataPriv : null,
       sum: config.mmu.hasPaging ? enableSum : null,
       mxr: config.mmu.hasPaging ? enableMxr : null,
       // Translate instruction fetches (below M-mode). The icache is VIRTUALLY
@@ -1134,11 +1133,24 @@ class RiverCore extends BridgeModule {
               Const(config.mxlen.satpPpnMask, width: config.mxlen.size));
     }
 
+    // MPRV is an access override, not an actual-M-mode-only permission bit.
+    // H deliberately retains read-only-zero MPRV pending MPV/VS integration.
+    effectiveDataPriv <=
+        (csrs == null || config.hasHypervisor
+            ? mode
+            : mux(
+                csrs.mstatus[17],
+                csrs.mstatus.slice(12, 11).zeroExtend(3),
+                mode,
+              ));
     if (csrs != null) {
       enableMxr <=
           ((csrs.mstatus >> 19) & Const(1, width: config.mxlen.size)).neq(0);
       enableSum <=
           ((csrs.mstatus >> 18) & Const(1, width: config.mxlen.size)).neq(0);
+    } else {
+      enableMxr <= Const(0);
+      enableSum <= Const(0);
     }
     // DTLBFC bit (rpipelinectl[3]) -> MMU data-TLB priv-change flush.
     dtlbFlushOnPriv <= (csrs == null ? Const(0) : csrs.rpipelinectl[3]);
