@@ -373,8 +373,12 @@ class RiverCore extends BridgeModule {
     );
     final dportSize = mux(execWriteActive, writeLog2Size, Const(2, width: 3));
 
-    // Wishbone ACK/MISO from external bus
+    // Wishbone responses from the external bus
     final wbAckExt = Logic(name: 'wbAckExt');
+    final wbErrExt = Logic(name: 'wbErrExt');
+    // OoO still needs fault addresses carried through the ROB and precise
+    // store-queue retirement. Preserve its existing ERR behavior for now.
+    final handleAccessFaults = config.executionMode == ExecutionMode.inOrder;
     final wbDatMisoExt = Logic(name: 'wbDatMisoExt', width: wbConfig.dataWidth);
 
     // Fetch arbiter (dual-dispatch): multiplex the two fetch lanes onto the
@@ -510,6 +514,7 @@ class RiverCore extends BridgeModule {
     // into the marginal PHY.
     final dcMemDone = Logic(name: 'dcMemDone');
     final dcMemValid = Logic(name: 'dcMemValid');
+    final dcMemFault = Logic(name: 'dcMemFault');
     final dcMemRdata = Logic(name: 'dcMemRdata', width: config.mxlen.size);
     final dFlush = Logic(name: 'dFlush');
     HarborL1DCache? dcache;
@@ -519,6 +524,7 @@ class RiverCore extends BridgeModule {
         xlen: config.mxlen.size,
         ctxBits: dCtx?.width ?? 0,
         reqAddrBits: l1AddrBits,
+        memFaultIn: dcMemFault,
         target: target,
       );
       addSubModule(dcache);
@@ -557,6 +563,7 @@ class RiverCore extends BridgeModule {
       wbDatMisoExt,
       mmuConfig: config.mmu,
       busConfig: wbConfig,
+      wbErr: wbErrExt,
       satpMode: config.mmu.hasPaging ? satpModeWire : null,
       satpRoot: config.mmu.hasPaging ? satpRootWire : null,
       virtIn: config.hasHypervisor ? guestAccessWire : null,
@@ -640,11 +647,12 @@ class RiverCore extends BridgeModule {
       // acknowledges the write-through).
       dcMemDone <= mmu.dportDone;
       dcMemValid <= mmu.dportValid;
+      dcMemFault <= mmu.dportFault;
       dcMemRdata <= mmu.dportRdata;
       // A faulting access is delivered as done AND NOT valid, the same contract
-      // the no-D-cache path below uses, so the exec unit raises a load/store
-      // page fault. done and valid were BOTH driven from respValid here, which
-      // made `done & ~valid` structurally impossible: the core could not report
+      // the no-D-cache path below uses. Response metadata selects a page or
+      // access fault. Previously, done and valid were BOTH driven from respValid,
+      // making `done & ~valid` structurally impossible: the core could not report
       // a data page fault at all while the D-cache was in the path, and the
       // cache's fill/bypass FSM hung on the faulting access anyway. A NULL
       // pointer dereference froze the machine instead of trapping.
@@ -679,6 +687,7 @@ class RiverCore extends BridgeModule {
     wb.datMosi <= mmu.wbDatMosi;
     wb.sel <= mmu.wbSel;
     wbAckExt <= wb.ack;
+    wbErrExt <= (handleAccessFaults ? (wb.err ?? Const(0)) : Const(0));
     wbDatMisoExt <= wb.datMiso;
 
     // Logic-analyzer bus taps: mirror the consumer-direction signals (ACK, read
@@ -1552,6 +1561,16 @@ class RiverCore extends BridgeModule {
       mstateen0Se0: csrs?.mstateen0Se0,
       hstateen0Se0: csrs?.hstateen0Se0,
       memFaultGuest: config.hasHypervisor ? mmu.dportFaultGuest : null,
+      memAccessFault: !handleAccessFaults
+          ? null
+          : (useDCache
+                ? dcache!.respFaultIsAccess
+                : mmu.dportDone & ~mmu.dportValid & ~mmu.dportFault),
+      ifetchAccessFault: !handleAccessFaults
+          ? null
+          : (useICache
+                ? icache!.respFaultIsAccess
+                : mmu.ifetchDone & ~mmu.ifetchValid & ~mmu.ifetchFault),
       specCtl: csrs?.rpipelinectl.getRange(0, 4),
       prfSeedEn: prfSeedModeIn == null ? null : (prfSeedModeIn & rdWrite.en),
       prfSeedAddr: prfSeedModeIn == null ? null : rdWrite.addr,

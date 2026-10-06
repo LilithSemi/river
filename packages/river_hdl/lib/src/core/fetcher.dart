@@ -48,6 +48,9 @@ class FetchUnit extends Module {
     // instruction-fetch translation faults). When wired, a faulting read is
     // delivered as done & ~valid with `fetch_fault` set instead of retried.
     Logic? fault,
+    // Physical access fault, sampled with a failed completion and retained
+    // through decode/execute just like the aggregate fetch_fault marker.
+    Logic? accessFault,
     super.name = 'river_fetch_unit',
   }) {
     clk = addInput('clk', clk);
@@ -74,7 +77,9 @@ class FetchUnit extends Module {
     final strideIn = stride != null
         ? addInput('stride', stride, width: pc.width)
         : null;
-    final faultIn = fault == null ? Const(0) : addInput('fault', fault);
+    final accessFaultIn = addInput('access_fault', accessFault ?? Const(0));
+    final faultIn =
+        (fault == null ? Const(0) : addInput('fault', fault)) | accessFaultIn;
 
     memRead = memRead.clone()
       ..connectIO(
@@ -91,6 +96,20 @@ class FetchUnit extends Module {
     addOutput('result', width: 32);
     addOutput('pc_out', width: pc.width);
     addOutput('fetch_fault');
+    final accessFaulted = Logic(name: 'accessFaulted');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [accessFaulted < 0],
+        orElse: [
+          If(
+            memRead.en & memRead.done & ~memRead.valid,
+            then: [accessFaulted < accessFaultIn],
+          ),
+        ],
+      ),
+    ]);
+    addOutput('fetch_access_fault') <= output('fetch_fault') & accessFaulted;
 
     final dataW = memRead.data.width;
     final fetchAlignBits = switch (dataW) {

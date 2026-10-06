@@ -534,9 +534,12 @@ abstract class ExecutionUnit extends Module {
     Logic? hstateen0Se0,
     Logic? memFaultGuest,
     // Asserted when the instruction at currentPc could not be fetched because
-    // its translation faulted. The cycle raises instructionPageFault instead of
-    // executing (there is no instruction).
+    // an instruction access or translation fault occurred. The cycle traps
+    // instead of executing (there is no instruction).
     Logic? fetchFault,
+    // Access/page classification paired with the faulting fetch or data response.
+    Logic? fetchAccessFault,
+    Logic? memAccessFault,
     // Floating-point register ports. The FP register file belongs in the core
     // module next to the integer file, which is where the device target is
     // known and where a BRAM backend can be selected. When these are supplied
@@ -563,6 +566,11 @@ abstract class ExecutionUnit extends Module {
     this.currentMode = addInput('currentMode', currentMode, width: 3);
     currentMode = this.currentMode;
 
+    _fetchAccessFault = addInput(
+      'fetchAccessFault',
+      fetchAccessFault ?? Const(0),
+    );
+    _memAccessFault = addInput('memAccessFault', memAccessFault ?? Const(0));
     final fetchFaultIn = fetchFault == null
         ? Const(0)
         : addInput('fetchFault', fetchFault);
@@ -1190,7 +1198,7 @@ abstract class ExecutionUnit extends Module {
               output('returnLevel') < 0,
               output('memGuest') < 0,
               // A fetch fault means there is no instruction to run: raise an
-              // instruction page fault at currentPc (the faulting PC) instead.
+              // instruction fault at currentPc (the faulting PC) instead.
               // An async interrupt is taken only at a CLEAN instruction boundary:
               // mopStep==0 AND no memory or register-write side effect is in
               // flight. mopStep==0 alone is NOT a clean boundary. An atomic runs
@@ -1551,9 +1559,26 @@ abstract class ExecutionUnit extends Module {
     ];
   }
 
+  late final Logic _fetchAccessFault;
+  late final Logic _memAccessFault;
+
   List<Conditional> doTrap(Trap t, [Logic? tval, String? suffix]) {
     final trapInterrupt = Const(t.interrupt ? 1 : 0);
-    final causeCode = Const(t.causeCode, width: 6);
+    final accessCause = switch (t) {
+      Trap.instructionPageFault => Trap.instructionAccessFault,
+      Trap.loadPageFault => Trap.loadAccess,
+      Trap.storePageFault => Trap.storeAccess,
+      _ => null,
+    };
+    final causeCode = accessCause == null
+        ? Const(t.causeCode, width: 6)
+        : mux(
+            t == Trap.instructionPageFault
+                ? _fetchAccessFault
+                : _memAccessFault,
+            Const(accessCause.causeCode, width: 6),
+            Const(t.causeCode, width: 6),
+          );
     return rawTrap(trapInterrupt, causeCode, tval, suffix);
   }
 
@@ -1608,6 +1633,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.hstateen0Se0,
     super.memFaultGuest,
     super.fetchFault,
+    super.fetchAccessFault,
+    super.memAccessFault,
     super.fpRs1Port,
     super.fpRs2Port,
     super.fpRdPort,
@@ -2552,7 +2579,10 @@ class DynamicExecutionUnit extends ExecutionUnit {
               ),
               If(
                 memRead.done & ~memRead.valid,
-                then: doTrap(Trap.loadPageFault, opBase + imm),
+                then: [
+                  memRead.en < 0,
+                  ...doTrap(Trap.loadPageFault, opBase + imm),
+                ],
               ),
             ]),
             // Load-reserved: commit rd = sign-extended loaded value, arm the
@@ -2625,7 +2655,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
               ),
               If(
                 memRead.done & ~memRead.valid,
-                then: [memRead.en < 0, ...doTrap(Trap.loadPageFault, opBase)],
+                // Both halves belong to the original store/AMO instruction.
+                then: [memRead.en < 0, ...doTrap(Trap.storePageFault, opBase)],
               ),
             ]),
           ]),
@@ -2753,7 +2784,9 @@ class DynamicExecutionUnit extends ExecutionUnit {
               then: doTrap(Trap.illegal),
             ),
           ]),
-        Iff((mopStep - 1).lt(mopCount), [
+        // A terminal fault may wait a cycle for retirement. Do not restart
+        // its micro-op (notably SC, whose reservation has already been consumed).
+        Iff(~done & (mopStep - 1).lt(mopCount), [
           If(
             microcodeRead.done & microcodeRead.valid,
             then: [
@@ -3789,6 +3822,8 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.hstateen0Se0,
     super.memFaultGuest,
     super.fetchFault,
+    super.fetchAccessFault,
+    super.memAccessFault,
     super.fpRs1Port,
     super.fpRs2Port,
     super.fpRdPort,
@@ -5135,10 +5170,8 @@ class StaticExecutionUnit extends ExecutionUnit {
                       mopStep < mopStep + 1,
                     ],
                   ),
-                  // dport done & ~valid means the MMU walk faulted, the
-                  // only ~valid source (PMP/physical access faults aren't
-                  // modeled), so it is always a page fault (cause 13/15),
-                  // matching the emulator's mmu.dart.
+                  // A failed completion carries a page/guest-page or physical
+                  // access fault. doTrap selects the physical access cause.
                   If(
                     memRead.en & memRead.done & ~memRead.valid,
                     then: [
@@ -5402,21 +5435,9 @@ class StaticExecutionUnit extends ExecutionUnit {
                     memRead.en & memRead.done & memRead.valid,
                     then: [
                       memRead.en < 0,
-                      // Commit the (sign-extended) old value to rd, the AMO
-                      // microcode has no trailing WriteRegister, so drive the
-                      // regfile write port directly (as WriteRegister does).
-                      mirrorSp(
-                        readField(mop.dest, register: false).slice(4, 0),
-                        raw.signExtend(mxlen.size),
-                      ),
-                      rdWrite.addr <
-                          readField(mop.dest, register: false).slice(4, 0),
-                      rdWrite.data < raw.signExtend(mxlen.size),
-                      rdWrite.en <
-                          readField(
-                            mop.dest,
-                            register: false,
-                          ).slice(4, 0).gt(0),
+                      // Do not change rd until the write succeeds. A failed
+                      // AMO write must preserve the pre-instruction destination.
+                      amoOld < raw.signExtend(mxlen.size),
                       // Issue the modified-value store.
                       // Any store from this hart ends an LR/SC sequence.
                       reservationValid < 0,
@@ -5434,17 +5455,16 @@ class StaticExecutionUnit extends ExecutionUnit {
                     memRead.en & memRead.done & ~memRead.valid,
                     then: [
                       memRead.en < 0,
-                      // G-stage walk fault -> guest load page fault (21);
-                      // VS/single-stage -> regular load page fault (13).
+                      // A failed AMO read is still a store/AMO fault.
                       If(
                         memFaultGuest ?? Const(0),
                         then: doTrap(
-                          Trap.loadGuestPageFault,
+                          Trap.storeGuestPageFault,
                           addr,
                           '_${op.mnemonic}',
                         ),
                         orElse: doTrap(
-                          Trap.loadPageFault,
+                          Trap.storePageFault,
                           addr,
                           '_${op.mnemonic}',
                         ),
@@ -5458,7 +5478,22 @@ class StaticExecutionUnit extends ExecutionUnit {
                 CaseItem(Const(i + 2, width: maxLen.bitLength), [
                   If(
                     memWrite.done & memWrite.valid,
-                    then: [memWrite.en < 0, mopStep < mopStep + 1],
+                    then: [
+                      memWrite.en < 0,
+                      mirrorSp(
+                        readField(mop.dest, register: false).slice(4, 0),
+                        amoOld,
+                      ),
+                      rdWrite.addr <
+                          readField(mop.dest, register: false).slice(4, 0),
+                      rdWrite.data < amoOld,
+                      rdWrite.en <
+                          readField(
+                            mop.dest,
+                            register: false,
+                          ).slice(4, 0).gt(0),
+                      mopStep < mopStep + 1,
+                    ],
                   ),
                   If(
                     memWrite.done & ~memWrite.valid,

@@ -124,6 +124,9 @@ class RiverPipeline extends Module {
     // wired and translateFetch is on, a faulting fetch is delivered as a fetch
     // fault that the exec stage turns into instructionPageFault.
     Logic? ifetchFault,
+    // In-order access/page classification; queued OoO frontends are separate.
+    Logic? ifetchAccessFault,
+    Logic? memAccessFault,
     DataPortInterface? rdWrite1,
     DataPortInterface? memFetchRead1,
     Logic? wr0Ready,
@@ -352,6 +355,14 @@ class RiverPipeline extends Module {
         : addInput('specCtl', specCtl, width: 4);
     final bpdDisable = specCtlIn[1].named('bpdDisable');
     final ssbdDisable = specCtlIn[0].named('ssbdDisable');
+    final ifetchAccessFaultIn = addInput(
+      'ifetchAccessFault',
+      ifetchAccessFault ?? Const(0),
+    );
+    final memAccessFaultIn = addInput(
+      'memAccessFault',
+      memAccessFault ?? Const(0),
+    );
     final ifetchFaultIn = ifetchFault == null
         ? Const(0)
         : addInput('ifetchFault', ifetchFault);
@@ -491,6 +502,7 @@ class RiverPipeline extends Module {
               redirect: fetchRedirect,
               redirectPc: fetchRedirectPc,
               fault: usePrefetch ? null : ifetchFaultIn,
+              accessFault: ifetchAccessFaultIn,
             );
       fetchOutDone = fetcher.output('done');
       fetchOutValid = fetcher.output('valid');
@@ -507,6 +519,10 @@ class RiverPipeline extends Module {
         ? fetcher.output('fetch_fault')
         : useCompressedFetch
         ? cfb!.fetchFault
+        : Const(0);
+
+    final fetchAccessFaultSig = usePlainFetchUnit
+        ? fetcher.output('fetch_access_fault')
         : Const(0);
 
     // Helper: resize signal to target width (truncate or zero-extend)
@@ -611,6 +627,8 @@ class RiverPipeline extends Module {
               hstateen0Se0: hstateen0Se0,
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
+              fetchAccessFault: fetchAccessFaultSig,
+              memAccessFault: memAccessFaultIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
               fpRs2Port: fpRs2Port,
@@ -650,6 +668,8 @@ class RiverPipeline extends Module {
               hstateen0Se0: hstateen0Se0,
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
+              fetchAccessFault: fetchAccessFaultSig,
+              memAccessFault: memAccessFaultIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
               fpRs2Port: fpRs2Port,
