@@ -628,6 +628,9 @@ class RiverPipeline extends Module {
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
               fetchAccessFault: fetchAccessFaultSig,
+              fetchFaultTval: usePlainFetchUnit
+                  ? fetcher.output('fetch_fault_tval')
+                  : null,
               memAccessFault: memAccessFaultIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
@@ -669,6 +672,9 @@ class RiverPipeline extends Module {
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
               fetchAccessFault: fetchAccessFaultSig,
+              fetchFaultTval: usePlainFetchUnit
+                  ? fetcher.output('fetch_fault_tval')
+                  : null,
               memAccessFault: memAccessFaultIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,

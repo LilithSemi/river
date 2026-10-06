@@ -29,9 +29,13 @@ class FetchUnit extends Module {
   /// PC.
   Logic get pcOut => output('pc_out');
 
-  /// Asserted with done & ~valid when the delivered fetch faulted (instruction
-  /// page fault). The pipeline traps to instructionPageFault at [pcOut].
+  /// Marks a delivered instruction access/page fault. The pipeline traps
+  /// instead of executing; [pcOut] supplies the instruction-start EPC.
   Logic get fetchFault => output('fetch_fault');
+
+  /// Faulting instruction portion's address, valid with [fetchFault].
+  /// [pcOut] remains the instruction start for EPC.
+  Logic get fetchFaultTval => output('fetch_fault_tval');
 
   FetchUnit(
     Logic clk,
@@ -96,6 +100,7 @@ class FetchUnit extends Module {
     addOutput('result', width: 32);
     addOutput('pc_out', width: pc.width);
     addOutput('fetch_fault');
+    addOutput('fetch_fault_tval', width: pc.width);
     final accessFaulted = Logic(name: 'accessFaulted');
     Sequential(clk, [
       If(
@@ -230,6 +235,7 @@ class FetchUnit extends Module {
           readData < 0,
           secondData < 0,
           faulted < 0,
+          fetchFaultTval < 0,
           if (hasCompressed) compressed < 0,
         ],
         orElse: [
@@ -321,6 +327,7 @@ class FetchUnit extends Module {
                   then: [
                     complete < 1,
                     faulted < 1,
+                    fetchFaultTval < pcLatch,
                     pcOut < pcLatch,
                     enableRead < 0,
                     memRead.addr < (pcLatch & alignment),
@@ -353,6 +360,8 @@ class FetchUnit extends Module {
                 then: [
                   complete < 1,
                   faulted < 1,
+                  // Only the upper halfword failed; EPC still uses pcLatch.
+                  fetchFaultTval < pcLatch + Const(2, width: pc.width),
                   phase2 < 0,
                   pcOut < pcLatch,
                   enableRead < 0,
