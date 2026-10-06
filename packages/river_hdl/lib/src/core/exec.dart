@@ -1413,6 +1413,12 @@ abstract class ExecutionUnit extends Module {
   Logic compareCurrentMode(PrivilegeMode target) =>
       currentMode.eq(Const(target.id, width: 3));
 
+  // Enable implemented CSRs for ordinary U-mode, but retain the existing VU
+  // rejection until virtual counter permissions and exception selection are
+  // implemented together. Merely removing this guard would bypass hcounteren.
+  Logic get _virtualUserCsrBlocked =>
+      compareCurrentMode(PrivilegeMode.user) & (virtIn ?? Const(0));
+
   Logic selectTrapTargetMode(
     Logic trapInterrupt,
     Logic causeCode,
@@ -3566,30 +3572,37 @@ class DynamicExecutionUnit extends ExecutionUnit {
                     ),
                   if (csrRead != null)
                     CaseItem(Const(ReadCsrMicroOp.funct, width: funct.width), [
-                      // Address privilege and counter enables are checked by
-                      // RiscVCsrFile; U-mode CSR access is not always illegal.
-                      csrRead.en < 1,
-                      csrRead.addr < csrAddr!,
+                      If(
+                        _virtualUserCsrBlocked,
+                        then: doTrap(Trap.illegal),
+                        orElse: [csrRead.en < 1, csrRead.addr < csrAddr!],
+                      ),
                     ]),
                   if (csrWrite != null)
                     CaseItem(Const(WriteCsrMicroOp.funct, width: funct.width), [
-                      csrWrite.en < 1,
-                      csrWrite.addr < csrAddr!,
-                      csrWrite.data < sharedSourceVal,
-                      // A satp write switches the address space. Both L1
-                      // caches are tagged by VIRTUAL address, so every line
-                      // they hold now names different memory. Pulse the same
-                      // `fence` the core already routes to icFlush/dFlush
-                      // instead of giving the caches a second flush source:
-                      // this reuses a net that is already placed and adds
-                      // only a 12-bit compare. Software need not follow a
-                      // satp write with sfence.vma (Linux uses ASIDs, so it
-                      // does not), which is why the caches went stale.
                       If(
-                        csrAddr.eq(
-                          Const(_satpCsrAddress, width: csrAddr.width),
-                        ),
-                        then: [fence < 1],
+                        _virtualUserCsrBlocked,
+                        then: doTrap(Trap.illegal),
+                        orElse: [
+                          csrWrite.en < 1,
+                          csrWrite.addr < csrAddr!,
+                          csrWrite.data < sharedSourceVal,
+                          // A satp write switches the address space. Both L1
+                          // caches are tagged by VIRTUAL address, so every line
+                          // they hold now names different memory. Pulse the same
+                          // `fence` the core already routes to icFlush/dFlush
+                          // instead of giving the caches a second flush source:
+                          // this reuses a net that is already placed and adds
+                          // only a 12-bit compare. Software need not follow a
+                          // satp write with sfence.vma (Linux uses ASIDs, so it
+                          // does not), which is why the caches went stale.
+                          If(
+                            csrAddr.eq(
+                              Const(_satpCsrAddress, width: csrAddr.width),
+                            ),
+                            then: [fence < 1],
+                          ),
+                        ],
                       ),
                     ]),
                   // Floating-point compute. The operands are already in the
@@ -5908,11 +5921,15 @@ class StaticExecutionUnit extends ExecutionUnit {
                       '_${op.mnemonic}',
                     ),
                     orElse: [
-                      // Ordinary CSR legality belongs to RiscVCsrFile;
-                      // retain the separate VS virtual-instruction check.
-                      csrRead.en < 1,
-                      csrRead.addr < rdCsrAddr,
-                      mopStep < mopStep + 1,
+                      If(
+                        _virtualUserCsrBlocked,
+                        then: doTrap(Trap.illegal, null, '_${op.mnemonic}'),
+                        orElse: [
+                          csrRead.en < 1,
+                          csrRead.addr < rdCsrAddr,
+                          mopStep < mopStep + 1,
+                        ],
+                      ),
                     ],
                   ),
                 ]),
@@ -5960,17 +5977,23 @@ class StaticExecutionUnit extends ExecutionUnit {
                       '_${op.mnemonic}',
                     ),
                     orElse: [
-                      csrWrite.en < 1,
-                      csrWrite.addr < wrCsrAddr,
-                      csrWrite.data < readSource(mop.source),
-                      mopStep < mopStep + 1,
-                      // See the dynamic path: a satp write invalidates
-                      // both virtually tagged L1 caches.
                       If(
-                        wrCsrAddr.eq(
-                          Const(_satpCsrAddress, width: wrCsrAddr.width),
-                        ),
-                        then: [fence < 1],
+                        _virtualUserCsrBlocked,
+                        then: doTrap(Trap.illegal, null, '_${op.mnemonic}'),
+                        orElse: [
+                          csrWrite.en < 1,
+                          csrWrite.addr < wrCsrAddr,
+                          csrWrite.data < readSource(mop.source),
+                          mopStep < mopStep + 1,
+                          // See the dynamic path: a satp write invalidates
+                          // both virtually tagged L1 caches.
+                          If(
+                            wrCsrAddr.eq(
+                              Const(_satpCsrAddress, width: wrCsrAddr.width),
+                            ),
+                            then: [fence < 1],
+                          ),
+                        ],
                       ),
                     ],
                   ),

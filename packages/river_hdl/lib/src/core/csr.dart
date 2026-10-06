@@ -1369,9 +1369,9 @@ class RiscVCsrFile extends Module {
     return out;
   }
 
-  // Machine counter enables apply below M-mode; supervisor enables further
-  // restrict U-mode when S-mode is implemented. CSR address privilege alone
-  // cannot enforce this because the counter aliases have U-level addresses.
+  // With V=0, machine counter enables apply below M-mode; supervisor enables
+  // further restrict U-mode when S-mode exists. Address privilege alone cannot
+  // enforce this because the counter aliases have U-level addresses.
   Logic _counterReadOk(Logic addr) {
     if (!hasUser) return Const(1);
     final mc = _csrTop
@@ -1394,7 +1394,10 @@ class RiscVCsrFile extends Module {
                   (sc == null ? Const(1) : sc[bit])));
       allowed &= ~hit | enabled;
     }
-    return allowed;
+    // This port changes non-virtual M/S/U only. Preserve virtual-mode behavior
+    // until hcounteren and cause-22 selection are implemented together; the
+    // executor still rejects VU CSR accesses before they reach this port.
+    return allowed | (_virtInput ?? Const(0));
   }
 
   void _wireLegalityAndFrontdoor() {
