@@ -21,14 +21,24 @@ String program(Map<int, int> words) {
   return out.toString();
 }
 
-RiverCoreConfig config(bool microcoded, RiscVMxlen xlen) => RiverCoreConfig(
+RiverCoreConfig config(
+  bool microcoded,
+  RiscVMxlen xlen, {
+  bool hypervisor = false,
+}) => RiverCoreConfig(
   resetVector: 0,
   clock: const HarborClockConfig(
     name: 'test',
     rate: HarborFixedClockRate(12000000),
   ),
   mxlen: xlen,
-  extensions: [if (xlen == RiscVMxlen.rv64) rv64i, rv32i, rvPriv, rvZicsr],
+  extensions: [
+    if (xlen == RiscVMxlen.rv64) rv64i,
+    rv32i,
+    rvPriv,
+    rvZicsr,
+    if (hypervisor) rvH,
+  ],
   microcodeMode: microcoded ? MicrocodeMode.full : MicrocodeMode.none,
   interrupts: [],
   mmu: HarborMmuConfig(
@@ -49,14 +59,19 @@ Future<void> runCase(
   int mc = 2,
   int sc = 2,
   int? illegalIndex,
+  bool hypervisor = false,
+  bool virtual = false,
+  int hc = 0,
 }) async {
+  assert(!virtual || (hypervisor && xlen == RiscVMxlen.rv64));
   final code = <int, int>{
     0x00: csr(0x305, 10, 1, 0), // mtvec
     0x04: csr(0x341, 11, 1, 0), // mepc
     0x08: csr(0x300, 12, 1, 0), // mstatus.MPP
     0x0c: csr(0x306, 13, 1, 0), // mcounteren
     0x10: csr(0x106, 14, 1, 0), // scounteren
-    0x14: 0x30200073, // mret
+    if (hypervisor) 0x14: csr(0x606, 16, 1, 0), // hcounteren
+    (hypervisor ? 0x18 : 0x14): 0x30200073, // mret
     for (var i = 0; i < body.length; i++) 0x80 + 4 * i: body[i],
     0x80 + body.length * 4: 0x73, // ecall proves selected privilege was reached
     0x400: csr(0x342, 0, 2, 21), // mcause
@@ -70,14 +85,15 @@ Future<void> runCase(
       Register.x21: illegalIndex == null ? 8 + mode : 2,
       Register.x22: 0x80 + 4 * (illegalIndex ?? body.length),
     },
-    config(microcoded, xlen),
+    config(microcoded, xlen, hypervisor: hypervisor),
     initRegisters: {
       Register.x10: 0x400,
       Register.x11: 0x80,
-      Register.x12: mode << 11,
+      Register.x12: (mode << 11) | (virtual ? 1 << 39 : 0),
       Register.x13: mc,
       Register.x14: sc,
       Register.x15: 0x55,
+      if (hypervisor) Register.x16: hc,
       Register.x20: 0x77,
     },
     timeIn: Const(0x12345678, width: xlen.size),
