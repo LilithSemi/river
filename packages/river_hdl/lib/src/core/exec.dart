@@ -3566,37 +3566,30 @@ class DynamicExecutionUnit extends ExecutionUnit {
                     ),
                   if (csrRead != null)
                     CaseItem(Const(ReadCsrMicroOp.funct, width: funct.width), [
-                      If(
-                        currentMode.eq(Const(PrivilegeMode.user.id, width: 3)),
-                        then: doTrap(Trap.illegal),
-                        orElse: [csrRead.en < 1, csrRead.addr < csrAddr!],
-                      ),
+                      // Address privilege and counter enables are checked by
+                      // RiscVCsrFile; U-mode CSR access is not always illegal.
+                      csrRead.en < 1,
+                      csrRead.addr < csrAddr!,
                     ]),
                   if (csrWrite != null)
                     CaseItem(Const(WriteCsrMicroOp.funct, width: funct.width), [
+                      csrWrite.en < 1,
+                      csrWrite.addr < csrAddr!,
+                      csrWrite.data < sharedSourceVal,
+                      // A satp write switches the address space. Both L1
+                      // caches are tagged by VIRTUAL address, so every line
+                      // they hold now names different memory. Pulse the same
+                      // `fence` the core already routes to icFlush/dFlush
+                      // instead of giving the caches a second flush source:
+                      // this reuses a net that is already placed and adds
+                      // only a 12-bit compare. Software need not follow a
+                      // satp write with sfence.vma (Linux uses ASIDs, so it
+                      // does not), which is why the caches went stale.
                       If(
-                        currentMode.eq(Const(PrivilegeMode.user.id, width: 3)),
-                        then: doTrap(Trap.illegal),
-                        orElse: [
-                          csrWrite.en < 1,
-                          csrWrite.addr < csrAddr!,
-                          csrWrite.data < sharedSourceVal,
-                          // A satp write switches the address space. Both L1
-                          // caches are tagged by VIRTUAL address, so every line
-                          // they hold now names different memory. Pulse the same
-                          // `fence` the core already routes to icFlush/dFlush
-                          // instead of giving the caches a second flush source:
-                          // this reuses a net that is already placed and adds
-                          // only a 12-bit compare. Software need not follow a
-                          // satp write with sfence.vma (Linux uses ASIDs, so it
-                          // does not), which is why the caches went stale.
-                          If(
-                            csrAddr.eq(
-                              Const(_satpCsrAddress, width: csrAddr.width),
-                            ),
-                            then: [fence < 1],
-                          ),
-                        ],
+                        csrAddr.eq(
+                          Const(_satpCsrAddress, width: csrAddr.width),
+                        ),
+                        then: [fence < 1],
                       ),
                     ]),
                   // Floating-point compute. The operands are already in the
@@ -5915,15 +5908,11 @@ class StaticExecutionUnit extends ExecutionUnit {
                       '_${op.mnemonic}',
                     ),
                     orElse: [
-                      If(
-                        currentMode.eq(Const(PrivilegeMode.user.id, width: 3)),
-                        then: doTrap(Trap.illegal, null, '_${op.mnemonic}'),
-                        orElse: [
-                          csrRead.en < 1,
-                          csrRead.addr < rdCsrAddr,
-                          mopStep < mopStep + 1,
-                        ],
-                      ),
+                      // Ordinary CSR legality belongs to RiscVCsrFile;
+                      // retain the separate VS virtual-instruction check.
+                      csrRead.en < 1,
+                      csrRead.addr < rdCsrAddr,
+                      mopStep < mopStep + 1,
                     ],
                   ),
                 ]),
@@ -5971,23 +5960,17 @@ class StaticExecutionUnit extends ExecutionUnit {
                       '_${op.mnemonic}',
                     ),
                     orElse: [
+                      csrWrite.en < 1,
+                      csrWrite.addr < wrCsrAddr,
+                      csrWrite.data < readSource(mop.source),
+                      mopStep < mopStep + 1,
+                      // See the dynamic path: a satp write invalidates
+                      // both virtually tagged L1 caches.
                       If(
-                        currentMode.eq(Const(PrivilegeMode.user.id, width: 3)),
-                        then: doTrap(Trap.illegal, null, '_${op.mnemonic}'),
-                        orElse: [
-                          csrWrite.en < 1,
-                          csrWrite.addr < wrCsrAddr,
-                          csrWrite.data < readSource(mop.source),
-                          mopStep < mopStep + 1,
-                          // See the dynamic path: a satp write invalidates
-                          // both virtually tagged L1 caches.
-                          If(
-                            wrCsrAddr.eq(
-                              Const(_satpCsrAddress, width: wrCsrAddr.width),
-                            ),
-                            then: [fence < 1],
-                          ),
-                        ],
+                        wrCsrAddr.eq(
+                          Const(_satpCsrAddress, width: wrCsrAddr.width),
+                        ),
+                        then: [fence < 1],
                       ),
                     ],
                   ),
