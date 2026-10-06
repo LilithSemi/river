@@ -28,10 +28,16 @@ ${_bytes(0x1111, 8)}
 ${_bytes(0x2222, 8)}
 ''';
 
-void main() => runMprvCoreTests();
-
-void runMprvCoreTests({bool microcoded = false}) {
+void main() {
   tearDown(Simulator.reset);
+  for (final microcoded in [false, true]) {
+    group(microcoded ? 'microcoded' : 'static', () {
+      _runMprvCoreTests(microcoded: microcoded);
+    });
+  }
+}
+
+void _runMprvCoreTests({required bool microcoded}) {
   const mprv = 1 << 17, sum = 1 << 18, mxr = 1 << 19;
   for (final cached in [false, true]) {
     final config = RiverCoreConfig(
