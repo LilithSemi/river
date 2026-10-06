@@ -238,11 +238,12 @@ class RiverMmu extends Module {
     final dtlbLevel = Logic(name: 'dtlbLevel', width: 3);
     final satpShadowMode = Logic(name: 'satpShadowMode', width: 4);
     final satpShadowRoot = Logic(name: 'satpShadowRoot', width: xlen);
-    // Shadow of the privilege mode, to detect a context switch for DTLBFC.
+    // Preserve DTLBFC's actual-mode switch policy. MPRV/MPP changes need no
+    // flush: each data-TLB hit rechecks permissions with effective privilege.
     final privShadow = Logic(name: 'privShadow', width: 3);
-    final privChanged = dataPriv == null
+    final privChanged = priv == null
         ? Const(0)
-        : dataPriv.neq(privShadow).named('privChanged');
+        : priv.neq(privShadow).named('privChanged');
 
     // G-stage (hypervisor second-stage) walk state. Under two-stage, every
     // VS-stage bus address (`walkAddr`) is guest-physical and must be G-walked
@@ -538,7 +539,7 @@ class RiverMmu extends Module {
           dpFaultGuestR < 0,
           ifFaultR < 0,
           justCompleted < 0,
-          privShadow < (dataPriv ?? Const(0, width: 3)),
+          privShadow < (priv ?? Const(0, width: 3)),
           // Track satp so the fetch-TLB self-invalidates when it changes, and
           // flush it on sfence.vma (tlbFlushIn).
           if (hasPaging) ...[
