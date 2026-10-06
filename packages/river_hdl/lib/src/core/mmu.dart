@@ -47,6 +47,7 @@ class RiverMmu extends Module {
     Logic wbDatMiso, {
     required this.mmuConfig,
     required this.busConfig,
+    Logic? wbErr,
     Logic? satpMode,
     Logic? satpRoot,
     // Hypervisor two-stage: when [virtIn]=1 and [gMode]!=0, the (VS-stage)
@@ -91,6 +92,7 @@ class RiverMmu extends Module {
     dportWdata = addInput('dport_wdata', dportWdata, width: xlen);
     dportSize = addInput('dport_size', dportSize, width: 3);
     wbAck = addInput('dataBus_ACK', wbAck);
+    wbErr = addInput('dataBus_ERR', wbErr ?? Const(0));
     wbDatMiso = addInput(
       'dataBus_DAT_MISO',
       wbDatMiso,
@@ -469,7 +471,9 @@ class RiverMmu extends Module {
     // slice pulses ACK for one cycle, so the shipped fabric never did this, but
     // the FSM must not depend on that. cycR and stbR are always written
     // together, so cycR alone names a live transaction and costs one AND term.
-    final ackLive = (cycR & wbAck).named('ackLive');
+    // ERR is terminal even for slaves that assert ACK and ERR together.
+    final ackLive = (cycR & wbAck & ~wbErr).named('ackLive');
+    final errLive = (cycR & wbErr).named('errLive');
 
     Sequential(clk, [
       If(
@@ -553,6 +557,32 @@ class RiverMmu extends Module {
           ],
 
           If.block([
+            // A physical bus error terminates the ORIGINAL access, including
+            // errors reading PTEs or writing A/D bits. Leave the page/guest
+            // fault flags clear: done & !valid & !fault denotes an access fault.
+            Iff(busActive & errLive, [
+              cycR < 0,
+              stbR < 0,
+              busActive < 0,
+              justCompleted < 1,
+              dpDoneR < arbState.eq(1),
+              ifDoneR < arbState.eq(2),
+              dpRdataR < 0,
+              ifRdataR < 0,
+              arbState < 0,
+              if (hasPaging) ...[
+                walking < 0,
+                walkArmed < 0,
+                adWrite < 0,
+                ftlbValid < 0,
+                dtlbValid < 0,
+              ],
+              if (hasTwoStage) ...[
+                gWalking < 0,
+                gWalkArmed < 0,
+                gTranslated < 0,
+              ],
+            ]),
             // G-stage (second-stage) PTE returned. (checked first: during a
             // G sub-walk both gWalking and walking may be set). Resolves the
             // host-physical address for the pending VS access, then resumes it.
