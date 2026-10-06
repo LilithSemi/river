@@ -539,6 +539,8 @@ abstract class ExecutionUnit extends Module {
     Logic? fetchFault,
     // Access/page classification paired with the faulting fetch or data response.
     Logic? fetchAccessFault,
+    // Faulting instruction portion's VA; the instruction start remains EPC.
+    Logic? fetchFaultTval,
     Logic? memAccessFault,
     // Floating-point register ports. The FP register file belongs in the core
     // module next to the integer file, which is where the device target is
@@ -571,6 +573,9 @@ abstract class ExecutionUnit extends Module {
       fetchAccessFault ?? Const(0),
     );
     _memAccessFault = addInput('memAccessFault', memAccessFault ?? Const(0));
+    _fetchFaultTval = fetchFaultTval == null
+        ? null
+        : addInput('fetchFaultTval', fetchFaultTval, width: mxlen.size);
     final fetchFaultIn = fetchFault == null
         ? Const(0)
         : addInput('fetchFault', fetchFault);
@@ -1561,6 +1566,7 @@ abstract class ExecutionUnit extends Module {
 
   late final Logic _fetchAccessFault;
   late final Logic _memAccessFault;
+  late final Logic? _fetchFaultTval;
 
   List<Conditional> doTrap(Trap t, [Logic? tval, String? suffix]) {
     final trapInterrupt = Const(t.interrupt ? 1 : 0);
@@ -1579,6 +1585,9 @@ abstract class ExecutionUnit extends Module {
             Const(accessCause.causeCode, width: 6),
             Const(t.causeCode, width: 6),
           );
+    if (t == Trap.instructionPageFault && _fetchFaultTval != null) {
+      tval = _fetchFaultTval;
+    }
     return rawTrap(trapInterrupt, causeCode, tval, suffix);
   }
 
@@ -1634,6 +1643,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.memFaultGuest,
     super.fetchFault,
     super.fetchAccessFault,
+    super.fetchFaultTval,
     super.memAccessFault,
     super.fpRs1Port,
     super.fpRs2Port,
@@ -3823,6 +3833,7 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.memFaultGuest,
     super.fetchFault,
     super.fetchAccessFault,
+    super.fetchFaultTval,
     super.memAccessFault,
     super.fpRs1Port,
     super.fpRs2Port,
