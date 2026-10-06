@@ -6,8 +6,10 @@ import 'package:rohd/rohd.dart';
 import 'package:river_hdl/src/core/iterative_fp_arith.dart';
 import 'package:test/test.dart';
 
-/// [IterativeFpArith] against Dart's own arithmetic, which is IEEE binary64
-/// and is the model the emulator uses.
+import 'fma_reference.dart';
+
+/// Non-fused operations use Dart's IEEE arithmetic as their reference. FMA
+/// uses exact integer arithmetic so the oracle does not round the product.
 ///
 /// The execution unit reads this core for fadd, fsub, fmul, fdiv and the four
 /// fused multiply-add forms, at both precisions, because a single-precision
@@ -122,6 +124,111 @@ void main() {
   List<Object> fnmsub(int a, int b, int c) => [a, b, c, 1, 1, 0, 0, 0];
   List<Object> fnmadd(int a, int b, int c) => [a, b, c, 1, 1, 1, 0, 0];
 
+  for (final shape in [(8, 23, false), (11, 52, false), (11, 52, true)]) {
+    final (e, m, narrow) = shape;
+    final single = narrow || e == 8;
+    final eb = single ? 8 : 11;
+    final mb = single ? 23 : 52;
+    final directed = single
+        ? <List<int>>[
+            [0x3f800001, 0x3f7ffffe, 0xbf800000, 0xa8800000],
+            [0x7f7fffff, 0x40000000, 0xff7fffff, 0x7f7fffff],
+            [1, 0x3f000000, 1, 2],
+            [0x80000000, 0x40000000, 0x80000000, 0x80000000],
+            [0x7f800000, 0, 0x3f800000, 0x7fc00000],
+          ]
+        : <List<int>>[
+            [
+              0x3ff0000000000001,
+              0x3feffffffffffffe,
+              0xbff0000000000000,
+              0xb970000000000000,
+            ],
+            [
+              0x7fefffffffffffff,
+              0x4000000000000000,
+              0xffefffffffffffff,
+              0x7fefffffffffffff,
+            ],
+            [1, 0x3fe0000000000000, 1, 2],
+            [
+              0x8000000000000000,
+              0x4000000000000000,
+              0x8000000000000000,
+              0x8000000000000000,
+            ],
+            [0x7ff0000000000000, 0, 0x3ff0000000000000, 0x7ff8000000000000],
+          ];
+    test('single-rounding FMA e=$e m=$m narrow=$narrow', () async {
+      for (final row in directed) {
+        expect(
+          fusedBits(row[0], row[1], row[2], exponentBits: eb, fractionBits: mb),
+          row[3],
+          reason: 'independent exact cancellation/range/special witness',
+        );
+      }
+      final rnd = math.Random(0xf00d);
+      int randomBits() => single
+          ? rnd.nextInt(1 << 32)
+          : (rnd.nextInt(1 << 32) << 32) | rnd.nextInt(1 << 32);
+      final triples = <List<int>>[
+        for (final row in directed) row.sublist(0, 3),
+        for (var i = 0; i < 128; i++)
+          [randomBits(), randomBits(), randomBits()],
+      ];
+      // Cancellation exposes low product bits that broad random exponents
+      // rarely exercise. The rounded host product is only the input addend,
+      // never the expected fused answer.
+      for (var i = 0; i < 64; i++) {
+        final a = single
+            ? 0x3f800000 | rnd.nextInt(1 << 23)
+            : 0x3ff0000000000000 | (randomBits() & 0x000fffffffffffff);
+        final b = single
+            ? 0x3f800000 | rnd.nextInt(1 << 23)
+            : 0x3ff0000000000000 | (randomBits() & 0x000fffffffffffff);
+        final c = single
+            ? f32Bits(-bitsF32(a) * bitsF32(b))
+            : f64Bits(-bitsF64(a) * bitsF64(b));
+        triples.add([a, b, c]);
+      }
+      final jobs = <List<Object>>[];
+      final expected = <int>[];
+      for (final row in triples) {
+        for (final negateProduct in [false, true]) {
+          for (final negateAddend in [false, true]) {
+            jobs.add([
+              row[0],
+              row[1],
+              row[2],
+              1,
+              negateProduct ? 1 : 0,
+              negateAddend ? 1 : 0,
+              0,
+              0,
+              0,
+              narrow ? 1 : 0,
+            ]);
+            expected.add(
+              fusedBits(
+                row[0],
+                row[1],
+                row[2],
+                exponentBits: eb,
+                fractionBits: mb,
+                negateProduct: negateProduct,
+                negateAddend: negateAddend,
+              ),
+            );
+          }
+        }
+      }
+      final got = await run(jobs, exponentWidth: e, mantissaWidth: m);
+      for (var i = 0; i < got.length; i++) {
+        expect(got[i], expected[i], reason: 'FMA job $i: ${jobs[i]}');
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+  }
+
   List<double> spread(math.Random rnd, int count) {
     final vals = <double>[
       1.0,
@@ -225,13 +332,41 @@ void main() {
         final bb = f64Bits(b);
         final cb = f64Bits(c);
         jobs.add(fmadd(ab, bb, cb));
-        want.add(f64Bits(a * b + c));
+        want.add(fusedBits(ab, bb, cb, exponentBits: 11, fractionBits: 52));
         jobs.add(fmsub(ab, bb, cb));
-        want.add(f64Bits(a * b - c));
+        want.add(
+          fusedBits(
+            ab,
+            bb,
+            cb,
+            exponentBits: 11,
+            fractionBits: 52,
+            negateAddend: true,
+          ),
+        );
         jobs.add(fnmsub(ab, bb, cb));
-        want.add(f64Bits(-(a * b) + c));
+        want.add(
+          fusedBits(
+            ab,
+            bb,
+            cb,
+            exponentBits: 11,
+            fractionBits: 52,
+            negateProduct: true,
+          ),
+        );
         jobs.add(fnmadd(ab, bb, cb));
-        want.add(f64Bits(-(a * b) - c));
+        want.add(
+          fusedBits(
+            ab,
+            bb,
+            cb,
+            exponentBits: 11,
+            fractionBits: 52,
+            negateProduct: true,
+            negateAddend: true,
+          ),
+        );
       }
       final got = await run(jobs, exponentWidth: 11, mantissaWidth: 52);
       for (var i = 0; i < jobs.length; i++) {
@@ -494,9 +629,19 @@ void main() {
         jobs.add(divS(ab, bb));
         want.add(f32Bits(a / b));
         jobs.add(fmaddS(ab, bb, cb));
-        want.add(f32Bits(a * b + c));
+        want.add(fusedBits(ab, bb, cb, exponentBits: 8, fractionBits: 23));
         jobs.add(fnmaddS(ab, bb, cb));
-        want.add(f32Bits(-(a * b) - c));
+        want.add(
+          fusedBits(
+            ab,
+            bb,
+            cb,
+            exponentBits: 8,
+            fractionBits: 23,
+            negateProduct: true,
+            negateAddend: true,
+          ),
+        );
       }
       final got = await run(jobs, exponentWidth: 11, mantissaWidth: 52);
       for (var i = 0; i < jobs.length; i++) {
