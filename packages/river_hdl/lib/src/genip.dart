@@ -152,6 +152,11 @@ class DeviceParams {
   /// JTAG so it can breakpoint even hot, I-cached code without patching it.
   final int? triggers;
 
+  /// debug-jtag `userprobe=true`: build the sticky user-mode excursion probe
+  /// and report it in dcsr's reserved field. Off by default and byte identical
+  /// when off. A diagnostic build option, not a production one.
+  final bool? userProbe;
+
   /// Give this `spi` device an integrated DMA engine: a second fabric master
   /// that streams SD bytes straight to memory (no per-byte CPU poll). absent/
   /// false = byte-identical slave-only PIO. Firmware finds it via the device's
@@ -172,6 +177,10 @@ class DeviceParams {
   /// It is also a runtime CTRL[8] bit, so this only sets the reset default.
   /// absent/false = rising-edge sample (the standard host default).
   final bool? sampleFall;
+
+  /// Pin count of a `gpio` device. Absent uses a small default, because every
+  /// pin costs three registers plus its own interrupt logic.
+  final int? pins;
 
   const DeviceParams({
     this.trainable,
@@ -201,9 +210,11 @@ class DeviceParams {
     this.iface,
     this.sdcard,
     this.triggers,
+    this.userProbe,
     this.dma,
     this.dmaShared,
     this.sampleFall,
+    this.pins,
   });
 
   /// Accepted param keys (case-insensitive), for error messages.
@@ -235,9 +246,11 @@ class DeviceParams {
     'iface',
     'sdcard',
     'triggers',
+    'userprobe',
     'dma',
     'dmashared',
     'samplefall',
+    'pins',
   ];
 
   static bool _parseBool(String v) {
@@ -287,6 +300,8 @@ class DeviceParams {
     String? iface;
     bool? sdcard;
     int? triggers;
+    bool? userProbe;
+    int? pins;
     bool? dma;
     bool? dmaShared;
     bool? sampleFall;
@@ -363,6 +378,10 @@ class DeviceParams {
           sdcard = _parseBool(val);
         case 'triggers':
           triggers = int.parse(val);
+        case 'userprobe':
+          userProbe = _parseBool(val);
+        case 'pins':
+          pins = int.parse(val);
         case 'dma':
           dma = _parseBool(val);
         case 'dmashared':
@@ -403,9 +422,11 @@ class DeviceParams {
       iface: iface,
       sdcard: sdcard,
       triggers: triggers,
+      userProbe: userProbe,
       dma: dma,
       dmaShared: dmaShared,
       sampleFall: sampleFall,
+      pins: pins,
     );
   }
 }
@@ -1185,6 +1206,11 @@ class RiverGenIpConfig {
   int get debugTriggers =>
       _firstDeviceOfType('debug-jtag')?.params?.triggers ?? 0;
 
+  /// Sticky user-mode excursion probe requested on the debug-jtag device
+  /// (`debug-jtag:userprobe=true`). False when absent.
+  bool get userModeProbe =>
+      _firstDeviceOfType('debug-jtag')?.params?.userProbe ?? false;
+
   // --- flash-firmware (derived from a `flash-firmware` device) ---
 
   /// Built-in firmware program baked into flash (the device `program` param).
@@ -1563,6 +1589,21 @@ class RiverGenIpConfig {
     final busConfig = buildBusConfig();
     final target = buildTarget();
 
+    // The PLIC context plan: one context per privilege level that claims
+    // interrupts, machine first then supervisor, hart by hart. A hart without
+    // the S extension gets only its machine context.
+    //
+    // This ONE list decides three things that must agree: how many contexts the
+    // PLIC is built with, which core input each `ext_irq_<N>` drives, and the
+    // `interrupts-extended` pairs in the device tree. Deriving them separately
+    // is how the sources came to dangle in the first place.
+    final interruptContexts = <HarborInterruptContext>[
+      for (final c in coreConfigs) ...[
+        HarborInterruptContext.machine(c.hartId),
+        if (c.hasSupervisor) HarborInterruptContext.supervisor(c.hartId),
+      ],
+    ];
+
     // The clk90 DDR controller (DLL-off, CK = system clock) shares the single SoC
     // clock domain: no separate DRAM clock, CDC bridge, or train-control MMIO. The
     // matching GenIpConfig knobs are retained as accepted-but-ignored no-ops.
@@ -1586,6 +1627,7 @@ class RiverGenIpConfig {
       busConfig: busConfig,
       acpiOemId: 'LILSMI',
       acpiOemTableId: 'RIVER',
+      interruptContexts: interruptContexts,
       // An FPGA target normally resets only at configuration (power-on). A
       // `reset_n=<pad>` pin (e.g. a board RESET button) adds an active-low
       // external reset ORed into that POR, so a press restarts the SoC. The
@@ -1683,6 +1725,18 @@ class RiverGenIpConfig {
     final coreSwNets = <Logic>[];
     final coreTimeNets = <Logic>[];
 
+    // The PLIC (if present) drives each hart's machine EXTERNAL interrupt line
+    // (mip.MEIP). Same shape as the CLINT nets above: make a net per hart now,
+    // feed it to the core, and connect the PLIC `ext_irq_<hart>` output to it
+    // after the peripheral loop below. Without this the core has no external
+    // interrupt input at all, so a device interrupt can never reach software.
+    final hasPlic = mmioDevices.any((d) => d.type == 'plic');
+    final coreExtNets = <Logic>[];
+    // The supervisor-external counterpart (mip.SEIP), one per hart that has the
+    // S extension. An S-mode OS claims from its OWN PLIC context, so this is a
+    // second line and not a copy of the machine one.
+    final coreSeiNets = <int, Logic>{};
+
     RiverCore? debugCore;
     var hartIndex = 0;
     for (final coreConfig in coreConfigs) {
@@ -1698,12 +1752,25 @@ class RiverGenIpConfig {
         coreSwNets.add(swNet);
         coreTimeNets.add(timeNet);
       }
+      Logic? extNet;
+      Logic? seiNet;
+      if (hasPlic) {
+        extNet = Logic(name: 'core${hartIndex}_ext_pending');
+        coreExtNets.add(extNet);
+        if (coreConfig.hasSupervisor) {
+          seiNet = Logic(name: 'core${hartIndex}_sei_pending');
+          coreSeiNets[coreConfig.hartId] = seiNet;
+        }
+      }
       final core = RiverCore(
         coreConfig,
         busConfig: busConfig,
         target: target,
         withDebug: enableDebug,
         debugTriggers: enableDebug ? debugTriggers : 0,
+        userProbe: enableDebug && userModeProbe,
+        srcIrqs: extNet == null ? const {} : {'extPending': extNet},
+        supervisorExternalPending: seiNet,
         timerPending: timerNet,
         swPending: swNet,
         timeIn: timeNet,
@@ -2292,7 +2359,12 @@ class RiverGenIpConfig {
 
     final peripheralsByName = <String, BridgeModule>{};
     for (final dev in mmioDevices) {
-      final peripheral = _createPeripheral(dev, busConfig, target: target);
+      final peripheral = _createPeripheral(
+        dev,
+        busConfig,
+        target: target,
+        plicContexts: interruptContexts.length,
+      );
       if (peripheral != null) {
         soc.addPeripheral(peripheral);
         peripheralsByName[dev.name] = peripheral;
@@ -2393,6 +2465,17 @@ class RiverGenIpConfig {
       }
     }
 
+    // GPIO pin bundles. They are real chip pads, so raise all three to the top
+    // even without a --pin flag: an unexposed `gpio_in` is a floating module
+    // input, which is an X in simulation and an unconstrained net in synthesis.
+    for (final dev in mmioDevices) {
+      if (dev.type != 'gpio') continue;
+      final gpio = peripheralsByName[dev.name]!;
+      for (final port in const ['gpio_in', 'gpio_out', 'gpio_dir']) {
+        soc.exposePin(gpio, port, externalName: '${dev.name}_$port');
+      }
+    }
+
     // Expose peripheral pins referenced by --pin flags (and the board catalog).
     for (final pin in effectivePins) {
       if (!pin.isDevicePin) continue;
@@ -2412,6 +2495,43 @@ class RiverGenIpConfig {
     // (delta xc7s50 congestion relief) and is the Linux-throughput topology.
     // Without a DMA channel this is byte-identical to the historic single fabric.
     void finishFabric() {
+      // Wire every peripheral interrupt output into the PLIC, and the PLIC's
+      // per-hart output into the core. Done here, after the DFU and debug
+      // subsystems have added their peripherals, so the numbering the device
+      // tree and the ACPI tables report covers the final peripheral list.
+      //
+      // The numbers come from `HarborSoC.interruptAssignments`, the same
+      // allocator the device tree, ACPI and SVD generators read. Hardware and
+      // tables therefore cannot disagree.
+      if (hasPlic) {
+        final routing = HarborInterruptRouting.forSoC(soc);
+        if (routing != null) {
+          routing.connectSoCSources(soc);
+          // Each context output goes to the core input for the cause it drives.
+          // The list is the same one the device tree turns into
+          // `interrupts-extended`, so a context an OS is told to claim from is
+          // the context actually wired to that hart's interrupt line.
+          final driven = <Logic>{};
+          for (final (ctx, entry) in soc.interruptContexts.indexed) {
+            if (ctx >= routing.numHarts) break;
+            final line = entry.cause == 9
+                ? coreSeiNets[entry.hartId]
+                : (entry.hartId < coreExtNets.length
+                      ? coreExtNets[entry.hartId]
+                      : null);
+            if (line == null) continue;
+            line <= routing.hartInterrupt(ctx);
+            driven.add(line);
+          }
+          // Anything the plan did not reach is tied low rather than left
+          // floating. A floating core interrupt input is an X in simulation and
+          // an unconstrained net in synthesis.
+          for (final net in [...coreExtNets, ...coreSeiNets.values]) {
+            if (!driven.contains(net)) net <= Const(0);
+          }
+        }
+      }
+
       final hasDmaChannel = mmioDevices.any(
         (dev) =>
             (dev.type == 'spi' || dev.type == 'sdio') &&
@@ -2422,14 +2542,34 @@ class RiverGenIpConfig {
         soc.buildFabric(pipeline: true);
         return;
       }
+      // The DMA channel reaches main memory only. DRAM is main memory on every
+      // board that has it, so prefer it and keep those SoCs byte identical. A
+      // DRAM-less SoC (an SRAM or PSRAM part) still needs the DMA to reach ITS
+      // main memory, so fall back to those. An empty set makes Harbor throw
+      // `channel "dma" reaches no slave` from deep inside the fabric builder,
+      // far from the cause, so name the real problem here instead.
+      var dmaSlaves = {
+        for (final p in soc.peripherals)
+          if (p.name.startsWith('dram')) p.name,
+      };
+      if (dmaSlaves.isEmpty) {
+        dmaSlaves = {
+          for (final p in soc.peripherals)
+            if (p.name.startsWith('sram') || p.name.startsWith('psram')) p.name,
+        };
+      }
+      if (dmaSlaves.isEmpty) {
+        throw ArgumentError(
+          'A DMA-capable device needs a memory region for the DMA channel to '
+          'reach. Add a dram, sram or psram device, or set dmashared=true to '
+          'put the DMA master on the primary channel.',
+        );
+      }
       soc.buildFabric(
         pipeline: true,
         channelSlaves: {
           'primary': {for (final p in soc.peripherals) p.name},
-          'dma': {
-            for (final p in soc.peripherals)
-              if (p.name.startsWith('dram')) p.name,
-          },
+          'dma': dmaSlaves,
         },
       );
     }
@@ -2649,6 +2789,8 @@ class RiverGenIpConfig {
     DeviceEntry dev,
     WishboneConfig busConfig, {
     HarborDeviceTarget? target,
+    // Number of PLIC contexts, from the SoC's one context plan. See buildSoC.
+    int plicContexts = 1,
   }) {
     switch (dev.type) {
       case 'uart':
@@ -2675,6 +2817,10 @@ class RiverGenIpConfig {
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
           sources: mmioDevices.length + 1,
+          // One context per privilege level that claims: M and S per hart. An
+          // S-mode OS needs its own enable/threshold/claim block, which is what
+          // the Linux PLIC driver looks for.
+          contexts: plicContexts,
         );
       case 'spi':
         // Generic SPI master. Pads (spi_clk/spi_mosi/spi_miso/spi_cs_n) are
@@ -2689,6 +2835,19 @@ class RiverGenIpConfig {
           // width matches the fabric so it can reach all of memory.
           dma: dev.params?.dma ?? false,
           dmaAddressWidth: busConfig.addressWidth,
+          name: dev.name,
+        );
+      case 'gpio':
+        // General-purpose I/O with per-pin interrupts. The three pin bundles are
+        // exposed as top-level ports below, so a board binds them with
+        // `--pin name=<dev>@gpio_in:<pad>` style indexed pads.
+        return HarborGpio(
+          baseAddress: dev.address,
+          // Small default: each pin costs an output, a direction, an enable, a
+          // status and an edge bit, so a wide default is real area for nothing.
+          pinCount: dev.params?.pins ?? 8,
+          busAddressWidth: busConfig.addressWidth,
+          busDataWidth: busConfig.dataWidth,
           name: dev.name,
         );
       case 'sdio':
@@ -2739,7 +2898,15 @@ class RiverGenIpConfig {
           name: dev.name,
         );
       default:
-        return null;
+        // A device type the parser accepts but no case builds would otherwise
+        // vanish silently: no RTL, no device-tree node, no bus window, and no
+        // message. That is the same class of fault as an interrupt source that
+        // is declared but never wired, so name it here instead.
+        throw ArgumentError(
+          'Device "${dev.name}": type "${dev.type}" has no peripheral '
+          'implementation in genip. Supported MMIO types are '
+          'uart, clint, plic, gpio, spi and sdio.',
+        );
     }
   }
 

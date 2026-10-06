@@ -58,45 +58,6 @@ let
       "uart:0x10000000:ns16550a"
     ];
   };
-
-  # Shared Arty S7-50 override for the delta bring-up (native 4-bit SDIO, 33.33
-  # MHz). The base delta-v1-arty and the DMA/clock comparison variants below all
-  # derive from this so the only differences are the axis under test.
-  delta-arty-attrs = {
-    target = "spartan7:xc7s50:csga324";
-    board = "arty-s7-50";
-    clockFreq = 33333333;
-    oscFreq = 100000000;
-    memories = [
-      "0x20000000:16M:flash:arty-s7"
-      "0x08000000:64K:sram"
-      "0x80000000:256M:dram:arty-s7:ddr3v2=true,clockfreq=300000000,cmdslot=2,wrshift=-1,trainable=true"
-    ];
-    # Native 4-bit SDIO host (4x the 1-bit SPI throughput) with an ADMA engine on
-    # the fabric. dmashared puts the ADMA on the PRIMARY channel (no separate
-    # channel + converge crossbar), which de-congests the DDR CDC and lifts the
-    # ddr_clk route from ~67 to ~80 MHz on this dense xc7s50.
-    devices = delta-v1-base.devices ++ [
-      "sdio:0x10001000:dma=true,samplefall=true"
-      "debug-jtag:triggers=4"
-    ];
-    bootProgram = "xipboot";
-    pins = [
-      "clk=R2 SSTL135"
-      "uart_tx=uart@tx:R12"
-      "uart_rx=uart@rx:V12"
-      "reset_n=C18"
-      # Native SDIO on the Arty S7 PmodSD header (iface= is spi-only, so the SD
-      # pads bind by explicit pin). LVCMOS33 is the default I/O standard.
-      "sdio_sd_clk=N14"
-      "sdio_sd_cmd=L18"
-      "sdio_sd_dat0=M14"
-      "sdio_sd_dat1=M16"
-      "sdio_sd_dat2=M17"
-      "sdio_sd_dat3=L17"
-      "sdio_sd_cd=M18"
-    ];
-  };
 in
 {
   creek-v1-orangecrab = {
@@ -180,42 +141,45 @@ in
     );
   };
 
-  # Delta bring-up on the Arty S7-50, SCAFFOLD. This mirrors creek-v1-arty (same
-  # board, DDR3, SD card, self-boot) but swaps the rc1-s core for rc1-f (Full,
-  # with FPU) so a stock rv64gc NixOS can run. The SD card on Pmod JA is the
-  # rootfs device. NOTE: rc1-f is larger than rc1-s (it adds the FPU), and creek
-  # already routes tight on the xc7s50, so fit/route here is UNPROVEN; the real
-  # Delta board is likely a larger part. Kept on the Arty for continuity of the
-  # bring-up flow until a bigger board is wired in.
-  # DMA-SPI at the proven 33.33 MHz (project-river-40mhz). dma=true gives the
-  # integrated SPI DMA master: SD blocks stream straight to DRAM, no per-byte CPU
-  # poll. Weir finds it via the `harbor,dma` DT property and falls back to PIO.
   delta-v1-arty = {
-    ip = river-hdl.mkSoC (delta-v1-base // delta-arty-attrs);
-  };
-
-  # DMA comparison variant: SPI WITHOUT the DMA master (PIO block reads). Same
-  # everything else, so a DMA-vs-PIO A/B on identical timing.
-  delta-v1-arty-pio = {
     ip = river-hdl.mkSoC (
       delta-v1-base
-      // delta-arty-attrs
       // {
+        target = "spartan7:xc7s50:csga324";
+        board = "arty-s7-50";
+        clockFreq = 33333333;
+        oscFreq = 100000000;
+        memories = [
+          "0x20000000:16M:flash:arty-s7"
+          "0x08000000:64K:sram"
+          "0x80000000:256M:dram:arty-s7:ddr3v2=true,clockfreq=300000000,cmdslot=2,wrshift=-1,trainable=true"
+        ];
+        # Native 4-bit SDIO host (4x the 1-bit SPI throughput) with an ADMA engine on
+        # the fabric. dmashared puts the ADMA on the PRIMARY channel (no separate
+        # channel + converge crossbar), which de-congests the DDR CDC and lifts the
+        # ddr_clk route from ~67 to ~80 MHz on this dense xc7s50.
         devices = delta-v1-base.devices ++ [
-          "spi:0x10001000:iface=pmod@ja,sdcard=true"
+          "sdio:0x10001000:dma=true,samplefall=true"
           "debug-jtag:triggers=4"
+        ];
+        bootProgram = "xipboot";
+        pins = [
+          "clk=R2 SSTL135"
+          "uart_tx=uart@tx:R12"
+          "uart_rx=uart@rx:V12"
+          "reset_n=C18"
+          # Native SDIO on the Arty S7 PmodSD header (iface= is spi-only, so the SD
+          # pads bind by explicit pin). LVCMOS33 is the default I/O standard.
+          "sdio_sd_clk=N14"
+          "sdio_sd_cmd=L18"
+          "sdio_sd_dat0=M14"
+          "sdio_sd_dat1=M16"
+          "sdio_sd_dat2=M17"
+          "sdio_sd_dat3=L17"
+          "sdio_sd_cd=M18"
         ];
       }
     );
-  };
-
-  # Clock sweep of the DMA-SPI build: 40 MHz (the core-datapath ceiling, may not
-  # close) and 20 MHz (timing-safe floor). Bracket the proven 33.33 MHz baseline.
-  delta-v1-arty-40mhz = {
-    ip = river-hdl.mkSoC (delta-v1-base // delta-arty-attrs // { clockFreq = 40000000; });
-  };
-  delta-v1-arty-20mhz = {
-    ip = river-hdl.mkSoC (delta-v1-base // delta-arty-attrs // { clockFreq = 20000000; });
   };
 
   creek-v1-sky130 = {

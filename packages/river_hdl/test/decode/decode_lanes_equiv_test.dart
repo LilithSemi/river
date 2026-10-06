@@ -132,12 +132,16 @@ Future<Map<String, int>> run(
   );
   final memRead = DataPortInterface(config.mxlen.size, addrWidth);
   final memWrite = DataPortInterface(config.mxlen.size, addrWidth);
+  // readLatency MUST match on both sides. MemoryModel defaults to 1 while
+  // wrapReadForRegisterFile defaults to 0, so leaving it out drives `valid` a
+  // cycle before the model has data and the core latches an X instruction.
   // ignore: unused_local_variable
   final mem = MemoryModel(
     clk,
     reset,
     [wrapWriteForRegisterFile(memWrite)],
     [wrapReadForRegisterFile(memRead)],
+    readLatency: 0,
     storage: storage,
   );
   final wbCyc = core.output('dataBus_CYC');
@@ -264,6 +268,13 @@ Future<void> equiv(
   );
 }
 
+// Budgets measured 2026-09-03, serially (-j 1) on an idle 128-core aarch64 box:
+// alu 8m30, m-ext 11m35, branch 14m14, load/store 34m02, compressed 15m12.
+// The old 8-minute timeout was under half what the slowest case needs, so
+// branch/m-ext/load-store failed as TimeoutException in every run regardless of
+// machine load. 60 minutes gives the 34-minute worst case real headroom.
+// These are slow because microcode decode is slow, which is a known perf item,
+// not a correctness one.
 void main() {
   tearDown(() async {
     await Simulator.reset();
@@ -272,7 +283,7 @@ void main() {
   // Integer register-register + register-immediate ALU sweep. x1=0xF0,x2=0x0C
   // seeded; every op writes a distinct dest so a mis-decode shows up as one
   // wrong register.
-  test('alu integer ops', timeout: Timeout(Duration(minutes: 8)), () async {
+  test('alu integer ops', timeout: Timeout(Duration(minutes: 60)), () async {
     await equiv(
       'alu',
       [
@@ -304,7 +315,7 @@ void main() {
   });
 
   // M-extension: mul/div/rem in all widths.
-  test('m-ext ops', timeout: Timeout(Duration(minutes: 8)), () async {
+  test('m-ext ops', timeout: Timeout(Duration(minutes: 60)), () async {
     await equiv(
       'm',
       [
@@ -326,7 +337,7 @@ void main() {
 
   // Branches: the flood site is a bltu. Exercise every branch, taken and not.
   // Each branch guards an addi so a wrong branch decode changes the counter.
-  test('branch ops', timeout: Timeout(Duration(minutes: 8)), () async {
+  test('branch ops', timeout: Timeout(Duration(minutes: 60)), () async {
     await equiv(
       'branch',
       [
@@ -352,7 +363,7 @@ void main() {
 
   // Store/load roundtrip through a scratch region (base x1 = 0x400, above the
   // program). Covers sd/sw/sh/sb + ld/lw/lh/lb/lhu/lbu/lwu.
-  test('load/store ops', timeout: Timeout(Duration(minutes: 8)), () async {
+  test('load/store ops', timeout: Timeout(Duration(minutes: 60)), () async {
     await equiv(
       'ldst',
       [
@@ -377,7 +388,7 @@ void main() {
   // Compressed ops: mixed 16/32-bit stream. The flood code is mixed RVC, so
   // any RVC packed-decode error surfaces here. c.li/c.addi/c.mv/c.add/c.sub/
   // c.and/c.or/c.xor/c.slli/c.andi/c.srli.
-  test('compressed ops', timeout: Timeout(Duration(minutes: 8)), () async {
+  test('compressed ops', timeout: Timeout(Duration(minutes: 60)), () async {
     await equiv(
       'rvc',
       [

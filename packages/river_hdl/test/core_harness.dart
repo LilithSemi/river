@@ -7,6 +7,8 @@ import 'package:river/river.dart';
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
 
+import 'adversarial_memory.dart';
+
 Future<void> coreTest(
   String memString,
   Map<Register, int> regStates,
@@ -31,10 +33,26 @@ Future<void> coreTest(
   // timer (an mtimecmp write) so the interrupt is taken once and does not storm
   // on every mret. Null = leave it asserted (level) once raised.
   int? lowerTimerIrqAt,
+  // Repeating machine-timer interrupt. When set, mip.MTIP is raised for
+  // [timerIrqHigh] cycles every [timerIrqPeriod] cycles, starting at
+  // [timerIrqStart]. A period that does not divide the loop length walks the
+  // take across every phase of the instruction stream in ONE simulation, which
+  // is what makes a sweep affordable: building this core costs far more than
+  // running it. Overrides raiseTimerIrqAt/lowerTimerIrqAt.
+  int? timerIrqPeriod,
+  int timerIrqHigh = 6,
+  int timerIrqStart = 40,
+  // Memory behaviour. Null takes RIVER_MEM_* from the environment, and with no
+  // RIVER_MEM_* set the harness keeps the instantaneous MemoryModel it always
+  // had. See adversarial_memory.dart.
+  AdversarialMemory? memory,
 }) async {
+  final behaviour = memory ?? AdversarialMemory.fromEnvironment();
   final clk = SimpleClockGenerator(20).clk;
   final reset = Logic();
-  final timerIrq = raiseTimerIrqAt == null ? null : Logic(name: 'timerIrq');
+  final timerIrq = (raiseTimerIrqAt == null && timerIrqPeriod == null)
+      ? null
+      : Logic(name: 'timerIrq');
 
   final addrWidth = config.mxlen.size;
   final wbConfig = WishboneConfig(
@@ -75,59 +93,86 @@ Future<void> coreTest(
         LogicValue.filled(dataWidth, LogicValue.zero),
   );
 
-  // Bridge Wishbone master to MemoryModel
-  final memRead = DataPortInterface(config.mxlen.size, addrWidth);
-  final memWrite = DataPortInterface(config.mxlen.size, addrWidth);
-
-  // ignore: unused_local_variable
-  final mem = MemoryModel(
-    clk,
-    reset,
-    [wrapWriteForRegisterFile(memWrite)],
-    [wrapReadForRegisterFile(memRead, clk: clk, readLatency: memLatency)],
-    readLatency: memLatency,
-    storage: storage,
-  );
-
   final wbCyc = core.output('dataBus_CYC');
   final wbStb = core.output('dataBus_STB');
   final wbWe = core.output('dataBus_WE');
   final wbAdr = core.output('dataBus_ADR');
   final wbDatMosi = core.output('dataBus_DAT_MOSI');
 
-  memRead.en <= wbCyc & wbStb & ~wbWe;
-  memRead.addr <= wbAdr;
-  memWrite.en <= wbCyc & wbStb & wbWe;
-  memWrite.addr <= wbAdr;
-  memWrite.data <= wbDatMosi;
-
-  // wbAck honors the read port's latency: for reads, only acknowledge when the
-  // slave actually has data ready (memRead.valid, `done` asserts immediately on
-  // `en`, it only means the request was accepted). Writes are combinational, so
-  // a one-cycle ack is correct.
-  final wbAckReg = Logic(name: 'wbAck');
-  final readyForAck = wbWe | memRead.valid;
-  Sequential(clk, [
-    If(
-      reset,
-      then: [wbAckReg < 0],
-      orElse: [
-        If(
-          wbCyc & wbStb & ~wbAckReg & readyForAck,
-          then: [wbAckReg < 1],
-          orElse: [wbAckReg < 0],
-        ),
-      ],
-    ),
-  ]);
   // While `seedGate` is high we starve the data-bus acknowledge so the fetcher
   // stalls on its first read and the pipeline cannot retire anything. This lets
   // us backdoor-seed the register file one entry per clock edge (the regfile has
   // a single write port and clears all entries while `reset` is asserted, so the
   // seed must happen post-reset, with the core held) before instructions run.
   final seedGate = Logic(name: 'seedGate');
-  core.input('dataBus_ACK').srcConnection! <= wbAckReg & ~seedGate;
-  core.input('dataBus_DAT_MISO').srcConnection! <= memRead.data;
+
+  AdversarialWishboneSlave? adversary;
+  if (behaviour != null) {
+    // A memory that is allowed to be slow, to queue and to post. It replaces
+    // the MemoryModel and its acknowledge register, and drives the same two
+    // core inputs. `memLatency` folds into the read latency.
+    final ack = Logic(name: 'advAck');
+    final miso = Logic(name: 'advMiso', width: config.mxlen.size);
+    adversary = attachAdversarialMemory(
+      clk: clk,
+      reset: reset,
+      storage: storage,
+      dataWidth: config.mxlen.size,
+      cyc: wbCyc,
+      stb: wbStb,
+      we: wbWe,
+      adr: wbAdr,
+      datMosi: wbDatMosi,
+      sel: core.output('dataBus_SEL'),
+      ack: ack,
+      miso: miso,
+      behaviour: behaviour,
+    );
+    core.input('dataBus_ACK').srcConnection! <= ack & ~seedGate;
+    core.input('dataBus_DAT_MISO').srcConnection! <= miso;
+  } else {
+    // Bridge Wishbone master to MemoryModel
+    final memRead = DataPortInterface(config.mxlen.size, addrWidth);
+    final memWrite = DataPortInterface(config.mxlen.size, addrWidth);
+
+    // ignore: unused_local_variable
+    final mem = MemoryModel(
+      clk,
+      reset,
+      [wrapWriteForRegisterFile(memWrite)],
+      [wrapReadForRegisterFile(memRead, clk: clk, readLatency: memLatency)],
+      readLatency: memLatency,
+      storage: storage,
+    );
+
+    memRead.en <= wbCyc & wbStb & ~wbWe;
+    memRead.addr <= wbAdr;
+    memWrite.en <= wbCyc & wbStb & wbWe;
+    memWrite.addr <= wbAdr;
+    memWrite.data <= wbDatMosi;
+
+    // wbAck honors the read port's latency: for reads, only acknowledge when the
+    // slave actually has data ready (memRead.valid, `done` asserts immediately on
+    // `en`, it only means the request was accepted). Writes are combinational, so
+    // a one-cycle ack is correct.
+    final wbAckReg = Logic(name: 'wbAck');
+    final readyForAck = wbWe | memRead.valid;
+    Sequential(clk, [
+      If(
+        reset,
+        then: [wbAckReg < 0],
+        orElse: [
+          If(
+            wbCyc & wbStb & ~wbAckReg & readyForAck,
+            then: [wbAckReg < 1],
+            orElse: [wbAckReg < 0],
+          ),
+        ],
+      ),
+    ]);
+    core.input('dataBus_ACK').srcConnection! <= wbAckReg & ~seedGate;
+    core.input('dataBus_DAT_MISO').srcConnection! <= memRead.data;
+  }
 
   reset.inject(1);
   seedGate.inject(initRegisters.isNotEmpty ? 1 : 0);
@@ -171,8 +216,15 @@ Future<void> coreTest(
   var reached = false;
   for (var i = 0; i < maxCycles; i++) {
     await clk.nextPosedge;
-    if (i == raiseTimerIrqAt) timerIrq!.inject(1);
-    if (i == lowerTimerIrqAt) timerIrq!.inject(0);
+    if (timerIrqPeriod != null) {
+      final phase = i - timerIrqStart;
+      timerIrq!.inject(
+        (phase >= 0 && (phase % timerIrqPeriod) < timerIrqHigh) ? 1 : 0,
+      );
+    } else {
+      if (i == raiseTimerIrqAt) timerIrq!.inject(1);
+      if (i == lowerTimerIrqAt) timerIrq!.inject(0);
+    }
     final pc = core.pipeline.nextPc.value;
     if (trace && pc.isValid) {
       final v = pc.toInt();
@@ -198,6 +250,10 @@ Future<void> coreTest(
       print('[TRACE] $r = 0x${rv?.toInt().toRadixString(16)}');
     }
   }
+
+  // A posted write is acknowledged but not yet in storage. Commit the queue so
+  // a pending write is not read back as a lost one.
+  adversary?.flush();
 
   await Simulator.endSimulation();
   await Simulator.simulationEnded;

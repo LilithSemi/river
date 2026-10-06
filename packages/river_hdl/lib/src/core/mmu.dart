@@ -22,6 +22,9 @@ class RiverMmu extends Module {
   Logic get dportFaultGuest => output('dport_fault_guest');
   Logic get ifetchFault => output('ifetch_fault');
 
+  /// Sticky user-mode excursion probe, present only when `userProbe` is set.
+  /// See the probe block in the constructor for the bit map.
+  Logic get probe => output('probe');
   // Downstream bus master outputs
   Logic get wbCyc => output('dataBus_CYC');
   Logic get wbStb => output('dataBus_STB');
@@ -64,6 +67,11 @@ class RiverMmu extends Module {
     // harmlessly): invalidates the single-entry fetch TLB so a page-table edit
     // that does not change satp is observed by the next fetch.
     Logic? tlbFlush,
+    // Sticky user-mode excursion probe (see the `probe` output). Off by
+    // default: when false NOTHING below elaborates, so the emitted RTL is byte
+    // identical to a build that never had the option. Turn it on only to answer
+    // "does this core ever enter user mode" on real hardware.
+    bool userProbe = false,
     // DTLBFC (rpipelinectl[3]): when high, also flush the data TLB on every
     // privilege-mode change (satp changes already flush). Closes the data-TLB
     // residue channel across context switches for paranoid configs.
@@ -177,6 +185,17 @@ class RiverMmu extends Module {
     final reqWe = Logic(name: 'reqWe');
     final reqWdata = Logic(name: 'reqWdata', width: xlen);
     final reqSize = Logic(name: 'reqSize', width: 3);
+    // Privilege state LATCHED with the walk request. The leaf permission check
+    // at the end of a walk must judge the access by the privilege the requester
+    // held when the MMU accepted the request, not by the privilege in effect
+    // many cycles later when the leaf comes back. A trap or an xRET between the
+    // two moved the mode under the walk, and the U-bit rule then denied a
+    // supervisor page to the new (user) mode: a valid, executable page raised an
+    // instruction page fault. SUM and MXR move with the same commit, so latch
+    // them together.
+    final reqPriv = Logic(name: 'reqPriv', width: 3);
+    final reqSum = Logic(name: 'reqSum');
+    final reqMxr = Logic(name: 'reqMxr');
     // Each bus access of the walk is its own Wishbone transaction (cyc/stb drop
     // between accesses, mirroring the single-access path). walkArmed = an access
     // address is queued; walkAddr = that address; armed accesses are launched by
@@ -265,19 +284,32 @@ class RiverMmu extends Module {
     // needs SUM, except a supervisor FETCH from a user page is never allowed
     // (SUM does not cover instruction fetch). M-mode and unwired priv fall back
     // to the R/W/X check only.
-    Logic leafPermFault(Logic pte, Logic isFetch, Logic we) {
+    // [atPriv]/[atSum]/[atMxr] name the privilege state the access was MADE at.
+    // A TLB hit is checked at the cycle the request is granted, so it leaves
+    // them null and the live inputs apply. A walk finishes cycles later, so it
+    // passes the values latched with the request.
+    Logic leafPermFault(
+      Logic pte,
+      Logic isFetch,
+      Logic we, {
+      Logic? atPriv,
+      Logic? atSum,
+      Logic? atMxr,
+    }) {
+      final mxrEff = atMxr ?? mxrIn ?? Const(0);
       final dataPerm = mux(
         we,
         pte[2], // write -> W
-        pte[1] | ((mxrIn ?? Const(0)) & pte[3]), // read -> R | (MXR & X)
+        pte[1] | (mxrEff & pte[3]), // read -> R | (MXR & X)
       );
       final permOk = mux(isFetch, pte[3], dataPerm); // fetch -> X
-      if (priv == null) return ~permOk;
-      final isUser = priv.eq(Const(PrivilegeMode.user.id, width: 3));
-      final isSup = priv.eq(Const(PrivilegeMode.supervisor.id, width: 3));
+      final privEff = atPriv ?? priv;
+      if (privEff == null) return ~permOk;
+      final isUser = privEff.eq(Const(PrivilegeMode.user.id, width: 3));
+      final isSup = privEff.eq(Const(PrivilegeMode.supervisor.id, width: 3));
       final u = pte[4];
       // SUM only relaxes supervisor data access to user pages, not fetches.
-      final supUserOk = (sumIn ?? Const(0)) & ~isFetch;
+      final supUserOk = (atSum ?? sumIn ?? Const(0)) & ~isFetch;
       final uFault = (isUser & ~u) | (isSup & u & ~supUserOk);
       return ~permOk | uFault;
     }
@@ -421,6 +453,19 @@ class RiverMmu extends Module {
         ? leafPa(dtlbPte, dportAddr, dtlbLevel)
         : Const(0, width: xlen);
 
+    // A transfer ends on ONE acknowledge. Every branch below that consumes an
+    // ACK is qualified by cycR, the registered CYC the MMU is driving, so an
+    // acknowledge that arrives when the MMU owns no transaction is ignored.
+    // Without this, a slave that held ACK for a second cycle (after the MMU had
+    // already dropped CYC) was read as the NEXT page-table entry: the walk
+    // descended a level on a PTE it had already consumed, read a table entry
+    // that belongs to no part of the translation, found it empty, and raised an
+    // instruction page fault on a valid executable page. The Harbor register
+    // slice pulses ACK for one cycle, so the shipped fabric never did this, but
+    // the FSM must not depend on that. cycR and stbR are always written
+    // together, so cycR alone names a live transaction and costs one AND term.
+    final ackLive = (cycR & wbAck).named('ackLive');
+
     Sequential(clk, [
       If(
         reset,
@@ -465,6 +510,9 @@ class RiverMmu extends Module {
           reqWe < 0,
           reqWdata < 0,
           reqSize < 0,
+          reqPriv < 0,
+          reqSum < 0,
+          reqMxr < 0,
           if (hasTwoStage) ...[
             gWalking < 0,
             gWalkArmed < 0,
@@ -504,7 +552,7 @@ class RiverMmu extends Module {
             // G sub-walk both gWalking and walking may be set). Resolves the
             // host-physical address for the pending VS access, then resumes it.
             if (hasTwoStage)
-              Iff(busActive & wbAck & gWalking, [
+              Iff(busActive & ackLive & gWalking, [
                 cycR < 0,
                 stbR < 0,
                 If.block([
@@ -583,7 +631,7 @@ class RiverMmu extends Module {
 
             // Page-table walk: a PTE just came back.
             if (hasPaging)
-              Iff(busActive & wbAck & walking & ~(hasTwoStage ? gWalking : Const(0)), [
+              Iff(busActive & ackLive & walking & ~(hasTwoStage ? gWalking : Const(0)), [
                 // End this PTE's transaction.
                 cycR < 0,
                 stbR < 0,
@@ -605,7 +653,14 @@ class RiverMmu extends Module {
                   // Leaf PTE.
                   Iff(pteLeaf(wbDatMiso), [
                     If(
-                      leafPermFault(wbDatMiso, isFetchWalk, reqWe),
+                      leafPermFault(
+                        wbDatMiso,
+                        isFetchWalk,
+                        reqWe,
+                        atPriv: priv == null ? null : reqPriv,
+                        atSum: sumIn == null ? null : reqSum,
+                        atMxr: mxrIn == null ? null : reqMxr,
+                      ),
                       then: [
                         // Permission violation -> page fault.
                         walking < 0,
@@ -709,7 +764,7 @@ class RiverMmu extends Module {
 
             // Svadu A/D PTE writeback completed: resume with the access.
             if (hasPaging)
-              Iff(busActive & wbAck & adWrite, [
+              Iff(busActive & ackLive & adWrite, [
                 cycR < 0,
                 stbR < 0,
                 adWrite < 0,
@@ -723,7 +778,7 @@ class RiverMmu extends Module {
 
             // ACK received, complete the (non-walk) transaction.
             if (hasPaging)
-              Iff(busActive & wbAck & ~walking & ~adWrite, [
+              Iff(busActive & ackLive & ~walking & ~adWrite, [
                 cycR < 0,
                 stbR < 0,
                 busActive < 0,
@@ -756,7 +811,7 @@ class RiverMmu extends Module {
                 arbState < 0,
               ])
             else
-              Iff(busActive & wbAck, [
+              Iff(busActive & ackLive, [
                 cycR < 0,
                 stbR < 0,
                 busActive < 0,
@@ -883,6 +938,12 @@ class RiverMmu extends Module {
                         reqWe < dportWe,
                         reqWdata < dportWdata,
                         reqSize < dportSize,
+                        // Freeze the privilege state this access was made at,
+                        // so the leaf check at the end of the walk judges the
+                        // requester and not whoever is running by then.
+                        reqPriv < (priv ?? Const(0, width: 3)),
+                        reqSum < (sumIn ?? Const(0)),
+                        reqMxr < (mxrIn ?? Const(0)),
                         walkArmed < 1,
                         walkAddr <
                             ptePtr(rootBase, vpnOf(dportAddr, startLevel)),
@@ -964,6 +1025,11 @@ class RiverMmu extends Module {
                         reqWe < 0,
                         reqWdata < 0,
                         reqSize < Const(3, width: 3),
+                        // See the data port above: the fetch is judged by the
+                        // privilege it was requested at.
+                        reqPriv < (priv ?? Const(0, width: 3)),
+                        reqSum < (sumIn ?? Const(0)),
+                        reqMxr < (mxrIn ?? Const(0)),
                         walkArmed < 1,
                         walkAddr <
                             ptePtr(rootBase, vpnOf(ifetchAddr, startLevel)),
@@ -998,6 +1064,67 @@ class RiverMmu extends Module {
         ],
       ),
     ]);
+
+    // Sticky user-mode excursion probe.
+    //
+    // A privilege excursion into user mode is invisible after the fact: any
+    // trap taken later is taken FROM supervisor, so sstatus.SPP reads 1 and the
+    // excursion leaves no trace. It has to be caught while it happens. These
+    // four bits set once and never clear, so a debugger can read them long
+    // afterwards and learn what the core did.
+    //
+    //   bit 0  everUser       the core was in user mode at all
+    //   bit 1  userWalk       it was in user mode while a page-table walk ran
+    //   bit 2  latchMismatch  a walk accepted in user mode returned its leaf
+    //                         while the core was no longer in user mode. This
+    //                         is the EXACT condition under which the
+    //                         grant-time privilege latch judges an access
+    //                         differently from the live-privilege check it
+    //                         replaced.
+    //   bit 3  userFault      such a walk actually raised a page fault
+    //
+    // It is a SEPARATE sequential block on purpose: it adds no input to the
+    // walk FSM's condition cone, so it cannot slow down the logic it measures.
+    if (userProbe && hasPaging && priv != null) {
+      final userId = Const(PrivilegeMode.user.id, width: 3);
+      final everUser = Logic(name: 'probeEverUser');
+      final userWalk = Logic(name: 'probeUserWalk');
+      final latchMismatch = Logic(name: 'probeLatchMismatch');
+      final userFault = Logic(name: 'probeUserFault');
+
+      final leafNow = (busActive & ackLive & walking & pteLeaf(wbDatMiso))
+          .named('probeLeafNow');
+      final acceptedInUser = (leafNow & reqPriv.eq(userId)).named(
+        'probeAcceptedInUser',
+      );
+
+      addOutput('probe', width: 4);
+      Sequential(clk, [
+        If(
+          reset,
+          then: [everUser < 0, userWalk < 0, latchMismatch < 0, userFault < 0],
+          orElse: [
+            If(priv.eq(userId), then: [everUser < 1]),
+            If(priv.eq(userId) & walking, then: [userWalk < 1]),
+            If(acceptedInUser & priv.neq(userId), then: [latchMismatch < 1]),
+            If(
+              acceptedInUser &
+                  leafPermFault(
+                    wbDatMiso,
+                    isFetchWalk,
+                    reqWe,
+                    atPriv: reqPriv,
+                    atSum: reqSum,
+                    atMxr: reqMxr,
+                  ),
+              then: [userFault < 1],
+            ),
+          ],
+        ),
+      ]);
+      output('probe') <=
+          [userFault, latchMismatch, userWalk, everUser].swizzle();
+    }
 
     // Drive outputs from registers
     ifetchDone <= ifDoneR;

@@ -156,6 +156,14 @@ void main() {
     required int nextPc,
     required List<Register> checkRegs,
     List<int> checkMem = const [],
+    // Privilege both engines start in. M-mode accesses are PHYSICAL in both, so
+    // a test that must exercise paged translation has to run in S-mode.
+    PrivilegeMode? startPriv,
+    // Golden values the EMULATOR must produce before the HDL is compared to it.
+    // parityCheck only asserts that the two engines agree, so a case where both
+    // do nothing agrees trivially. Pin the expected result here and that silent
+    // pass becomes a failure.
+    Map<Register, int> expectGold = const {},
   }) async {
     // --- Emulator golden run ---
     final sram = Sram(
@@ -176,6 +184,7 @@ void main() {
       }
     });
     seed.forEach((r, v) => ecore.xregs[r] = v);
+    if (startPriv != null) ecore.mode = startPriv;
     // fetch + cycle (NOT runPipeline): cycle() routes V opcodes to executeVector;
     // runPipeline would hit the stub rv_v microcode and skip vector execution.
     var pc = config.resetVector;
@@ -189,6 +198,13 @@ void main() {
       reason: 'emulator did not reach nextPc=$nextPc (got $pc)',
     );
     final goldRegs = {for (final r in checkRegs) r: ecore.xregs[r] ?? 0};
+    expectGold.forEach((r, want) {
+      expect(
+        goldRegs[r],
+        want,
+        reason: 'emulator golden $r is wrong, so the parity check is vacuous',
+      );
+    });
     final goldMem = {for (final a in checkMem) a: rd64(sram, a)};
 
     // --- HDL check vs golden ---
@@ -209,6 +225,7 @@ void main() {
       memStates: goldMem,
       initRegisters: seed,
       nextPc: nextPc,
+      startPriv: startPriv,
     );
   }
 
@@ -510,6 +527,13 @@ void main() {
         nop,
       ],
       hvConfig(),
+      // S-mode: M-mode data accesses are physical in BOTH engines (HDL
+      // mmu.dart `dataPagingOn`, emulator Core.translate), so an M-mode run
+      // would read PA 0x20000, get 0 in both, and pass without ever walking the
+      // table. S-mode makes the walk actually happen.
+      startPriv: PrivilegeMode.supervisor,
+      // The walk must actually reach PA 0x30000 and load its data.
+      expectGold: {Register.x11: 0x12345678DEADBEEF},
       seed: {Register.x10: 0x8000000000000010},
       dataMem: {
         0x10000: [0x4401, 0], // l2[0] -> l1 (PPN 0x11), V

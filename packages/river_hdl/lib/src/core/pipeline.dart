@@ -96,6 +96,11 @@ class RiverPipeline extends Module {
     Logic? stvec,
     Logic? interruptTake,
     Logic? interruptCause,
+    // Floating-point register ports, owned by the core module next to the
+    // integer file. Null on a core without F/D.
+    DataPortInterface? fpRs1Port,
+    DataPortInterface? fpRs2Port,
+    DataPortInterface? fpRdPort,
     // mret/sret return targets (for the OoO commit-stage fetcher redirect).
     Logic? mepc,
     Logic? sepc,
@@ -230,6 +235,42 @@ class RiverPipeline extends Module {
         inputTags: {DataPortGroup.integrity},
         uniquify: (og) => 'rdWrite_$og',
       );
+
+    // The FP register file lives in the core module beside the integer file, so
+    // its ports cross this boundary exactly as the integer ports do.
+    final fpRs1In = fpRs1Port;
+    if (fpRs1In != null) {
+      fpRs1Port = fpRs1In.clone()
+        ..connectIO(
+          this,
+          fpRs1In,
+          outputTags: {DataPortGroup.control},
+          inputTags: {DataPortGroup.data, DataPortGroup.integrity},
+          uniquify: (og) => 'fpRs1Port_$og',
+        );
+    }
+    final fpRs2In = fpRs2Port;
+    if (fpRs2In != null) {
+      fpRs2Port = fpRs2In.clone()
+        ..connectIO(
+          this,
+          fpRs2In,
+          outputTags: {DataPortGroup.control},
+          inputTags: {DataPortGroup.data, DataPortGroup.integrity},
+          uniquify: (og) => 'fpRs2Port_$og',
+        );
+    }
+    final fpRdIn = fpRdPort;
+    if (fpRdIn != null) {
+      fpRdPort = fpRdIn.clone()
+        ..connectIO(
+          this,
+          fpRdIn,
+          outputTags: {DataPortGroup.control, DataPortGroup.data},
+          inputTags: {DataPortGroup.integrity},
+          uniquify: (og) => 'fpRdPort_$og',
+        );
+    }
 
     // Dual-commit: second register write port + its back-pressure inputs.
     if (rdWrite1 != null) {
@@ -571,6 +612,9 @@ class RiverPipeline extends Module {
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
               staticInstructions: staticInstructions,
+              fpRs1Port: fpRs1Port,
+              fpRs2Port: fpRs2Port,
+              fpRdPort: fpRdPort,
               counterWidth: counterWidth,
             )
           : StaticExecutionUnit(
@@ -607,6 +651,9 @@ class RiverPipeline extends Module {
               memFaultGuest: memFaultGuest,
               fetchFault: fetchFaultSig,
               staticInstructions: staticInstructions,
+              fpRs1Port: fpRs1Port,
+              fpRs2Port: fpRs2Port,
+              fpRdPort: fpRdPort,
               counterWidth: counterWidth,
             );
 
@@ -1499,13 +1546,63 @@ class RiverPipeline extends Module {
       final commitReturnLevel3 = rob.commitReturnLevel0
           .zeroExtend(3)
           .named('commitReturnLevel3');
+
+      // Front-end instruction page fault. The fetcher could not deliver the
+      // instruction, so nothing is allocated into the ROB and no functional
+      // unit can ever report the fault at commit. The fault must therefore be
+      // taken here, from the front end. It waits for the ROB to drain, so every
+      // older instruction has retired and the exception stays precise.
+      //
+      // Without this the OoO pipeline simply ignored fetch_fault: the fetch
+      // buffer held the faulting slot (it clears only on a redirect) and
+      // re-presented the same bubble every cycle, so the core spun on the bad
+      // PC instead of trapping. The in-order pipeline has always taken this
+      // fault through its exec unit.
+      final feFaultCause = Const(Trap.instructionPageFault.causeCode, width: 6);
+      final Logic frontEndFault;
+      if (speculative && useCompressedFetch) {
+        // One-shot: fetch_fault is held until the redirect lands, so latch that
+        // the trap was taken and re-arm only once the fetcher has moved on.
+        final feFaultTaken = Logic(name: 'feFaultTaken');
+        frontEndFault = (fetchFaultSig & rob.empty & enable & ~feFaultTaken)
+            .named('frontEndFault');
+        Sequential(clk, [
+          If(
+            reset,
+            then: [feFaultTaken < 0],
+            orElse: [
+              If(
+                frontEndFault,
+                then: [feFaultTaken < 1],
+                orElse: [
+                  If(~fetchFaultSig, then: [feFaultTaken < 0]),
+                ],
+              ),
+            ],
+          ),
+        ]);
+      } else {
+        // No speculative redirect path, so the fetcher cannot be resteered to a
+        // trap vector from here.
+        frontEndFault = Const(0);
+      }
+      // The cause that drives the trap vector and the target mode: the front-end
+      // fault carries its own, everything else comes from the committing entry.
+      final trapCauseSel = mux(
+        frontEndFault,
+        feFaultCause,
+        rob.commitCause0,
+      ).named('trapCauseSel');
+      // Either source takes a trap this cycle.
+      final anyTrap = (commitException | frontEndFault).named('anyTrap');
+
       final Logic trapTargetMode;
       final Logic trapVecPc;
       if (mtvec != null) {
         final isIntr = Const(0); // commit exceptions are synchronous
         trapTargetMode = selectTrapTargetModeTop(
           isIntr,
-          rob.commitCause0,
+          trapCauseSel,
           currentMode,
           mideleg,
           medeleg,
@@ -1517,7 +1614,7 @@ class RiverPipeline extends Module {
             : mtvec;
         trapVecPc = computeTrapVectorPcTop(
           tvec,
-          rob.commitCause0,
+          trapCauseSel,
           isIntr,
           mxlen,
           suffix: 'Ooo',
@@ -1621,11 +1718,16 @@ class RiverPipeline extends Module {
         // return -> {m,s}epc, branch -> commit target.
         final commitBranchRedir = (rob.commitValid0 & rob.commitRedirects0)
             .named('commitBranchRedir');
+        // A front-end fetch fault steers the fetcher exactly like a committing
+        // exception. The flush is a no-op for the (drained) back end, but the
+        // redirect is what clears the fetch buffer's held fault and restarts it
+        // at the trap vector.
         specFlush! <=
-            (commitBranchRedir | commitException | commitReturn).named('specF');
+            (commitBranchRedir | commitException | commitReturn | frontEndFault)
+                .named('specF');
         final anyRedirect = (specFlush | predictRedirect).named('anyRedirect');
         final commitRedirPc = mux(
-          commitException,
+          anyTrap,
           trapVecPc,
           mux(commitReturn, retVecPc, rob.commitTarget0),
         ).named('commitRedirPc');
@@ -2265,15 +2367,16 @@ class RiverPipeline extends Module {
             counter < 0,
           ],
           orElse: [
-            // Commit: signal done when ROB commits
-            done < rob.commitValid0,
+            // Commit: signal done when the ROB commits, or when the front end
+            // takes a fetch fault (nothing reached the ROB to commit).
+            done < rob.commitValid0 | frontEndFault,
             valid < rob.commitValid0 & ~rob.commitException0,
 
-            // PC update: a committing exception redirects to the trap vector
-            // (highest priority); else a branch/jump redirects to its target;
+            // PC update: a trap redirects to the trap vector (highest
+            // priority); else a branch/jump redirects to its target;
             // otherwise advance past the committed instruction.
             If(
-              commitException,
+              anyTrap,
               then: [nextPc < trapVecPc],
               orElse: [
                 If(
@@ -2293,16 +2396,18 @@ class RiverPipeline extends Module {
             ),
 
             nextSp < currentSp,
-            nextMode < mux(commitException, trapTargetMode, currentMode),
+            nextMode < mux(anyTrap, trapTargetMode, currentMode),
 
-            // Trap from ROB commit
-            trap < (rob.commitValid0 & rob.commitException0),
-            trapCause < rob.commitCause0,
+            // Trap from ROB commit, or from a front-end fetch fault.
+            trap < ((rob.commitValid0 & rob.commitException0) | frontEndFault),
+            trapCause < trapCauseSel,
             // OoO path takes no async interrupts yet; ROB commits only
             // synchronous exceptions.
             trapInterrupt < 0,
             trapTval < Const(0, width: mxlen.size),
-            trapEpc < rob.commitPc0,
+            // The fetch fault belongs to the PC the fetcher could not read,
+            // which the ROB never saw.
+            trapEpc < mux(frontEndFault, fetchOutPc, rob.commitPc0),
             // Privileged return (mret/sret): core.dart restores pc<-{m,s}epc and
             // mode<-{m,s}status.xPP and pops the status stack. The fetcher was
             // already redirected to retVecPc + flushed via specFlush above.

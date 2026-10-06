@@ -22,6 +22,12 @@ class RiverCore extends BridgeModule {
   RiverCore(
     this.config, {
     Map<String, Logic> srcIrqs = const {},
+    // Supervisor external interrupt-pending line from the interrupt controller,
+    // the S-mode counterpart of [srcIrqs]. Drives mip.SEIP(9); null ties the bit
+    // to 0. The SoC wires this from the PLIC context that belongs to this hart's
+    // S-mode (see genip). Kept a separate port from [srcIrqs] because an S-mode
+    // OS claims from its OWN context window, so the two lines are independent.
+    Logic? supervisorExternalPending,
     // Machine timer / software interrupt-pending lines from the CLINT. Drive
     // mip.MTIP(7) and mip.MSIP(3) respectively; null ties the bit to 0. The SoC
     // wires these from the CLINT's timer_irq/sw_irq outputs (see genip).
@@ -42,6 +48,13 @@ class RiverCore extends BridgeModule {
     // here, so it must be mirrored to a plain output to stay hierarchy-legal.
     // Off in production.
     bool busTap = false,
+    // Sticky user-mode excursion probe. Off by default and BYTE IDENTICAL when
+    // off: nothing below elaborates. When on, seven sticky bits appear in the
+    // reserved field of the dcsr READ path (they are not stored in dcsr, so a
+    // debugger write cannot clobber them) and answer, over JTAG, whether this
+    // core ever entered user mode and what put it there. See the probe block
+    // below for the bit map.
+    bool userProbe = false,
     // Test-only backdoor: when high, an architectural regWritePort write also
     // seeds the OoO physical regfile. Asserted only while frozen during seeding;
     // null leaves it tied off.
@@ -128,6 +141,12 @@ class RiverCore extends BridgeModule {
     Logic? dbgTdata2Write; // debugger writing tdata2 (selected trigger)
     Logic? dbgTrigRdata; // read value for tselect/tdata1/tdata2/tinfo
     Logic? dbgIsTrigCsr; // regno is one of the trigger CSRs (0x7a0..0x7a4)
+    // Sticky user-mode entry witnesses (userProbe only). Declared here and
+    // driven from their own sequential block at the end of the constructor, so
+    // the dcsr read path below can fold them in.
+    Logic? probeUserFromMret; // an MRET restored MPP = user
+    Logic? probeUserFromSret; // an SRET restored SPP = user
+    Logic? probeUserFromTrap; // a trap targeted user mode
     if (withDebug) {
       createPort('debug_halt_req', PortDirection.input);
       createPort('debug_resume_req', PortDirection.input);
@@ -148,6 +167,11 @@ class RiverCore extends BridgeModule {
       debugHalted = Logic(name: 'debugHalted');
       debugDpc = Logic(name: 'debugDpc', width: config.mxlen.size);
       debugDcsr = Logic(name: 'debugDcsr', width: 32);
+      if (userProbe) {
+        probeUserFromMret = Logic(name: 'probeUserFromMret');
+        probeUserFromSret = Logic(name: 'probeUserFromSret');
+        probeUserFromTrap = Logic(name: 'probeUserFromTrap');
+      }
       ebreakDebug = Logic(name: 'ebreakDebug');
       stepping = Logic(name: 'stepping');
       output('debug_halted') <= debugHalted;
@@ -389,6 +413,60 @@ class RiverCore extends BridgeModule {
     final useICache = l1?.i != null;
     final useDCache = l1 != null;
 
+    // Permission context for the L1 tags. Both caches are in FRONT of the MMU,
+    // so a HIT never reaches the MMU and no permission check runs on it. Without
+    // this tag a line filled by one privilege mode stayed usable by a mode the
+    // page table forbids: user code read a supervisor-only page out of the
+    // D-cache and executed a supervisor-only page out of the I-cache, and a
+    // supervisor load with sstatus.SUM clear read a user page. The privilege
+    // change itself flushes nothing here (the MMU DTLBFC does not reach the L1).
+    //
+    // Tagging each line with its context makes the offending access MISS, so it
+    // goes to the MMU and faults. It costs one flop per line per context bit and
+    // does not flush the cache on every trap, which whole-cache invalidation on
+    // a privilege change would.
+    //
+    // Fetch permission depends on the privilege mode only. A load also depends
+    // on sstatus.SUM, so the D-cache carries that bit too. Two mode bits
+    // separate U (0), S (1) and M (3), which matters as well because machine
+    // mode is untranslated and its addresses are physical. sstatus.SUM only
+    // exists with the CSR file, so drop that bit when there is none: the
+    // privilege bits alone are still correct, just coarser.
+    final privContext =
+        (useICache || useDCache) && (config.hasSupervisor || config.hasUser);
+    Logic? iCtx;
+    Logic? dCtx;
+    if (privContext) {
+      final privTag = mode.slice(1, 0);
+      iCtx = virt == null ? privTag : [virt, privTag].swizzle();
+      // sstatus.SUM is deliberately left out. It only separates an S-mode access
+      // made with SUM set from one made with SUM clear, which is a narrow
+      // permission hole and not a data-corruption path for a correct kernel. The
+      // privilege bits alone catch the case that corrupts Linux, where a kernel
+      // virtual address and a user virtual address share a tag because the tag
+      // holds no address bit above 31. Each tag bit widens the comparator, and
+      // that comparator is this core's FPGA critical path, so the bit is not
+      // free: including SUM measurably hurt routing on xc7s50.
+      dCtx = [if (guestAccessWire != null) guestAccessWire, privTag].swizzle();
+    }
+
+    // Significant low address bits BOTH L1 caches must tag on.
+    //
+    // The caches sit in FRONT of the MMU, so they are virtually indexed and
+    // virtually tagged: with paging on they are shown a VIRTUAL address and only
+    // a miss is translated. The tag must span the widest VIRTUAL address the
+    // core can present, not the physical map. This used to be a flat 32, which
+    // is the physical map width, so VA[63:32] was never compared and under Sv39
+    // the linear map, vmalloc and kernel text aliased onto each other.
+    //
+    // 39 for Sv39 (VA[63:39] is a sign extension of VA[38], so VA[38:0] carries
+    // every bit that distinguishes one canonical address from another). The
+    // floor of 32 covers M-mode and satp=Bare, where the request is a physical
+    // address on a <=4 GB map.
+    final l1AddrBits = config.mmu.pagingModes
+        .map((m) => m.virtualBits)
+        .fold<int>(32, (a, b) => b > a ? b : a);
+
     final icMemDone = Logic(name: 'icMemDone');
     final icMemValid = Logic(name: 'icMemValid');
     final icMemFault = Logic(name: 'icMemFault');
@@ -403,9 +481,8 @@ class RiverCore extends BridgeModule {
         config: l1!.i!,
         xlen: config.mxlen.size,
         dualPort: dualDispatch,
-        // 32 physical bits cover the fetch space (DRAM at 0x80000000 + <=1GB); a
-        // narrower tag packs far fewer LUTs than a full xlen compare.
-        physAddrBits: 32,
+        ctxBits: iCtx?.width ?? 0,
+        reqAddrBits: l1AddrBits,
         // Maps the per-line data to a block RAM (DP16KD / RAMB36E1).
         target: target,
       );
@@ -414,6 +491,7 @@ class RiverCore extends BridgeModule {
       icache.input('reset').srcConnection! <= reset;
       icache.input('req_addr').srcConnection! <= pipeFetchRead.addr;
       icache.input('req_valid').srcConnection! <= pipeFetchRead.en;
+      if (iCtx != null) icache.input('req_ctx').srcConnection! <= iCtx;
       icache.input('flush').srcConnection! <= icFlush;
       icache.input('mem_done').srcConnection! <= icMemDone;
       icache.input('mem_valid').srcConnection! <= icMemValid;
@@ -441,7 +519,8 @@ class RiverCore extends BridgeModule {
       dcache = HarborL1DCache(
         config: l1.d,
         xlen: config.mxlen.size,
-        physAddrBits: 32,
+        ctxBits: dCtx?.width ?? 0,
+        reqAddrBits: l1AddrBits,
         target: target,
       );
       addSubModule(dcache);
@@ -449,6 +528,7 @@ class RiverCore extends BridgeModule {
       dcache.input('reset').srcConnection! <= reset;
       dcache.input('req_addr').srcConnection! <= dportAddr;
       dcache.input('req_valid').srcConnection! <= dportEn;
+      if (dCtx != null) dcache.input('req_ctx').srcConnection! <= dCtx;
       dcache.input('req_write').srcConnection! <= dportWe;
       dcache.input('req_data').srcConnection! <= writeValue;
       dcache.input('req_size').srcConnection! <= dportSize;
@@ -497,6 +577,7 @@ class RiverCore extends BridgeModule {
       translateFetch: config.mmu.hasPaging,
       tlbFlush: config.mmu.hasPaging ? mmuTlbFlush : null,
       dtlbFlushOnPrivChange: config.mmu.hasPaging ? dtlbFlushOnPriv : null,
+      userProbe: userProbe,
     );
 
     if (useICache) {
@@ -561,10 +642,19 @@ class RiverCore extends BridgeModule {
       dcMemDone <= mmu.dportDone;
       dcMemValid <= mmu.dportValid;
       dcMemRdata <= mmu.dportRdata;
-      pipeExecRead.done <= dcache!.respValid & ~execWriteActive;
+      // A faulting access is delivered as done AND NOT valid, the same contract
+      // the no-D-cache path below uses, so the exec unit raises a load/store
+      // page fault. done and valid were BOTH driven from respValid here, which
+      // made `done & ~valid` structurally impossible: the core could not report
+      // a data page fault at all while the D-cache was in the path, and the
+      // cache's fill/bypass FSM hung on the faulting access anyway. A NULL
+      // pointer dereference froze the machine instead of trapping.
+      pipeExecRead.done <=
+          (dcache!.respValid | dcache.respFault) & ~execWriteActive;
       pipeExecRead.valid <= dcache.respValid & ~execWriteActive;
       pipeExecRead.data <= dcache.respData;
-      pipeExecWrite.done <= dcache.respValid & execWriteActive;
+      pipeExecWrite.done <=
+          (dcache.respValid | dcache.respFault) & execWriteActive;
       pipeExecWrite.valid <= dcache.respValid & execWriteActive;
     } else {
       pipeExecRead.done <= mmu.dportDone & ~execWriteActive;
@@ -677,9 +767,27 @@ class RiverCore extends BridgeModule {
       final gprOrCsr = dbgCsrData == null
           ? regs.rd0Data
           : mux(dbgIsGpr!, regs.rd0Data, dbgCsrData);
+      // User-mode excursion probe, reported in dcsr's reserved field [26:20].
+      // It is folded into the READ path only, never stored in debugDcsr, so a
+      // debugger write to dcsr cannot clobber it and the existing write mask
+      // (0x0FFFFE3F) needs no change. Bit map:
+      //   [23:20] MMU probe: everUser, userWalk, latchMismatch, userFault
+      //   [24]    an MRET restored MPP = user
+      //   [25]    an SRET restored SPP = user
+      //   [26]    a trap targeted user mode
+      final dcsrRead = !userProbe
+          ? debugDcsr!
+          : (debugDcsr! |
+                    (config.mmu.hasPaging
+                        ? (mmu.probe.zeroExtend(32) << 20)
+                        : Const(0, width: 32)) |
+                    (probeUserFromMret!.zeroExtend(32) << 24) |
+                    (probeUserFromSret!.zeroExtend(32) << 25) |
+                    (probeUserFromTrap!.zeroExtend(32) << 26))
+                .named('dcsrRead');
       final nonTrig = mux(
         dbgIsDcsr!,
-        debugDcsr!.zeroExtend(config.mxlen.size),
+        dcsrRead.zeroExtend(config.mxlen.size),
         mux(
           dbgIsMisa!,
           Const(config.isa.misaValue, width: config.mxlen.size),
@@ -713,6 +821,74 @@ class RiverCore extends BridgeModule {
     rdWrite.done <= rdWrite.en;
     rdWrite.valid <= rdWrite.en;
 
+    // Floating-point register file (F/D). It lives here beside the integer file
+    // so it sees the same device target and can use a BRAM backend instead of a
+    // flop array. A 32x64 two-read-port flop file costs about 2048 flops plus
+    // two 64-bit 32-to-1 read multiplexers, which is large and slow to place.
+    // The exec unit gets the ports. A core with no FP operation gets neither.
+    final hasFloat = microcode.execLookup.values.any(
+      (op) => op.resources.any(
+        (r) => r is RfResource && r.regfile is RiscVFloatRegFile,
+      ),
+    );
+    DataPortInterface? fpRs1Port;
+    DataPortInterface? fpRs2Port;
+    DataPortInterface? fpRdPort;
+    if (hasFloat) {
+      final fp1 = DataPortInterface(64, 5);
+      final fp2 = DataPortInterface(64, 5);
+      final fpw = DataPortInterface(64, 5);
+      final fpRegs = HarborRegisterFile(
+        numEntries: 32,
+        dataWidth: 64,
+        // RISC-V has no hardwired-zero float register: f0/ft0 is a normal
+        // storage entry, unlike integer x0.
+        reservedZero: false,
+        target: target,
+        // The SAME knob the integer file gets. Without it the FP file always
+        // built at latency 0 in simulation, while the shipping target gives it
+        // latency 1 from the device default, so the hardware read latency of
+        // the FP file was never exercised in a test.
+        forceReadLatency: config.regfileReadLatency,
+        name: 'fp_regfile',
+      );
+      // No addSubModule here. ROHD resolves the owning module by tracing
+      // connectivity, and every FP port connects into the pipeline, so an
+      // explicit core parent contradicts the resolved one. Hierarchy placement
+      // does not change the synthesised result, and the file is still built
+      // with the device target, which is the point of moving it here.
+      fpRegs.input('clk').srcConnection! <= clk;
+      fpRegs.input('reset').srcConnection! <= reset;
+      fpRegs.input('rd0_addr').srcConnection! <= fp1.addr;
+      fpRegs.input('rd1_addr').srcConnection! <= fp2.addr;
+      fpRegs.input('wr_en').srcConnection! <= fpw.en;
+      fpRegs.input('wr_addr').srcConnection! <= fpw.addr;
+      fpRegs.input('wr_data').srcConnection! <= fpw.data;
+      fp1.data <= fpRegs.rd0Data;
+      fp2.data <= fpRegs.rd1Data;
+      // Read data is [fpRegs.readLatency] cycles behind the address, the same
+      // as the integer file, so delay the handshake by the same amount.
+      Logic delayFpRead(Logic en, String name) {
+        var d = en;
+        for (var i = 0; i < fpRegs.readLatency; i++) {
+          final q = Logic(name: '${name}_q$i');
+          Sequential(clk, [q < d]);
+          d = q;
+        }
+        return d;
+      }
+
+      fp1.done <= delayFpRead(fp1.en, 'fpRs1RdDone');
+      fp1.valid <= delayFpRead(fp1.en, 'fpRs1RdValid');
+      fp2.done <= delayFpRead(fp2.en, 'fpRs2RdDone');
+      fp2.valid <= delayFpRead(fp2.en, 'fpRs2RdValid');
+      fpw.done <= fpw.en;
+      fpw.valid <= fpw.en;
+      fpRs1Port = fp1;
+      fpRs2Port = fp2;
+      fpRdPort = fpw;
+    }
+
     // The Debug Module borrows read port 0 to service abstract register-access
     // commands. Its ready must lag reg_read by the regfile read latency (the same
     // delay the operand read applies), otherwise the DM latches stale read data on
@@ -732,6 +908,11 @@ class RiverCore extends BridgeModule {
       final anyFromThis = sig.or();
       externalPending = externalPending | anyFromThis;
     }
+    // Supervisor external line -> mip.SEIP. Named `seiPending` at the module
+    // boundary, the name the SoC and the CSR file both use for it.
+    final seiPendingIn = supervisorExternalPending == null
+        ? null
+        : addInput('seiPending', supervisorExternalPending);
     // Per-cause CLINT lines: timer -> mip.MTIP, software -> mip.MSIP. Kept
     // distinct from externalPending (MEIP) so the SBI timer and IPIs reach the
     // right mcause, not the external-interrupt handler.
@@ -857,6 +1038,10 @@ class RiverCore extends BridgeModule {
     final csrTrapToVS = config.hasHypervisor
         ? Logic(name: 'csrTrapToVS')
         : null;
+    // The retire strobe for minstret: one pulse per instruction that COMMITS.
+    // Driven from the same `committing` gate the trap/xRET controls use, so a
+    // multi-cycle microcoded instruction counts once.
+    final csrRetire = config.hasCsrs ? Logic(name: 'csrRetire') : null;
 
     final csrs = config.hasCsrs
         ? RiscVCsrFile(
@@ -871,6 +1056,12 @@ class RiverCore extends BridgeModule {
             mhartid: config.hartId,
             rpipelineCap: config.rpipelineCap,
             externalPending: externalPending,
+            supervisorExternalPending: seiPendingIn,
+            // An FP register-file write makes the FP context dirty. The CSR
+            // file keeps a sticky flop and shows FS=Dirty on every mstatus and
+            // sstatus read while it is set.
+            fpDirty: fpRdPort?.en,
+            retire: csrRetire,
             timerPending: timerPendingIn,
             swPending: swPendingIn,
             timeIn: timeInIn,
@@ -1236,9 +1427,19 @@ class RiverCore extends BridgeModule {
       final mGlobal = ((isM & mMie) | ~isM).named('mIntGlobal');
       final sGlobal = ((isS & sSie) | isU).named('sIntGlobal');
       final mPend = (csrs.mip & csrs.mie).named('mIntPend');
-      final sPend = config.hasSupervisor
+      var sPend = config.hasSupervisor
           ? (csrs.sip! & csrs.sie!).named('sIntPend')
           : Const(0, width: xlen);
+      // mip.SEIP(9) is the OR of the hardware supervisor-external line and the
+      // software-writable bit, per the privileged spec. The CSR file holds only
+      // the software bit today, so the hardware line joins the take decision
+      // here, still gated by sie.SEIE. This stays correct after the CSR file
+      // folds the line into its own sip view: OR is idempotent.
+      if (seiPendingIn != null && config.hasSupervisor) {
+        sPend = sPend
+            .withSet(9, sPend[9] | (seiPendingIn & csrs.sie![9]))
+            .named('sIntPendHw');
+      }
       // (bit, isSupervisor), listed lowest priority first so the folds below let
       // the highest priority win.
       const order = [
@@ -1330,6 +1531,9 @@ class RiverCore extends BridgeModule {
       stvec: csrs?.stvec,
       interruptTake: interruptTake,
       interruptCause: interruptCause,
+      fpRs1Port: fpRs1Port,
+      fpRs2Port: fpRs2Port,
+      fpRdPort: fpRdPort,
       mepc: csrs?.mepc,
       sepc: (csrs != null && config.hasSupervisor) ? csrs.sepc : null,
       virt: virt,
@@ -1361,12 +1565,24 @@ class RiverCore extends BridgeModule {
       staticInstructions: staticInstructions,
     );
 
-    // Flush the instruction cache on fence.i (the pipeline's fence signal).
+    // Both L1 caches sit in FRONT of the MMU, so they are indexed and tagged by
+    // VIRTUAL address. Every event that can re-point a virtual address at
+    // different memory must drop their contents: fence.i, sfence.vma, AND a satp
+    // write. The exec unit pulses `fence` for all three (see the WriteCsr steps,
+    // which pulse it when the target CSR is satp), so this one net carries them
+    // all and the caches need no separate satp port.
+    //
+    // The satp case is not redundant. Software is not obliged to follow a satp
+    // write with an sfence.vma: River's satp is a plain read/write register, so
+    // Linux reads back a full 16-bit ASID, enables its ASID allocator, and from
+    // then on switches address spaces with the satp write ALONE. The MMU already
+    // self-invalidates its TLBs on that write. While the L1s did not, they kept
+    // the outgoing address space's lines and served them to the incoming one, so
+    // a process fetched another process's instructions. On creek this could not
+    // show (bare mode, VA == PA, one address space); under Sv39 it corrupted the
+    // machine at random.
     icFlush <= pipeline.fence;
     mmuTlbFlush <= pipeline.fence;
-    // Flush the D-cache on the same fence. It is virtually addressed, so a fence
-    // drops any line a translation change could alias, keeping paged-mode data
-    // coherent without an sfence path (conservative on creek where VA == PA).
     if (useDCache) dFlush <= pipeline.fence;
 
     // An access is guest-translated when the core is virtualized OR the current
@@ -1411,6 +1627,10 @@ class RiverCore extends BridgeModule {
       csrTrapTval <= pipeline.trapTval;
       csrReturnActive <= committing & pipeline.isReturn;
       csrReturnFromM <= pipeline.returnLevel.eq(Const(3, width: 3));
+      // minstret counts instructions that RETIRE. An instruction that takes a
+      // trap, or a cycle in which an asynchronous interrupt is taken, does not
+      // retire: the instruction runs again after the handler returns.
+      csrRetire! <= committing & ~pipeline.trap;
       if (csrTrapToVS != null) {
         // exec already routed this trap to S (medeleg-delegated); upgrade to VS
         // when virtualized and hedeleg further delegates this cause.
@@ -1485,6 +1705,14 @@ class RiverCore extends BridgeModule {
           : mux(csrTrapToVS, vsTrapPc, pipeline.nextPc)),
     );
 
+    // dcsr.prv: the privilege the hart held when it entered Debug Mode. The
+    // RISC-V debug spec requires it; River never wrote it, so it read its reset
+    // value (3, machine) whatever the core was doing. mode[1:0] is already the
+    // spec encoding (M=3, S=1, U=0).
+    final dcsrPrv = withDebug
+        ? mode.getRange(0, 2).zeroExtend(32).named('dcsrPrv')
+        : Const(0, width: 32);
+
     // Core state machine. The normal (non-halted) advance body, captured so
     // debug-halt can gate it.
     final coreBody = <Conditional>[
@@ -1541,8 +1769,8 @@ class RiverCore extends BridgeModule {
                     pipelineEnable < 0,
                     debugDpc! < committedNextPc,
                     debugDcsr! <
-                        (debugDcsr! & Const(0xFFFFFE3F, width: 32)) |
-                            Const(4 << 6, width: 32),
+                        (debugDcsr! & Const(0xFFFFFE3C, width: 32)) |
+                            (Const(4 << 6, width: 32) | dcsrPrv),
                     stepping! < Const(0),
                   ],
                 ),
@@ -1662,8 +1890,8 @@ class RiverCore extends BridgeModule {
                         debugDpc < pc,
                         // Halt cause = 3 (haltreq); keep the other dcsr bits.
                         debugDcsr <
-                            (debugDcsr & Const(0xFFFFFE3F, width: 32)) |
-                                Const(3 << 6, width: 32),
+                            (debugDcsr & Const(0xFFFFFE3C, width: 32)) |
+                                (Const(3 << 6, width: 32) | dcsrPrv),
                       ],
                       orElse: [
                         // A hardware execute trigger fires BEFORE its matched
@@ -1678,8 +1906,8 @@ class RiverCore extends BridgeModule {
                                   debugDpc < pc,
                                   debugDcsr <
                                       (debugDcsr &
-                                              Const(0xFFFFFE3F, width: 32)) |
-                                          Const(2 << 6, width: 32),
+                                              Const(0xFFFFFE3C, width: 32)) |
+                                          (Const(2 << 6, width: 32) | dcsrPrv),
                                 ],
                                 orElse: [
                                   If(
@@ -1691,10 +1919,11 @@ class RiverCore extends BridgeModule {
                                       debugDcsr <
                                           (debugDcsr &
                                                   Const(
-                                                    0xFFFFFE3F,
+                                                    0xFFFFFE3C,
                                                     width: 32,
                                                   )) |
-                                              Const(1 << 6, width: 32),
+                                              (Const(1 << 6, width: 32) |
+                                                  dcsrPrv),
                                     ],
                                     orElse: coreBody,
                                   ),
@@ -1710,8 +1939,8 @@ class RiverCore extends BridgeModule {
                                   debugDpc < pipeline.trapEpc,
                                   debugDcsr <
                                       (debugDcsr &
-                                              Const(0xFFFFFE3F, width: 32)) |
-                                          Const(1 << 6, width: 32),
+                                              Const(0xFFFFFE3C, width: 32)) |
+                                          (Const(1 << 6, width: 32) | dcsrPrv),
                                 ],
                                 orElse: coreBody,
                               ),
@@ -1723,6 +1952,35 @@ class RiverCore extends BridgeModule {
             : coreBody,
       ),
     ]);
+
+    // Sticky witnesses for HOW the core entered user mode, so the probe gives a
+    // diagnosis rather than a yes or no. Each sets once and never clears.
+    // A separate sequential block: it adds no input to the core state machine's
+    // condition cone, so it cannot perturb the timing of what it measures.
+    if (userProbe && withDebug) {
+      final fromMret = probeUserFromMret!;
+      final fromSret = probeUserFromSret!;
+      final fromTrap = probeUserFromTrap!;
+      final userId = Const(PrivilegeMode.user.id, width: 3);
+      final committingNow = (~interruptHold & pipeline.done & pipelineEnable)
+          .named('probeCommitting');
+      final retToUser = (committingNow & pipeline.isReturn & retMode.eq(userId))
+          .named('probeRetToUser');
+      Sequential(clk, [
+        If(
+          reset,
+          then: [fromMret < 0, fromSret < 0, fromTrap < 0],
+          orElse: [
+            If(retToUser & csrReturnFromM, then: [fromMret < 1]),
+            If(retToUser & ~csrReturnFromM, then: [fromSret < 1]),
+            If(
+              committingNow & ~pipeline.isReturn & pipeline.nextMode.eq(userId),
+              then: [fromTrap < 1],
+            ),
+          ],
+        ),
+      ]);
+    }
 
     // Expose the V-bit for observability (no behavioral effect until VS-mode /
     // two-stage translation consume it).

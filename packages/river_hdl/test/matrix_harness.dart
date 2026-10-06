@@ -7,6 +7,9 @@ import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
 
+import 'adversarial_memory.dart';
+import 'matrix_configs.dart';
+
 /// Shared engine for the River test matrix. A matrix FILE is one config; it calls
 /// [runMatrix] with the config and the list of instruction [MatrixCell]s that
 /// apply to it. The config's HDL core is elaborated ONCE (setUpAll), then every
@@ -65,15 +68,27 @@ void runMatrix(
   RiverCoreConfig config,
   List<MatrixCell> cells, {
   Object? skip,
+  int? highMemBase,
+  int highMemSize = 0x10000,
+  Duration timeout = const Duration(minutes: 10),
+  // Memory behaviour. Null takes RIVER_MEM_* from the environment, and with no
+  // RIVER_MEM_* set the harness keeps the instantaneous MemoryModel it always
+  // had. See adversarial_memory.dart.
+  AdversarialMemory? memory,
 }) {
   test(label, skip: skip, () async {
     // Emulator goldens FIRST (pure Dart, before the Simulator starts).
     final goldens = <String, _Golden>{};
     for (final cell in cells) {
-      goldens[cell.name] = await _emulatorGolden(config, cell);
+      goldens[cell.name] = await _emulatorGolden(
+        config,
+        cell,
+        highMemBase: highMemBase,
+        highMemSize: highMemSize,
+      );
     }
     // Build the HDL core ONCE (starts the Simulator in this body's context).
-    final mc = await _MatrixCore.build(config);
+    final mc = await _MatrixCore.build(config, memory: memory);
     // Run every cell against the one built core; collect, don't throw, so all
     // cells run and the message lists every failure.
     final failures = <String>[];
@@ -89,7 +104,7 @@ void runMatrix(
           '${failures.length}/${cells.length} cells failed:\n'
           '${failures.join('\n')}',
     );
-  }, timeout: Timeout(Duration(minutes: 10)));
+  }, timeout: Timeout(timeout));
 }
 
 /// Golden architectural state for a cell (computed by the emulator).
@@ -146,14 +161,27 @@ bool _archEq(int a, int b, int xlen) {
 /// Each cell is checked TWICE against its hand-verified expected values: once on
 /// the emulator (pins the golden ISS) and once on the built HDL (pins the RTL).
 /// Failures are tagged [emu] or [hdl] so a divergence localizes to the engine.
-void runGolden(String label, RiverCoreConfig config, List<GoldenCell> cells) {
+void runGolden(
+  String label,
+  RiverCoreConfig config,
+  List<GoldenCell> cells, {
+  int? highMemBase,
+  int highMemSize = 0x10000,
+  Duration timeout = const Duration(minutes: 10),
+  AdversarialMemory? memory,
+}) {
   test(label, () async {
     final xlen = config.mxlen.size;
     final failures = <String>[];
     // 1. Pin the EMULATOR against the hand-verified golden (run before the
     //    Simulator starts, same ordering rule as the matrix).
     for (final gc in cells) {
-      final emu = await _emulatorGolden(config, gc._asCell);
+      final emu = await _emulatorGolden(
+        config,
+        gc._asCell,
+        highMemBase: highMemBase,
+        highMemSize: highMemSize,
+      );
       gc.expectedRegs.forEach((r, want) {
         final got = emu.regs[r] ?? 0;
         if (!_archEq(got, want, xlen)) {
@@ -171,7 +199,7 @@ void runGolden(String label, RiverCoreConfig config, List<GoldenCell> cells) {
     }
     // 2. Pin the HDL against the SAME golden (reuses the matrix runner, which
     //    already masks to xlen bits).
-    final mc = await _MatrixCore.build(config);
+    final mc = await _MatrixCore.build(config, memory: memory);
     for (final gc in cells) {
       final err = await mc.runHdl(
         gc._asCell,
@@ -187,37 +215,89 @@ void runGolden(String label, RiverCoreConfig config, List<GoldenCell> cells) {
           '${failures.length} golden checks failed:\n'
           '${failures.join('\n')}',
     );
-  }, timeout: Timeout(Duration(minutes: 10)));
+  }, timeout: Timeout(timeout));
 }
 
 /// Run [cell] on the emulator (golden ISS) and capture the observed reg/mem
 /// state. Pure Dart, MUST be called before the HDL Simulator starts.
-Future<_Golden> _emulatorGolden(RiverCoreConfig config, MatrixCell cell) async {
+Future<_Golden> _emulatorGolden(
+  RiverCoreConfig config,
+  MatrixCell cell, {
+  int? highMemBase,
+  int highMemSize = 0x10000,
+}) async {
+  final clockHz = (config.clock.rate as HarborFixedClockRate).frequency;
   final sram = emu.Sram(
     RiverDevice(
       name: 'sram',
       compatible: 'river,sram',
       range: BusAddressRange(0, 0xFFFFF),
-      clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
+      clockFrequency: clockHz,
     ),
   );
+  // Optional second window at [highMemBase]. The HDL side needs nothing (its
+  // SparseMemoryStorage covers the whole space), but the emulator only answers
+  // inside a mapped device. The D-cache allocates ONLY at or above its
+  // cacheableBase (0x80000000), so a cell that must fill and hit a data line
+  // keeps its data up here instead of in the low SRAM.
+  final highSram = highMemBase == null
+      ? null
+      : emu.Sram(
+          RiverDevice(
+            name: 'dram',
+            compatible: 'river,sram',
+            range: BusAddressRange(highMemBase, highMemSize),
+            clockFrequency: clockHz,
+          ),
+        );
+  final highBase = highMemBase ?? 0;
+
+  emu.Sram bank(int addr) =>
+      (highSram != null && addr >= highBase) ? highSram : sram;
+  int offset(int addr) =>
+      (highSram != null && addr >= highBase) ? addr - highBase : addr;
+
   void ww(int addr, int value) {
+    final data = bank(addr).data;
+    final off = offset(addr);
     for (var i = 0; i < 4; i++) {
-      sram.data[addr + i] = (value >> (i * 8)) & 0xFF;
+      data[off + i] = (value >> (i * 8)) & 0xFF;
     }
   }
 
   int rd64(int addr) {
+    final data = bank(addr).data;
+    final off = offset(addr);
     var v = 0;
     for (var i = 0; i < 8; i++) {
-      v |= sram.data[addr + i] << (i * 8);
+      v |= data[off + i] << (i * 8);
     }
     return v;
   }
 
-  final ecore = emu.RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
+  final ecore = emu.RiverCore(
+    config,
+    memDevices: Map.fromEntries([
+      sram.mem!,
+      if (highSram != null) highSram.mem!,
+    ]),
+  );
   for (var i = 0; i < cell.program.length; i++) {
     ww(i * 4, cell.program[i]);
+  }
+  // A paged config starts at the prologue, not at the cell program, so the
+  // emulator gets the same prologue, page tables and satp seed. The map is an
+  // identity map, so the architectural results do not change.
+  if (config.mmu.hasPaging) {
+    for (var i = 0; i < matrixPagedPrologue.length; i++) {
+      ww(config.resetVector + i * 4, matrixPagedPrologue[i]);
+    }
+    matrixPageTable().forEach((addr, words) {
+      for (var j = 0; j < words.length; j++) {
+        ww(addr + j * 4, words[j]);
+      }
+    });
+    ecore.xregs[matrixSatpSeedReg] = matrixSatp;
   }
   cell.dataMem.forEach((addr, words) {
     for (var j = 0; j < words.length; j++) {
@@ -251,6 +331,17 @@ class _MatrixCore {
   final RiverCore core;
   final SparseMemoryStorage storage;
 
+  /// The adversarial slave, or null when the harness runs on the instantaneous
+  /// MemoryModel it always used.
+  final AdversarialWishboneSlave? adversary;
+
+  /// The bus request lines, kept so a paged run can watch for the page-table
+  /// walk that proves translation is actually active.
+  final Logic busCyc;
+  final Logic busStb;
+  final Logic busWe;
+  final Logic busAdr;
+
   _MatrixCore._(
     this.config,
     this.xlen,
@@ -259,9 +350,18 @@ class _MatrixCore {
     this.seedGate,
     this.core,
     this.storage,
+    this.adversary,
+    this.busCyc,
+    this.busStb,
+    this.busWe,
+    this.busAdr,
   );
 
-  static Future<_MatrixCore> build(RiverCoreConfig config) async {
+  static Future<_MatrixCore> build(
+    RiverCoreConfig config, {
+    AdversarialMemory? memory,
+  }) async {
+    final behaviour = memory ?? AdversarialMemory.fromEnvironment();
     await Simulator.reset();
     final xlen = config.mxlen.size;
     final clk = SimpleClockGenerator(20).clk;
@@ -271,7 +371,13 @@ class _MatrixCore {
       dataWidth: xlen,
       selWidth: xlen ~/ 8,
     );
-    final core = RiverCore(config, busConfig: wbConfig);
+    // Translation applies only in S/U mode, so a paged config must leave reset
+    // in supervisor rather than the M-mode default.
+    final core = RiverCore(
+      config,
+      busConfig: wbConfig,
+      resetPrivilege: config.mmu.hasPaging ? PrivilegeMode.supervisor.id : null,
+    );
     core.input('clk').srcConnection! <= clk;
     core.input('reset').srcConnection! <= reset;
     await core.build();
@@ -283,49 +389,97 @@ class _MatrixCore {
       onInvalidRead: (addr, dataWidth) =>
           LogicValue.filled(dataWidth, LogicValue.zero),
     );
-    final memRead = DataPortInterface(xlen, xlen);
-    final memWrite = DataPortInterface(xlen, xlen);
-    // ignore: unused_local_variable
-    final mem = MemoryModel(
-      clk,
-      reset,
-      [wrapWriteForRegisterFile(memWrite)],
-      [wrapReadForRegisterFile(memRead, clk: clk, readLatency: 0)],
-      readLatency: 0,
-      storage: storage,
-    );
     final wbCyc = core.output('dataBus_CYC');
     final wbStb = core.output('dataBus_STB');
     final wbWe = core.output('dataBus_WE');
-    memRead.en <= wbCyc & wbStb & ~wbWe;
-    memRead.addr <= core.output('dataBus_ADR');
-    memWrite.en <= wbCyc & wbStb & wbWe;
-    memWrite.addr <= core.output('dataBus_ADR');
-    memWrite.data <= core.output('dataBus_DAT_MOSI');
-    final wbAckReg = Logic(name: 'wbAck');
-    Sequential(clk, [
-      If(
-        reset,
-        then: [wbAckReg < 0],
-        orElse: [
-          If(
-            wbCyc & wbStb & ~wbAckReg & (wbWe | memRead.valid),
-            then: [wbAckReg < 1],
-            orElse: [wbAckReg < 0],
-          ),
-        ],
-      ),
-    ]);
     final seedGate = Logic(name: 'seedGate');
-    core.input('dataBus_ACK').srcConnection! <= wbAckReg & ~seedGate;
-    core.input('dataBus_DAT_MISO').srcConnection! <= memRead.data;
+    AdversarialWishboneSlave? adversary;
+    if (behaviour != null) {
+      // A memory that is allowed to be slow, to queue and to post. The seam is
+      // the same three signals the MemoryModel path drives.
+      final ack = Logic(name: 'advAck');
+      final miso = Logic(name: 'advMiso', width: xlen);
+      adversary = attachAdversarialMemory(
+        clk: clk,
+        reset: reset,
+        storage: storage,
+        dataWidth: xlen,
+        cyc: wbCyc,
+        stb: wbStb,
+        we: wbWe,
+        adr: core.output('dataBus_ADR'),
+        datMosi: core.output('dataBus_DAT_MOSI'),
+        sel: core.output('dataBus_SEL'),
+        ack: ack,
+        miso: miso,
+        behaviour: behaviour,
+      );
+      core.input('dataBus_ACK').srcConnection! <= ack & ~seedGate;
+      core.input('dataBus_DAT_MISO').srcConnection! <= miso;
+    } else {
+      final memRead = DataPortInterface(xlen, xlen);
+      // A MASKED write port, so the model applies the Wishbone SEL byte enables
+      // instead of writing the whole bus word. A plain port made every sub-word
+      // store (sb/sh/sw) overwrite the other bytes of the containing 64-bit word.
+      // That hid a whole class of defect: an error in the SEL mask or in the
+      // write-data lane shift is invisible in simulation, but on silicon it
+      // corrupts the bytes next to the store.
+      final memWrite = MaskedDataPortInterface(xlen, xlen);
+      // ignore: unused_local_variable
+      final mem = MemoryModel(
+        clk,
+        reset,
+        [memWrite],
+        [wrapReadForRegisterFile(memRead, clk: clk, readLatency: 0)],
+        readLatency: 0,
+        storage: storage,
+      );
+      memRead.en <= wbCyc & wbStb & ~wbWe;
+      memRead.addr <= core.output('dataBus_ADR');
+      memWrite.en <= wbCyc & wbStb & wbWe;
+      memWrite.addr <= core.output('dataBus_ADR');
+      memWrite.data <= core.output('dataBus_DAT_MOSI');
+      // One mask bit per data byte, which is exactly the Wishbone SEL contract.
+      // The MMU makes SEL from the access size and shifts it into the byte lane,
+      // and it shifts DAT_MOSI the same way, so the two line up bit for bit.
+      memWrite.mask <= core.output('dataBus_SEL');
+      final wbAckReg = Logic(name: 'wbAck');
+      Sequential(clk, [
+        If(
+          reset,
+          then: [wbAckReg < 0],
+          orElse: [
+            If(
+              wbCyc & wbStb & ~wbAckReg & (wbWe | memRead.valid),
+              then: [wbAckReg < 1],
+              orElse: [wbAckReg < 0],
+            ),
+          ],
+        ),
+      ]);
+      core.input('dataBus_ACK').srcConnection! <= wbAckReg & ~seedGate;
+      core.input('dataBus_DAT_MISO').srcConnection! <= memRead.data;
+    }
 
     reset.inject(1);
     seedGate.inject(0);
     Simulator.setMaxSimTime(100000000);
     unawaited(Simulator.run());
     await clk.nextPosedge;
-    return _MatrixCore._(config, xlen, clk, reset, seedGate, core, storage);
+    return _MatrixCore._(
+      config,
+      xlen,
+      clk,
+      reset,
+      seedGate,
+      core,
+      storage,
+      adversary,
+      wbCyc,
+      wbStb,
+      wbWe,
+      core.output('dataBus_ADR'),
+    );
   }
 
   String _memString(List<int> program, Map<int, List<int>> dataMem) {
@@ -342,6 +496,12 @@ class _MatrixCore {
 
     final sb = StringBuffer(wordsAt(0, program));
     dataMem.forEach((addr, words) => sb.write(wordsAt(addr, words)));
+    if (config.mmu.hasPaging) {
+      sb.write(wordsAt(config.resetVector, matrixPagedPrologue));
+      matrixPageTable().forEach(
+        (addr, words) => sb.write(wordsAt(addr, words)),
+      );
+    }
     return sb.toString();
   }
 
@@ -350,15 +510,19 @@ class _MatrixCore {
   /// (returned, not thrown, so the caller can run every cell).
   Future<String?> runHdl(MatrixCell cell, _Golden golden) async {
     // Reset clears the regfile / pipeline / CSR state from the prior cell.
+    // The prologue reads satp out of a GPR, so a paged config always seeds.
+    final seed = config.mmu.hasPaging
+        ? {...cell.seed, matrixSatpSeedReg: matrixSatp}
+        : cell.seed;
     reset.inject(1);
-    seedGate.inject(cell.seed.isNotEmpty ? 1 : 0);
+    seedGate.inject(seed.isNotEmpty ? 1 : 0);
     for (var i = 0; i < 4; i++) {
       await clk.nextPosedge;
     }
     storage.loadMemString(_memString(cell.program, cell.dataMem));
     reset.inject(0);
     await clk.nextPosedge;
-    for (final e in cell.seed.entries) {
+    for (final e in seed.entries) {
       core.regWritePort.en.inject(1);
       core.regWritePort.addr.inject(LogicValue.ofInt(e.key.value, 5));
       core.regWritePort.data.inject(LogicValue.ofInt(e.value, xlen));
@@ -371,6 +535,12 @@ class _MatrixCore {
     }
     var reached = false;
     var lastPc = -1;
+    // A paged run must be SEEN to translate. Without this the variant is
+    // vacuous: if the core stayed in bare mode the cells would pass on the
+    // untranslated addresses and prove nothing. A read inside the root page
+    // table is the page-table walker doing its job.
+    var sawWalk = false;
+    var trapCause = -1;
     // Generous cap: the microcode (DynamicExecutionUnit) path is ~10x slower
     // per instruction (a multi-cycle linear pattern search per decode), so long
     // multi-instruction cells (e.g. the seeded INT_MIN edge cells, ~14 instrs
@@ -378,6 +548,20 @@ class _MatrixCore {
     // as soon as nextPc is reached, so the higher cap costs them nothing.
     for (var i = 0; i < 4000; i++) {
       await clk.nextPosedge;
+      final adr = busAdr.value;
+      if (busCyc.value.toBool() &&
+          busStb.value.toBool() &&
+          !busWe.value.toBool() &&
+          adr.isValid &&
+          adr.toInt() >= matrixRootTable &&
+          adr.toInt() < matrixRootTable + 32) {
+        sawWalk = true;
+      }
+      final t = core.pipeline.trap.value;
+      if (trapCause < 0 && t.isValid && t.toBool()) {
+        final c = core.pipeline.trapCause.value;
+        if (c.isValid) trapCause = c.toInt();
+      }
       final p = core.pipeline.nextPc.value;
       lastPc = p.isValid ? p.toInt() : -1;
       if (p.isValid && p.toInt() == cell.nextPc) {
@@ -388,8 +572,26 @@ class _MatrixCore {
 
     if (!reached) {
       return 'did not reach nextPc=0x${cell.nextPc.toRadixString(16)} '
-          '(stuck at pc=0x${lastPc.toRadixString(16)})';
+          '(stuck at pc=0x${lastPc.toRadixString(16)}'
+          '${trapCause < 0 ? '' : ', trapCause=$trapCause'})';
     }
+    if (config.mmu.hasPaging && !sawWalk) {
+      return 'NO PAGE-TABLE WALK: the core never read the root page table at '
+          '0x${matrixRootTable.toRadixString(16)}, so it did not translate and '
+          'this cell proves nothing about the MMU';
+    }
+    // A trap is also a way to lose translation without losing the cell. The
+    // trap goes to M-mode, where paging is off, so the rest of the cell runs on
+    // untranslated addresses and still reaches nextPc with the right answers.
+    // The identity map faults on nothing, so any trap here is a real defect.
+    if (config.mmu.hasPaging && trapCause >= 0) {
+      return 'UNEXPECTED TRAP (cause=$trapCause) under Sv39. The identity map '
+          'permits every access these cells make, and the trap drops the core '
+          'into M-mode where translation stops';
+    }
+    // A posted write is acknowledged but not yet in storage. Commit the queue
+    // so a pending write is not read back as a lost one.
+    adversary?.flush();
     // Compare the architectural low-xlen bits. The HDL regfile/memory values are
     // xlen-bit unsigned; the emulator goldens are signed Dart ints. On rv64 they
     // coincide (Dart int is 64-bit two's complement); on rv32 a negative result

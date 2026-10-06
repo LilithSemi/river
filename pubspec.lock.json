@@ -155,7 +155,7 @@
       "description": {
         "path": "packages/harbor",
         "ref": "HEAD",
-        "resolved-ref": "ddc1d70d05a67ba5a9fe0be33d3852795d07581e",
+        "resolved-ref": "72f410ddc72174428a6630cc5484721ec95468f4",
         "url": "https://git.lilithsemi.com/LilithSemi/harbor"
       },
       "source": "git",

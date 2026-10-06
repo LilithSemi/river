@@ -45,11 +45,15 @@ Future<void> main() async {
           LogicValue.filled(dataWidth, LogicValue.zero),
     );
     // NOP-fill low memory (addi x0,x0,0 == 0x13) so the PC marches forward.
-    for (var a = 0; a < 0x800; a += 8) {
-      storage.setData(
-        LogicValue.ofInt(a, xlen),
-        LogicValue.ofInt(0x0000001300000013, xlen),
-      );
+    // MemoryModel wipes its storage on every reset edge, so this MUST run after
+    // reset is deasserted. Filling before reset leaves the core fetching zeros.
+    void fillNops() {
+      for (var a = 0; a < 0x800; a += 8) {
+        storage.setData(
+          LogicValue.ofInt(a, xlen),
+          LogicValue.ofInt(0x0000001300000013, xlen),
+        );
+      }
     }
 
     final core = RiverCore(
@@ -86,11 +90,17 @@ Future<void> main() async {
     final memRead = DataPortInterface(xlen, xlen);
     final memWrite = DataPortInterface(xlen, xlen);
     // ignore: unused_local_variable
+    // readLatency MUST match on both sides. MemoryModel defaults to 1, but
+    // wrapReadForRegisterFile defaults to 0, so leaving it out drives `valid`
+    // a cycle before the model has data: the core latches an X instruction and
+    // wedges at the reset vector with no further bus activity. core_harness
+    // passes the same latency to both, which is why it does not hit this.
     final mem = MemoryModel(
       clk,
       reset,
       [wrapWriteForRegisterFile(memWrite)],
       [wrapReadForRegisterFile(memRead)],
+      readLatency: 0,
       storage: storage,
     );
     memRead.en <= wb.cyc & wb.stb & ~wb.we;
@@ -124,6 +134,7 @@ Future<void> main() async {
     await clk.nextPosedge;
     await clk.nextPosedge;
     reset.inject(0);
+    fillNops();
 
     // Let the core run a few instructions from resetVector.
     for (var i = 0; i < 200; i++) {

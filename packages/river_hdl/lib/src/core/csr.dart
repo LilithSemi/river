@@ -5,41 +5,105 @@ import 'package:river/river.dart';
 import '../data_port.dart';
 
 class RiscVMstatusCsr extends CsrConfig {
-  // [hyp] adds the MPV field (bit 39, RV64 hypervisor) so the V-bit can be
-  // pushed/popped on trap/MRET. Only declared field bits are read back, so MPV
-  // must be a field to be readable/writable.
-  RiscVMstatusCsr({bool hyp = false})
-    : super(
-        name: 'mstatus',
-        access: CsrAccess.readWrite,
-        fields: [
-          CsrFieldConfig(
-            start: 3,
-            width: 1,
-            name: 'mie',
-            access: CsrFieldAccess.readWrite,
-          ),
-          CsrFieldConfig(
-            start: 7,
-            width: 1,
-            name: 'mpie',
-            access: CsrFieldAccess.readWrite,
-          ),
-          CsrFieldConfig(
-            start: 11,
-            width: 2,
-            name: 'mpp',
-            access: CsrFieldAccess.readWrite,
-          ),
-          if (hyp)
-            CsrFieldConfig(
-              start: 39,
-              width: 1,
-              name: 'mpv',
-              access: CsrFieldAccess.readWrite,
-            ),
-        ],
-      );
+  // mstatus holds the WHOLE status state of the hart. sstatus is only a
+  // restricted view of these same bits (see [RiscVCsrFile], which aliases the
+  // sstatus address onto this register), so every S-visible field must live
+  // here. Only declared field bits are read back, so a field that is absent
+  // reads as 0 and drops its writes.
+  //
+  // [sup] adds the supervisor fields SIE/SPIE/SPP. [sum] adds SUM and [mxr]
+  // adds MXR, which the MMU reads to allow an S-mode access to a user page and
+  // a load from an execute-only page. [fp] adds FS and [vec] adds VS, the
+  // extension context-status fields the OS uses to track a dirty context.
+  // [hyp] adds MPV (bit 39, RV64 hypervisor) so the V-bit can be pushed and
+  // popped on trap/MRET.
+  RiscVMstatusCsr({
+    bool sup = false,
+    bool sum = false,
+    bool mxr = false,
+    bool fp = false,
+    bool vec = false,
+    bool hyp = false,
+  }) : super(
+         name: 'mstatus',
+         access: CsrAccess.readWrite,
+         fields: [
+           if (sup)
+             CsrFieldConfig(
+               start: 1,
+               width: 1,
+               name: 'sie',
+               access: CsrFieldAccess.readWrite,
+             ),
+           CsrFieldConfig(
+             start: 3,
+             width: 1,
+             name: 'mie',
+             access: CsrFieldAccess.readWrite,
+           ),
+           if (sup)
+             CsrFieldConfig(
+               start: 5,
+               width: 1,
+               name: 'spie',
+               access: CsrFieldAccess.readWrite,
+             ),
+           CsrFieldConfig(
+             start: 7,
+             width: 1,
+             name: 'mpie',
+             access: CsrFieldAccess.readWrite,
+           ),
+           if (sup)
+             CsrFieldConfig(
+               start: 8,
+               width: 1,
+               name: 'spp',
+               access: CsrFieldAccess.readWrite,
+             ),
+           if (vec)
+             CsrFieldConfig(
+               start: 9,
+               width: 2,
+               name: 'vs',
+               access: CsrFieldAccess.readWrite,
+             ),
+           CsrFieldConfig(
+             start: 11,
+             width: 2,
+             name: 'mpp',
+             access: CsrFieldAccess.readWrite,
+           ),
+           if (fp)
+             CsrFieldConfig(
+               start: 13,
+               width: 2,
+               name: 'fs',
+               access: CsrFieldAccess.readWrite,
+             ),
+           if (sum)
+             CsrFieldConfig(
+               start: 18,
+               width: 1,
+               name: 'sum',
+               access: CsrFieldAccess.readWrite,
+             ),
+           if (mxr)
+             CsrFieldConfig(
+               start: 19,
+               width: 1,
+               name: 'mxr',
+               access: CsrFieldAccess.readWrite,
+             ),
+           if (hyp)
+             CsrFieldConfig(
+               start: 39,
+               width: 1,
+               name: 'mpv',
+               access: CsrFieldAccess.readWrite,
+             ),
+         ],
+       );
 }
 
 class ReadOnlyNoFieldCsr extends CsrConfig {
@@ -130,6 +194,23 @@ class RiscVCsrFile extends Module {
   // (rdtime). Null when the SoC has no CLINT, in which case `time` is not added.
   Logic? _timeIn;
 
+  // The PLIC supervisor-external interrupt line. Null when the SoC has no
+  // supervisor-external context. See mip.SEIP below.
+  Logic? _seiPendingIn;
+
+  // Asserted for one cycle when an FP register write retires. It sets the
+  // sticky FP-dirty flop below. Null when the core has no FP register file.
+  Logic? _fpDirtyIn;
+
+  // Asserted for one cycle when an instruction retires. It advances minstret.
+  // Null when nothing drives it, in which case minstret does not count.
+  Logic? _retireIn;
+
+  // The sticky FP-dirty flop. It is set by [_fpDirtyIn] and it is cleared or
+  // set by a software write of the mstatus/sstatus FS field. Every mstatus and
+  // sstatus READ shows FS=Dirty while it is set. See [_statusRead].
+  Logic? _fsDirty;
+
   // Trap save-state / xRET restore controls (driven by core.dart). All
   // optional; when null the trap CSRs are not hardware-written (csrr/csrw work).
   Logic? _trapActive; // 1-cycle pulse: a synchronous trap is retiring
@@ -155,6 +236,11 @@ class RiscVCsrFile extends Module {
     int mhartid = 0,
     int rpipelineCap = 0,
     Logic? externalPending,
+    Logic? supervisorExternalPending,
+    // Asserted when an FP register write retires. Sets mstatus.FS to Dirty.
+    Logic? fpDirty,
+    // Asserted when an instruction retires. Advances minstret.
+    Logic? retire,
     Logic? timerPending,
     Logic? swPending,
     Logic? timeIn,
@@ -193,6 +279,20 @@ class RiscVCsrFile extends Module {
         externalPending,
         width: externalPending.width,
       );
+    }
+    // The PLIC supervisor-external line -> mip.SEIP (bit 9). The spec makes a
+    // read of mip.SEIP the OR of this wire and the software-writable bit, so
+    // the wire is folded into every READ path but never into the value written
+    // back to the register. If it were written back, software could not tell
+    // its own bit from the wire, and clearing the bit would fight the PLIC.
+    if (supervisorExternalPending != null) {
+      _seiPendingIn = addInput('seiPending', supervisorExternalPending);
+    }
+    if (fpDirty != null) {
+      _fpDirtyIn = addInput('fpDirty', fpDirty);
+    }
+    if (retire != null) {
+      _retireIn = addInput('retire', retire);
     }
     // Machine timer/software interrupt-pending lines, driven by the CLINT
     // (timer_irq = mtime>=mtimecmp -> mip.MTIP; sw_irq = msip -> mip.MSIP).
@@ -315,6 +415,10 @@ class RiscVCsrFile extends Module {
     _fdRead = hcl.DataPortInterface(mxlen.size, 12);
     _fdWrite = hcl.DataPortInterface(mxlen.size, 12);
 
+    // Created here because the mstatus/sstatus read paths below consume it.
+    // It is DRIVEN in _wireFsDirty, which needs the frontdoor write port.
+    _fsDirty = _fpDirtyIn == null ? null : Logic(name: 'fsDirtySticky');
+
     _csrTop = CsrTop(
       config: cfg,
       clk: this.clk,
@@ -324,9 +428,14 @@ class RiscVCsrFile extends Module {
       allowLargerRegisters: true,
     );
 
-    _implementedAddrs = cfg.blocks.single.registers
-        .map((r) => r.addr)
-        .toList(growable: false);
+    _implementedAddrs = [
+      ...cfg.blocks.single.registers.map((r) => r.addr),
+      // sstatus/sie/sip have no registers of their own; they are views of
+      // mstatus/mie/mip. They must still exist for the legality check, which
+      // uses the ARCHITECTURAL address so an S-mode access to 0x100/0x104/0x144
+      // is legal while the M-mode target address stays M-only.
+      ...(hasSupervisor ? _supervisorAliases.keys : const <int>[]),
+    ];
 
     _frontdoorWritableAddrs = <int>{};
     for (final r in cfg.blocks.single.registers) {
@@ -334,17 +443,24 @@ class RiscVCsrFile extends Module {
         _frontdoorWritableAddrs.add(r.addr);
       }
     }
+    if (hasSupervisor) _frontdoorWritableAddrs.addAll(_supervisorAliases.keys);
 
     _wireLegalityAndFrontdoor();
 
+    _wireFsDirty();
     _bindBackdoorForCounters();
     _wireCounters();
     _wireTrapState();
 
-    mstatus <=
-        _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mstatus.address).rdData!;
+    // The FS and SD bits are added on the READ path only. The register itself
+    // keeps what software last wrote. See [_statusRead].
+    mstatus <= _statusRead(_mstatusRaw);
     mie <= _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mie.address).rdData!;
-    mip <= _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mip.address).rdData!;
+    // mip is the ONLY interrupt-pending state. Its SEIP bit reads as the OR of
+    // the PLIC line and the software bit, so the output port (and every read
+    // path) carries the OR while the register itself keeps only the software
+    // bit. The backdoor writer below therefore starts from the RAW value.
+    mip <= _mipWithSei(_mipRaw);
     mideleg <=
         _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mideleg.address).rdData!;
     medeleg <=
@@ -374,12 +490,15 @@ class RiscVCsrFile extends Module {
 
       output('sepc') <=
           _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sepc.address).rdData!;
-      output('sstatus') <=
-          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sstatus.address).rdData!;
-      output('sie') <=
-          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sie.address).rdData!;
-      output('sip') <=
-          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sip.address).rdData!;
+      // sstatus is the S-visible window on mstatus, so the output port carries
+      // the same physical bits. The core reads SPP (bit 8) from here on SRET.
+      output('sstatus') <= (mstatus & _maskConst(_sstatusMask));
+      // sie and sip are the S-visible windows on mie and mip: the same physical
+      // bits, narrowed to the supervisor set and to what mideleg delegates. The
+      // core reads these for the S-interrupt take, so the pending/enable model
+      // and the trap-target model (exec.dart, also mideleg) now agree.
+      output('sie') <= (mie & _sInterruptMask);
+      output('sip') <= (mip & _sInterruptMask);
     }
 
     if (hasHypervisor) {
@@ -410,7 +529,10 @@ class RiscVCsrFile extends Module {
     // present; the other mip bits (the WARL S-bits, if any) pass through the
     // read-back value so a software write to them survives.
     if (externalPending != null || timerPending != null || swPending != null) {
-      var mipNext = mip;
+      // Start from the RAW register, not the `mip` output: the output folds in
+      // the PLIC SEIP line, and writing that back would make the wire
+      // indistinguishable from software's own bit.
+      var mipNext = _mipRaw;
       if (externalPending != null)
         mipNext = mipNext.withSet(11, externalPending);
       if (timerPending != null) mipNext = mipNext.withSet(7, timerPending);
@@ -435,8 +557,20 @@ class RiscVCsrFile extends Module {
     mscratchBd.wrData! <= Const(0, width: mxlen.size);
   }
 
+  // The F/D and V bits of misa. They decide if mstatus carries the FS and VS
+  // extension context-status fields.
+  bool get _hasFloat =>
+      ((misaValue >> 3) & 1) != 0 || ((misaValue >> 5) & 1) != 0;
+  bool get _hasVector => ((misaValue >> 21) & 1) != 0;
+
   CsrTopConfig _buildConfig(RiscVMxlen mxlen) {
-    const sstatusMask = 0x800DE133;
+    // The S-visible subset of mstatus: UIE, SIE, UPIE, SPIE, SPP, FS, XS, SUM,
+    // MXR and SD, plus UXL on RV64. A read of sstatus returns mstatus AND this
+    // mask, and a write of sstatus changes only these mstatus bits. Bits with no
+    // mstatus field (UIE/UPIE/XS/UXL/SD) stay 0.
+    final sstatusMask = mxlen == RiscVMxlen.rv64
+        ? 0x80000003000DE133
+        : 0x800DE133;
     const ustatusMask = 0x11;
     const supervisorInterruptMask = 0x222;
     const userInterruptMask = 0x111;
@@ -479,7 +613,14 @@ class RiscVCsrFile extends Module {
       ),
 
       CsrInstanceConfig(
-        arch: RiscVMstatusCsr(hyp: hasHypervisor),
+        arch: RiscVMstatusCsr(
+          sup: hasSupervisor,
+          sum: hasSum,
+          mxr: hasMxr,
+          fp: _hasFloat,
+          vec: _hasVector,
+          hyp: hasHypervisor,
+        ),
         addr: CsrAddress.mstatus.address,
         resetValue: 0,
         width: mxlen.size,
@@ -608,28 +749,15 @@ class RiscVCsrFile extends Module {
           ),
 
       if (hasSupervisor) ...[
-        CsrInstanceConfig(
-          arch: SimpleRwCsr('sstatus', mxlen.size),
-          addr: CsrAddress.sstatus.address,
-          resetValue: 0,
-          width: mxlen.size,
-          // Hardware-written on S-trap entry / SRET (wrEn in _wireTrapState).
-          isBackdoorWritable: true,
-        ),
-        CsrInstanceConfig(
-          arch: SimpleRwCsr('sie', mxlen.size),
-          addr: CsrAddress.sie.address,
-          resetValue: 0,
-          width: mxlen.size,
-          isBackdoorWritable: false,
-        ),
-        CsrInstanceConfig(
-          arch: SimpleRwCsr('sip', mxlen.size),
-          addr: CsrAddress.sip.address,
-          resetValue: 0,
-          width: mxlen.size,
-          isBackdoorWritable: false,
-        ),
+        // NOTE: sstatus (0x100) has NO register of its own. The privileged spec
+        // makes it a restricted VIEW of mstatus, so its address is aliased onto
+        // the mstatus register in _wireLegalityAndFrontdoor and its bits are
+        // masked with _sstatusMask. A separate register would let SPP, SUM and
+        // MXR read back values the trap logic and the MMU never see.
+        // sie (0x104) and sip (0x144) have no registers of their own either.
+        // They are views of mie and mip, masked with _sInterruptMask. Separate
+        // registers let S-mode enable an interrupt the delivery path reads from
+        // mie, and hid the PLIC SEIP line from a `csrr sip` entirely.
         // Ssstateen supervisor-level state-enable CSRs. No U-accessible
         // state-enabled features in River, so all bits are WARL-0 (mask 0).
         if (hasStateen)
@@ -951,6 +1079,116 @@ class RiscVCsrFile extends Module {
     return top;
   }
 
+  // A full-width constant from a mask literal. The RV64 sstatus mask has bit 63
+  // set, so as a Dart int it is negative; BigInt.toUnsigned keeps every bit.
+  Const _maskConst(int mask) => Const(
+    LogicValue.ofBigInt(BigInt.from(mask).toUnsigned(mxlen.size), mxlen.size),
+  );
+
+  // The stored mip register, without the PLIC line folded in. Every WRITE path
+  // starts here; every READ path goes through [_mipWithSei].
+  //
+  // FLATTENED into a plain net on purpose. The backdoor rdData is a CsrTop
+  // LogicStructure, and `withSet` on a structure does not behave like `withSet`
+  // on a Logic: driving the mip backdoor from the structure silently stopped
+  // MEIP/MTIP reaching the register, so no machine interrupt was ever taken.
+  Logic? _mipRawCache;
+  Logic get _mipRaw => _mipRawCache ??= (Logic(
+    name: 'mipRawValue',
+    width: mxlen.size,
+  )..gets(_csrTop.getBackdoorPortsByAddr(0, CsrAddress.mip.address).rdData!));
+
+  // The stored mstatus register, without the read-path overlay. Flattened into
+  // a plain net for the same reason as [_mipRaw]: the backdoor rdData is a
+  // CsrTop LogicStructure, and `withSet` on a structure does not behave like
+  // `withSet` on a Logic.
+  Logic? _mstatusRawCache;
+  Logic get _mstatusRaw =>
+      _mstatusRawCache ??= (Logic(name: 'mstatusRawValue', width: mxlen.size)
+        ..gets(
+          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mstatus.address).rdData!,
+        ));
+
+  // The mstatus/sstatus READ overlay. It supplies two bits that no register
+  // field holds:
+  //
+  //  * FS (bits 14:13) reads Dirty while [_fsDirty] is set. Linux saves the FP
+  //    context on a context switch ONLY when FS reads Dirty, so without this
+  //    the context is never saved and a task resumes with the FP registers of
+  //    another task.
+  //  * SD (bit XLEN-1) is the summary bit. It reads 1 when FS, VS or XS is
+  //    Dirty. River has no XS, so the term is FS or VS.
+  //
+  // This is a READ path, like [_mipWithSei]. It must never write the register
+  // back. mstatus has ONE hardware writer, the trap/xRET state machine in
+  // [_wireTrapState], and that writer starts from the backdoor read, which is
+  // one cycle behind. A second writer that echoed the stale value in a cycle
+  // with no trap would undo the SIE/SPIE update of a preceding sret.
+  Logic _statusRead(Logic raw) {
+    if (!_hasFloat && !_hasVector) return raw;
+    var v = raw;
+    if (_fsDirty != null) {
+      v = mux(_fsDirty!, v.withSet(13, Const(3, width: 2)), v);
+    }
+    final fsIsDirty = _hasFloat
+        ? v.slice(14, 13).eq(Const(3, width: 2))
+        : Const(0);
+    final vsIsDirty = _hasVector
+        ? v.slice(10, 9).eq(Const(3, width: 2))
+        : Const(0);
+    final out = Logic(name: 'mstatusReadValue', width: mxlen.size);
+    out <= v.withSet(mxlen.size - 1, fsIsDirty | vsIsDirty);
+    return out;
+  }
+
+  // The sticky FP-dirty flop. An FP register write sets it. A software write of
+  // mstatus or sstatus loads it from the FS field the write puts in place, so
+  // software clears it by writing FS=Clean, Initial or Off. sstatus writes come
+  // through the same physical address, so both names agree by construction.
+  void _wireFsDirty() {
+    if (_fsDirty == null) return;
+    final swWrite =
+        _fdWrite.en &
+        _fdWrite.addr.eq(Const(CsrAddress.mstatus.address, width: 12));
+    // The masked write data is the value that lands in the register, so the
+    // sstatus write mask is already applied to it.
+    final swDirty = _fdWrite.data.slice(14, 13).eq(Const(3, width: 2));
+    Sequential(clk, [
+      If(
+        swWrite,
+        then: [_fsDirty! < (swDirty | _fpDirtyIn!)],
+        orElse: [
+          If(_fpDirtyIn!, then: [_fsDirty! < 1]),
+        ],
+      ),
+    ], reset: reset);
+  }
+
+  // The stored mideleg register. Read from the backdoor rather than the output
+  // port because the masks below are built before the port is driven.
+  Logic get _midelegRaw =>
+      _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mideleg.address).rdData!;
+
+  // mip.SEIP (bit 9) reads as the OR of the PLIC supervisor-external line and
+  // the software-writable bit, per the privileged spec. The result goes into a
+  // plain net: the backdoor rdData is a CsrTop structure, and rohd_hcl refuses
+  // to clone (rename) one, so `.named` on it throws.
+  Logic _mipWithSei(Logic raw) {
+    if (_seiPendingIn == null) return raw;
+    final out = Logic(name: 'mipSeipOr', width: mxlen.size);
+    out <= raw.withSet(9, raw[9] | _seiPendingIn!);
+    return out;
+  }
+
+  // What sie/sip may show and change: the supervisor interrupt set (SSI/STI/SEI)
+  // narrowed to the causes mideleg actually delegates. A cause that is not
+  // delegated reads as zero and is not writable through the S alias, which is
+  // what makes this model agree with the trap-target choice in exec.dart.
+  Logic? _sIntMaskCache;
+  Logic get _sInterruptMask =>
+      _sIntMaskCache ??= (Logic(name: 'sIntCsrMask', width: mxlen.size)
+        ..gets(_maskConst(_sieSipMask) & _midelegRaw));
+
   late final int _sstatusMask;
   late final int _ustatusMask;
   late final int _sieSipMask;
@@ -1033,9 +1271,15 @@ class RiscVCsrFile extends Module {
     );
     final fullMask = Const(~0, width: mxlen.size);
 
-    Logic applyMask(int addr, Logic mask) {
+    // Merge the write into the register the address selects, keeping every bit
+    // the mask leaves clear. [physAddr] names the register that actually holds
+    // the state; it differs from [addr] only for an aliased CSR (sstatus, whose
+    // state lives in mstatus).
+    Logic applyMask(int addr, Logic mask, {int? physAddr}) {
       final hit = addr12.eq(Const(addr, width: addr12.width));
-      final current = _csrTop.getBackdoorPortsByAddr(0, addr).rdData!;
+      final current = _csrTop
+          .getBackdoorPortsByAddr(0, physAddr ?? addr)
+          .rdData!;
       final masked = (current & ~mask) | (data & mask);
       out = mux(hit, masked, out);
       return out;
@@ -1046,18 +1290,14 @@ class RiscVCsrFile extends Module {
     if (hasUser) out = applyMask(CsrAddress.utvec.address, vecMask);
 
     if (hasSupervisor) {
-      out = applyMask(
-        CsrAddress.sstatus.address,
-        Const(_sstatusMask, width: mxlen.size),
-      );
-      out = applyMask(
-        CsrAddress.sie.address,
-        Const(_sieSipMask, width: mxlen.size),
-      );
-      out = applyMask(
-        CsrAddress.sip.address,
-        Const(_sieSipMask, width: mxlen.size),
-      );
+      // Aliased supervisor writes land in the M register they view. Each mask
+      // keeps the bits that alias does not expose exactly as they are, so
+      // S-mode cannot reach MIE/MPIE/MPP through sstatus, cannot reach an
+      // undelegated interrupt through sie/sip, and cannot clear the PLIC's
+      // SEIP line through sip.
+      for (final e in _supervisorAliases.entries) {
+        out = applyMask(e.key, _aliasWriteMask(e.key), physAddr: e.value);
+      }
       out = applyMask(CsrAddress.satp.address, fullMask);
       // scounteren: only the counters River actually implements are writable
       // (WARL). CY (bit0) and IR (bit2) are backed by mcycle/minstret, so they
@@ -1157,6 +1397,25 @@ class RiscVCsrFile extends Module {
     rdAddr12 <= vsRedirect(csrRead.addr.slice(11, 0), 'rd');
     wrAddr12 <= vsRedirect(csrWrite.addr.slice(11, 0), 'wr');
 
+    // Supervisor CSR aliases: sstatus/sie/sip hold no state of their own, so the
+    // CsrTop port sees the mstatus/mie/mip address. The legality checks below
+    // keep the ARCHITECTURAL address, because 0x100/0x104/0x144 are S-level CSRs
+    // and their targets are M-level. The vsRedirect above already sent a VS-mode
+    // access to the vs* shadow (0x200/0x204/0x244), which IS a register, so it
+    // never reaches these aliases.
+    final aliases = hasSupervisor ? _supervisorAliases : const <int, int>{};
+    Logic aliasHit(Logic a, int archAddr, String tag) => a
+        .eq(Const(archAddr, width: 12))
+        .named('csrIsAlias${archAddr.toRadixString(16)}_$tag');
+    Logic aliasAddr(Logic a, String tag) {
+      if (aliases.isEmpty) return a;
+      var out = a;
+      for (final e in aliases.entries) {
+        out = mux(aliasHit(a, e.key, tag), Const(e.value, width: 12), out);
+      }
+      return out.named('csrPhysAddr_$tag');
+    }
+
     // `time` (0xC01) is served from the live CLINT mtime, not the CsrBlock, so
     // it is legal to read (at any privilege, U-level CSR) whenever mtime is
     // wired. Its data is muxed in below.
@@ -1178,20 +1437,44 @@ class RiscVCsrFile extends Module {
         _stateenOk(wrAddr12) &
         _isFrontdoorWritable(wrAddr12);
 
-    _fdRead.addr <= rdAddr12;
+    _fdRead.addr <= aliasAddr(rdAddr12, 'rd');
     _fdRead.en <= csrRead.en & rdLegal;
+    // An aliased S read gets the whole M register back, so narrow it to what
+    // that S CSR is allowed to show. A plain `csrr mip` also has to show the
+    // PLIC SEIP line, which the register itself does not hold.
+    var rdData = _mipWithSei(_fdRead.data);
+    rdData = mux(
+      rdAddr12.eq(Const(CsrAddress.mip.address, width: 12)).named('csrIsMipRd'),
+      rdData,
+      _fdRead.data,
+    );
+    // `csrr mstatus` shows the derived FS and SD bits. The sstatus alias picks
+    // them up in _aliasReadData, below the alias loop that follows.
+    rdData = mux(
+      rdAddr12
+          .eq(Const(CsrAddress.mstatus.address, width: 12))
+          .named('csrIsMstatusRd'),
+      _statusRead(_fdRead.data),
+      rdData,
+    );
+    for (final e in aliases.entries) {
+      rdData = mux(
+        aliasHit(rdAddr12, e.key, 'rdMask'),
+        _aliasReadData(e.key, _fdRead.data),
+        rdData,
+      );
+    }
     // `time` (rdtime) returns the live CLINT mtime, not a stored register, so the
     // OS clocksource tracks the same counter its timer events compare against.
     if (_timeIn != null) {
-      csrRead.data <=
-          mux(isTimeRd, _timeIn!.getRange(0, mxlen.size), _fdRead.data);
+      csrRead.data <= mux(isTimeRd, _timeIn!.getRange(0, mxlen.size), rdData);
     } else {
-      csrRead.data <= _fdRead.data;
+      csrRead.data <= rdData;
     }
     csrRead.done <= csrRead.en;
     csrRead.valid <= csrRead.en & rdLegal;
 
-    _fdWrite.addr <= wrAddr12;
+    _fdWrite.addr <= aliasAddr(wrAddr12, 'wr');
 
     final maskedWriteData = _maskWriteData(wrAddr12, csrWrite.data);
     _fdWrite.data <= maskedWriteData;
@@ -1218,29 +1501,59 @@ class RiscVCsrFile extends Module {
     }
   }
 
+  /// mcycle and minstret.
+  ///
+  /// Each counter is driven from a LOCAL accumulator flop, never from its own
+  /// backdoor read.
+  ///
+  /// The old code did `wrData < rdData + 1` inside a Sequential, so wrEn and
+  /// wrData were flop outputs. rohd_hcl samples them one clock later, and by
+  /// then rdData had not moved yet, so the SAME value was sent twice and the
+  /// register advanced once every TWO cycles. Measured on silicon: mcycle read
+  /// 10.000 MHz on a 20 MHz bus clock, exactly half.
+  ///
+  /// The backdoor is now driven combinationally from the accumulator, so the
+  /// register and the accumulator hold the same value in every cycle.
+  ///
+  /// minstret counts RETIRED instructions, not cycles. It advances only when
+  /// [_retireIn] is high. A multi-cycle microcoded instruction gives one pulse,
+  /// so it counts once. The old code used the same per-cycle expression as
+  /// mcycle, which made IPC read exactly 1.000000 on silicon.
+  ///
+  /// Both counters stay read/write to software. A frontdoor write has priority
+  /// inside rohd_hcl, and the backdoor write is disabled in that cycle as well,
+  /// so the software value lands and the accumulator loads it. Counting then
+  /// continues from the written value.
   void _wireCounters() {
-    Sequential(clk, [
-      If(
-        reset,
-        then: [
-          if (_mcycleBd != null && _mcycleBd!.hasWrite) _mcycleBd!.wrEn! < 0,
-          if (_minstretBd != null && _minstretBd!.hasWrite)
-            _minstretBd!.wrEn! < 0,
-        ],
-        orElse: [
-          if (_mcycleBd != null && _mcycleBd!.hasWrite) ...[
-            _mcycleBd!.wrEn! < 1,
-            _mcycleBd!.wrData! <
-                (_mcycleBd!.rdData! + Const(1, width: mxlen.size)),
-          ],
-          if (_minstretBd != null && _minstretBd!.hasWrite) ...[
-            _minstretBd!.wrEn! < 1,
-            _minstretBd!.wrData! <
-                (_minstretBd!.rdData! + Const(1, width: mxlen.size)),
-          ],
-        ],
-      ),
-    ], reset: reset);
+    final xlen = mxlen.size;
+
+    Logic swWriteTo(int addr) =>
+        _fdWrite.en & _fdWrite.addr.eq(Const(addr, width: 12));
+
+    void wireOne(CsrBackdoorInterface? bd, int addr, Logic step, String label) {
+      if (bd == null || !bd.hasWrite) return;
+      final swWrite = swWriteTo(addr).named('${label}SwWrite');
+      final acc = Logic(name: '${label}Acc', width: xlen);
+      final next = (acc + step).named('${label}Next');
+      Sequential(clk, [
+        If(swWrite, then: [acc < _fdWrite.data], orElse: [acc < next]),
+      ], reset: reset);
+      bd.wrEn! <= ~swWrite;
+      bd.wrData! <= next;
+    }
+
+    wireOne(
+      _mcycleBd,
+      CsrAddress.mcycle.address,
+      Const(1, width: xlen),
+      'mcycle',
+    );
+    wireOne(
+      _minstretBd,
+      CsrAddress.minstret.address,
+      (_retireIn ?? Const(0)).zeroExtend(xlen),
+      'minstret',
+    );
   }
 
   /// Hardware trap save-state and xRET restore, driven by core.dart's
@@ -1274,8 +1587,6 @@ class RiscVCsrFile extends Module {
         .withSet(7, Const(1, width: 1)) // MPIE <- 1
         .withSet(11, Const(0, width: 2)); // MPP <- U
 
-    mstatusBd.wrEn! <= (trapToM | retFromM);
-    mstatusBd.wrData! <= mux(trapToM, mTrap, mRet);
     mepcBd.wrEn! <= trapToM;
     mepcBd.wrData! <= _trapPc!;
     mcauseBd.wrEn! <= trapToM;
@@ -1283,31 +1594,44 @@ class RiscVCsrFile extends Module {
     mtvalBd.wrEn! <= trapToM;
     mtvalBd.wrData! <= _trapTval!;
 
-    if (hasSupervisor) {
+    // mstatus.FS is NOT written here. A hardware write of mstatus in a cycle
+    // with no trap and no xRET would echo `mcur`, the backdoor read, which is
+    // one cycle behind. That echo would undo the SIE/SPIE update of a preceding
+    // sret. FS is supplied on the READ path instead; see [_statusRead].
+    if (!hasSupervisor) {
+      final anyEvent = trapToM | retFromM;
+      mstatusBd.wrEn! <= anyEvent;
+      mstatusBd.wrData! <= mux(trapToM, mTrap, mRet);
+    } else {
       // A trap delegated to VS-mode (vsTrap) saves to the vs* CSRs below, not the
       // HS s* CSRs, so exclude it from trapToS.
       final vsTrap = _trapToVS ?? Const(0);
       final trapToS = _trapActive! & ~_trapTargetIsM! & ~vsTrap;
       final retFromS = _returnActive! & ~_returnFromM!;
 
-      final sstatusBd = bd(CsrAddress.sstatus.address);
       final sepcBd = bd(CsrAddress.sepc.address);
       final scauseBd = bd(CsrAddress.scause.address);
       final stvalBd = bd(CsrAddress.stval.address);
 
-      final scur = sstatusBd.rdData!;
-      // sstatus bits: SIE=1, SPIE=5, SPP=8.
-      final sTrap = scur
+      // The S status stack lives in mstatus, because sstatus is only a view of
+      // it. mstatus bits: SIE=1, SPIE=5, SPP=8.
+      final sTrap = mcur
           .withSet(1, Const(0, width: 1)) // SIE <- 0
-          .withSet(5, scur[1]) // SPIE <- old SIE
+          .withSet(5, mcur[1]) // SPIE <- old SIE
           .withSet(8, mode[0]); // SPP <- current mode (S=1/U=0)
-      final sRet = scur
-          .withSet(1, scur[5]) // SIE <- SPIE
+      final sRet = mcur
+          .withSet(1, mcur[5]) // SIE <- SPIE
           .withSet(5, Const(1, width: 1)) // SPIE <- 1
           .withSet(8, Const(0, width: 1)); // SPP <- U
 
-      sstatusBd.wrEn! <= (trapToS | retFromS);
-      sstatusBd.wrData! <= mux(trapToS, sTrap, sRet);
+      // One writer for the one register. A trap and an xRET never retire in the
+      // same cycle, so the priority order here only breaks a tie that cannot
+      // happen.
+      final anyEvent = trapToM | retFromM | trapToS | retFromS;
+      mstatusBd.wrEn! <= anyEvent;
+      mstatusBd.wrData! <=
+          mux(trapToM, mTrap, mux(retFromM, mRet, mux(trapToS, sTrap, sRet)));
+
       sepcBd.wrEn! <= trapToS;
       sepcBd.wrData! <= _trapPc!;
       scauseBd.wrEn! <= trapToS;
@@ -1348,19 +1672,67 @@ class RiscVCsrFile extends Module {
   void setData(LogicValue address, LogicValue data) {
     assert(address.width == 12);
 
-    _csrTop.getBackdoorPortsByAddr(0, address.toInt()).wrEn!.inject(1);
-    _csrTop.getBackdoorPortsByAddr(0, address.toInt()).wrData!.inject(data);
+    _csrTop
+        .getBackdoorPortsByAddr(0, _physAddr(address.toInt()))
+        .wrEn!
+        .inject(1);
+    _csrTop
+        .getBackdoorPortsByAddr(0, _physAddr(address.toInt()))
+        .wrData!
+        .inject(data);
   }
 
   LogicValue? getData(LogicValue address) {
     assert(address.width == 12);
-    return _csrTop.getBackdoorPortsByAddr(0, address.toInt()).rdData?.value;
+    return _csrTop
+        .getBackdoorPortsByAddr(0, _physAddr(address.toInt()))
+        .rdData
+        ?.value;
   }
 
   CsrBackdoorInterface getBackdoor(LogicValue address) {
     assert(address.width == 12);
 
-    return _csrTop.getBackdoorPortsByAddr(0, address.toInt());
+    return _csrTop.getBackdoorPortsByAddr(0, _physAddr(address.toInt()));
+  }
+
+  // The supervisor CSR aliases: each S address and the M register that actually
+  // holds its state. None of the three has a register of its own.
+  Map<int, int> get _supervisorAliases => {
+    CsrAddress.sstatus.address: CsrAddress.mstatus.address,
+    CsrAddress.sie.address: CsrAddress.mie.address,
+    CsrAddress.sip.address: CsrAddress.mip.address,
+  };
+
+  // The register that holds the state an architectural CSR address names. The
+  // backdoor sees the WHOLE M register, not the S-visible subset.
+  int _physAddr(int addr) =>
+      (hasSupervisor && _supervisorAliases.containsKey(addr))
+      ? _supervisorAliases[addr]!
+      : addr;
+
+  // What a read of an aliased S CSR returns, given the raw M register value.
+  Logic _aliasReadData(int archAddr, Logic raw) {
+    if (archAddr == CsrAddress.sstatus.address) {
+      // sstatus is a view of mstatus, so it must show the same derived FS and
+      // SD bits. The mask keeps both (bits 14:13 and bit XLEN-1).
+      return _statusRead(raw) & _maskConst(_sstatusMask);
+    }
+    if (archAddr == CsrAddress.sie.address) return raw & _sInterruptMask;
+    // sip: the PLIC line joins mip.SEIP before the supervisor mask.
+    return _mipWithSei(raw) & _sInterruptMask;
+  }
+
+  // What a write through an aliased S CSR may change in the M register.
+  Logic _aliasWriteMask(int archAddr) {
+    if (archAddr == CsrAddress.sstatus.address) {
+      return _maskConst(_sstatusMask);
+    }
+    if (archAddr == CsrAddress.sie.address) return _sInterruptMask;
+    // sip.SEIP is READ-ONLY to supervisor: the PLIC owns that line, and the
+    // software bit behind it belongs to M-mode. Everything else the supervisor
+    // set delegates stays writable (Weir writes STIP for the SBI timer).
+    return _sInterruptMask & ~_maskConst(1 << 9);
   }
 
   Logic get mvendorid =>

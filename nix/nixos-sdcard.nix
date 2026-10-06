@@ -98,6 +98,21 @@ in
         # emulated and skip the boot probe entirely.
         RISCV_EMULATED_UNALIGNED_ACCESS = lib.mkForce lib.kernel.yes;
         RISCV_PROBE_UNALIGNED_ACCESS = off;
+        # Timer tick rate. The default 250 Hz gives the whole timer path 4 ms.
+        # On this core that is far too little: the path is an interrupt entry, an
+        # SBI round trip into M-mode firmware and back, timer processing,
+        # softirqs and irqtime accounting, on an in-order core with no branch
+        # prediction and a 256-byte L1 D-cache. Measured on hardware at 20 MHz,
+        # mtimecmp fell 16 ms behind mtime and the kernel livelocked in a timer
+        # interrupt storm, servicing ticks and never making forward progress.
+        # 100 Hz gives 10 ms, which is 2.5x the budget for no hardware change.
+        HZ_250 = off;
+        HZ_100 = lib.mkForce lib.kernel.yes;
+        HZ = lib.mkForce (lib.kernel.freeform "100");
+        # Full dynticks does considerably more work per tick than NO_HZ_IDLE and
+        # targets many-core low-latency systems. This is a single hart.
+        NO_HZ_FULL = off;
+        NO_HZ_IDLE = lib.mkForce lib.kernel.yes;
       };
     }
   ];

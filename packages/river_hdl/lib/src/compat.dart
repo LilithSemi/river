@@ -151,6 +151,11 @@ class MicroOpFpuFunct {
   static const int fsgnjx = 22;
   static const int fmin = 23;
   static const int fmax = 24;
+  // Fused multiply-add (R4-type): rd = +-(a*b) +- c.
+  static const int fmadd = 25;
+  static const int fmsub = 26;
+  static const int fnmsub = 27;
+  static const int fnmadd = 28;
 
   MicroOpFpuFunct._();
 }
@@ -325,9 +330,14 @@ final List<MicroOpEncoding> kMicroOpTable = [
         5 + MicroOpField.width,
         5 + MicroOpField.width + mxlen.size - 1,
       ),
-      'valueOffset': BitRange(
+      // 1 = the operand names a floating-point register. `valueOffset` used to
+      // sit here as a second XLEN-wide field, but toMap always wrote 0 to it,
+      // so it was 64 bits of ROM and 64 bits of decode that could never do
+      // anything. Dropping it also narrows the ROM word, which shortens the
+      // bus from the ROM block RAM into the operand mux.
+      'fp': BitRange(
         5 + MicroOpField.width + mxlen.size,
-        5 + MicroOpField.width + mxlen.size * 2 - 1,
+        5 + MicroOpField.width + mxlen.size,
       ),
     }),
     toMap: (mop) {
@@ -336,7 +346,7 @@ final List<MicroOpEncoding> kMicroOpTable = [
         'funct': ReadRegisterMicroOp.funct,
         'source': m.source.id,
         'offset': m.offset,
-        'valueOffset': 0,
+        'fp': m.fp ? 1 : 0,
       };
     },
   ),
@@ -350,13 +360,23 @@ final List<MicroOpEncoding> kMicroOpTable = [
         5 + MicroOpField.width,
         5 + MicroOpField.width + MicroOpSource.width - 1,
       ),
-      'offset': BitRange(
+      // `offset` used to sit here as an XLEN-wide field, but toMap always
+      // wrote 0 to it, so it was 64 bits of ROM and 64 bits of decode that
+      // could never do anything. It is gone.
+      'valueOffset': BitRange(
         5 + MicroOpField.width + MicroOpSource.width,
         5 + MicroOpField.width + MicroOpSource.width + mxlen.size - 1,
       ),
-      'valueOffset': BitRange(
+      // 1 = the destination names a floating-point register.
+      'fp': BitRange(
         5 + MicroOpField.width + MicroOpSource.width + mxlen.size,
-        5 + MicroOpField.width + MicroOpSource.width + mxlen.size * 2 - 1,
+        5 + MicroOpField.width + MicroOpSource.width + mxlen.size,
+      ),
+      // 1 = the value is a 32-bit single-precision datum, so the write must set
+      // all the upper bits of the 64-bit FP register (NaN boxing).
+      'nanBox': BitRange(
+        5 + MicroOpField.width + MicroOpSource.width + mxlen.size + 1,
+        5 + MicroOpField.width + MicroOpSource.width + mxlen.size + 1,
       ),
     }),
     toMap: (mop) {
@@ -365,8 +385,9 @@ final List<MicroOpEncoding> kMicroOpTable = [
         'funct': WriteRegisterMicroOp.funct,
         'field': m.dest.id,
         'source': m.source.id,
-        'offset': 0,
         'valueOffset': m.valueOffset,
+        'fp': m.fp ? 1 : 0,
+        'nanBox': m.nanBox ? 1 : 0,
       };
     },
   ),
@@ -687,6 +708,16 @@ final List<MicroOpEncoding> kMicroOpTable = [
         5 + MicroOpFpuFunct.width + MicroOpField.width * 3 + 1,
         5 + MicroOpFpuFunct.width + MicroOpField.width * 3 + 1,
       ),
+      // Third source operand (rs3), used only by the fused multiply-add ops.
+      // Appended after 'doublePrecision' so no existing bit position moves.
+      'hasC': BitRange(
+        5 + MicroOpFpuFunct.width + MicroOpField.width * 3 + 2,
+        5 + MicroOpFpuFunct.width + MicroOpField.width * 3 + 2,
+      ),
+      'c': BitRange(
+        5 + MicroOpFpuFunct.width + MicroOpField.width * 3 + 3,
+        5 + MicroOpFpuFunct.width + MicroOpField.width * 4 + 2,
+      ),
     }),
     toMap: (mop) {
       final m = mop as RiscVFpuOp;
@@ -698,6 +729,8 @@ final List<MicroOpEncoding> kMicroOpTable = [
         'hasB': m.b != null ? 1 : 0,
         'b': m.b?.id ?? 0,
         'doublePrecision': m.doublePrecision ? 1 : 0,
+        'hasC': m.c != null ? 1 : 0,
+        'c': m.c?.id ?? 0,
       };
     },
   ),

@@ -116,6 +116,9 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
            rvD,
            rvFExtra,
            rvDExtra,
+           // c.fld/c.fsd/c.fldsp/c.fsdsp. They belong to C only when D is
+           // present, so they are a separate extension (see rvZcd).
+           rvZcd,
            rvPriv,
            rv64i,
            rv32i,
@@ -164,6 +167,8 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
            rvD,
            rvFExtra,
            rvDExtra,
+           // c.fld/c.fsd/c.fldsp/c.fsdsp (see rvZcd).
+           rvZcd,
            rvZba,
            rvZbb,
            rvZbs,

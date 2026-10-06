@@ -241,7 +241,9 @@ class RiverCore implements CsrContext {
   final TrapPlugin _trapPlugin;
 
   Map<Register, int> xregs;
-  Map<int, double> fregs;
+  // Raw 64-bit FP register bits, not a Dart double. The golden model must be
+  // bit-exact, and a double cannot hold a NaN payload or a NaN-boxed f32.
+  Map<int, int> fregs;
   List<int> _reservationSet;
   bool idle;
 
@@ -291,7 +293,15 @@ class RiverCore implements CsrContext {
 
   @override
   PrivilegeMode get mode => _csrPlugin.mode;
-  set mode(PrivilegeMode v) => _csrPlugin.mode = v;
+  set mode(PrivilegeMode v) {
+    // A privilege change ends any LR/SC sequence. Without this a reservation
+    // placed in one context can be consumed by another and the SC succeeds
+    // incorrectly. QEMU does the same in riscv_cpu_set_mode and cites ISA
+    // version 2.2 as requiring it. This covers MRET/SRET; trap entry clears via
+    // [trap] below. The RTL clears in exec.dart rawTrap and the return arms.
+    _reservationSet.clear();
+    _csrPlugin.mode = v;
+  }
 
   /// Virtualization bit (H extension): true while executing in VS/VU mode.
   bool get virt => _csrPlugin.virt;
@@ -420,6 +430,16 @@ class RiverCore implements CsrContext {
 
   void clearReservationSet() => _reservationSet.clear();
 
+  /// Drops any cached copy of [phys] after a write that went straight to the
+  /// MMU. LR/SC and the AMOs write with [Mmu.write], not with [write], so they
+  /// miss the invalidation that [write] does. Without this a load after the
+  /// atomic reads the stale line that the LR or an earlier load put in the
+  /// modelled L1, and the golden state stops matching the hardware.
+  void _invalidateCachedLine(int phys) {
+    l1d?.invalidate(phys);
+    l1i?.invalidate(phys);
+  }
+
   void reset() {
     xregs = {};
     fregs = {};
@@ -440,7 +460,13 @@ class RiverCore implements CsrContext {
     _cachePlugin.reset();
   }
 
-  int trap(int pc, TrapException e) => _trapPlugin.trap(pc, e, config);
+  int trap(int pc, TrapException e) {
+    // Trap entry ends any LR/SC sequence (see the [mode] setter). The trap
+    // plugin writes csr.mode directly, so it does not pass through that setter
+    // and needs its own clear here.
+    _reservationSet.clear();
+    return _trapPlugin.trap(pc, e, config);
+  }
 
   PrivilegeMode _effectiveMemPrivilege() {
     final mstatus = csrs.read(CsrAddress.mstatus.address, this);
@@ -466,6 +492,21 @@ class RiverCore implements CsrContext {
   Future<int> translate(int addr, MemoryAccess access) async {
     addr = addr.toUnsigned(config.mxlen.size);
     final eff = _effectiveMemPrivilege();
+
+    // M-mode accesses are PHYSICAL. satp does not translate them, so a walk
+    // through the supervisor page tables would fault on an address that is
+    // already physical. mstatus.MPRV can make M-mode DATA accesses use MPP's
+    // translation, and _effectiveMemPrivilege already resolves that, so gate on
+    // the EFFECTIVE privilege rather than the current mode.
+    //
+    // The HDL does the same (mmu.dart `dataPagingOn`). Without this gate the two
+    // engines diverge the moment satp is set in M-mode, which is exactly what
+    // test/parity/core_parity_test.dart 'MMU Sv39 translated load' caught.
+    //
+    // Known gap left alone here: MPRV must NOT affect instruction fetch, but
+    // fetch() also translates with the effective privilege, so M-mode with
+    // MPRV=1 and MPP=S would wrongly translate a fetch.
+    if (eff == PrivilegeMode.machine) return addr;
 
     int mstatus = csrs.read(CsrAddress.mstatus.address, this);
     final mxr = ((mstatus >> 19) & 1) != 0;
@@ -630,7 +671,14 @@ class RiverCore implements CsrContext {
     for (final mop in op.microcode) {
       if (mop is RiscVWriteRegister) {
         final value = state.readSource(mop.source) + mop.valueOffset;
-        final reg = Register.values[state.readField(mop.dest, register: false)];
+        final index = state.readField(mop.dest, register: false);
+        if (mop.fp) {
+          // f0 is normal storage and there is no floating-point stack pointer,
+          // so the x0 and x2 cases do not apply.
+          fregs[index] = value;
+          continue;
+        }
+        final reg = Register.values[index];
         if (reg == Register.x0) {
           continue;
         }
@@ -640,8 +688,12 @@ class RiverCore implements CsrContext {
         // after the microcode runs; keep it in sync or the write is reverted.
         if (reg == Register.x2) state.sp = value;
       } else if (mop is RiscVReadRegister) {
-        final reg = Register
-            .values[mop.offset + state.readField(mop.source, register: false)];
+        final index = mop.offset + state.readField(mop.source, register: false);
+        if (mop.fp) {
+          state.writeField(mop.source, fregs[index] ?? 0);
+          continue;
+        }
+        final reg = Register.values[index];
         final value = xregs[reg] ?? 0;
         state.writeField(mop.source, value);
       } else if (mop is RiscVAlu) {
@@ -1343,6 +1395,7 @@ class RiverCore implements CsrContext {
               sum: sum,
               mxr: mxr,
             );
+            _invalidateCachedLine(phys);
 
             result = 0;
             _reservationSet.clear();
@@ -1383,9 +1436,12 @@ class RiverCore implements CsrContext {
           final mxr = ((mstatus >> 19) & 1) != 0;
           final sum = ((mstatus >> 18) & 1) != 0;
 
+          // Read only the bytes the atomic names. Reading a full machine word
+          // for a `.w` atomic reaches past the operand, which can run off the
+          // end of a device.
           final loaded = await mmu.read(
             phys,
-            config.mxlen.bytes,
+            sizeBytes,
             pageTranslate: false,
             sum: sum,
             mxr: mxr,
@@ -1436,14 +1492,19 @@ class RiverCore implements CsrContext {
               newVal = (oldVal == cmp) ? srcVal : oldVal;
           }
 
+          // Write only the bytes the atomic names. This used to write a full
+          // machine word, so an `amoadd.w` on rv64 wrote 8 bytes and cleared
+          // the 4 bytes beside its operand: the golden model corrupted the
+          // neighbour of every `.w` atomic.
           await mmu.write(
             phys,
             newVal,
-            config.mxlen.bytes,
+            sizeBytes,
             pageTranslate: false,
             sum: sum,
             mxr: mxr,
           );
+          _invalidateCachedLine(phys);
 
           final rdIndex = state.readField(mop.dest);
           final rdReg = Register.values[rdIndex];

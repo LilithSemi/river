@@ -72,17 +72,83 @@ bool microarchSupports(Uarch u, String category) {
 
 /// Build the config for (mxlen, microarch, category): base ISA + the category's
 /// extensions, on the requested mxlen and pipeline personality.
+/// The split L1 the rc1 tiers carry. The matrix ran with NO cache at all, so
+/// every cell reached memory directly and the real I-cache/D-cache never saw a
+/// single hit, fill, store or fault. Two shipped bugs lived in exactly that gap:
+/// the D-cache had no faulting-response path (a NULL dereference froze the core
+/// instead of trapping), and both L1s went stale across an address-space switch.
+/// Pass `cached: true` to run a config through the real hierarchy.
+/// The default line is 8 bytes, which on rv64 is exactly ONE word, so the D-cache
+/// fill FSM never iterates. Pass a bigger [lineSize] to cover the multi-word fill
+/// loop (the fillWord counter and the per-word refill address walk).
+HarborL1CacheConfig matrixL1({
+  int iSize = 64,
+  int dSize = 256,
+  int lineSize = 8,
+}) => HarborL1CacheConfig.split(
+  iSize: iSize,
+  dSize: dSize,
+  ways: 1,
+  lineSize: lineSize,
+);
+
+/// The paged matrix variant runs the SAME cells through Sv39 translation. The
+/// whole matrix ran in bare mode, so no cell ever went through the translation
+/// datapath, the TLB or the page-table walker. The core ships in Sv39 under
+/// Linux, and bugs lived in exactly that gap (both virtually tagged L1 caches
+/// kept their lines across an address-space switch).
+///
+/// The map is an IDENTITY map of Sv39 1GB megapages, so VA == PA. No cell
+/// address changes and the emulator goldens stay valid.
+
+/// Physical address of the Sv39 root page table for the paged variant. It is
+/// above every address the cells use and below the 1MB emulator SRAM top.
+const matrixRootTable = 0x40000;
+
+/// satp for the identity map: Sv39 mode (8) plus the root table PPN.
+const matrixSatp = 0x8000000000000000 | (matrixRootTable >> 12);
+
+/// Reset vector of a paged config. A two-instruction prologue sits here, turns
+/// translation on and jumps to the cell program at 0. The cells keep their own
+/// addresses, so `nextPc` and the goldens do not move.
+const matrixPagedResetVector = 0x400;
+
+/// The prologue: `csrw satp,x31` then `jalr x0,0(x0)`.
+const matrixPagedPrologue = [0x180F9073, 0x00000067];
+
+/// The GPR that carries the satp value into the prologue. No cell uses x31.
+const matrixSatpSeedReg = Register.x31;
+
+/// Sv39 leaf PTE for the 1GB megapage at [pa]. The flags are V|R|W|X|A|D. A and
+/// D are pre-set, so no hardware A/D writeback adds bus traffic.
+int matrixMegapage(int pa) => ((pa >> 12) << 10) | 0xCF;
+
+/// The identity root table as 32-bit words (low half of each PTE first). Entry
+/// N maps VA [N GB, N+1 GB) to the same physical range; four entries cover the
+/// low 4GB, which is more than every cell touches.
+Map<int, List<int>> matrixPageTable() => {
+  for (var i = 0; i < 4; i++)
+    matrixRootTable + i * 8: [matrixMegapage(i << 30), 0],
+};
+
 RiverCoreConfig matrixConfig(
   RiscVMxlen mxlen,
   Uarch u,
   String category, {
   int? regfileReadLatency,
   MicrocodeMode microcodeMode = MicrocodeMode.none,
+  bool cached = false,
+  bool paged = false,
+  // Cache geometry override for a [cached] config. Null takes the [matrixL1]
+  // default (a split 64B I / 256B D, 1 way, 8B line).
+  HarborL1CacheConfig? l1,
 }) {
   final base = mxlen == RiscVMxlen.rv64
       ? <RiscVExtension>[rv64i, rv32i]
       : <RiscVExtension>[rv32i];
   return RiverCoreConfig(
+    resetVector: paged ? matrixPagedResetVector : 0,
+    l1cache: cached ? (l1 ?? matrixL1()) : null,
     regfileReadLatency: regfileReadLatency,
     microcodeMode: microcodeMode,
     clock: HarborClockConfig(
@@ -99,9 +165,13 @@ RiverCoreConfig matrixConfig(
     interrupts: const [],
     mmu: HarborMmuConfig(
       mxlen: mxlen,
-      pagingModes: const [RiscVPagingMode.bare],
+      pagingModes: paged
+          ? const [RiscVPagingMode.bare, RiscVPagingMode.sv39]
+          : const [RiscVPagingMode.bare],
       tlbLevels: const [],
       pmp: HarborPmpConfig.none,
+      hasSupervisorUserMemory: paged,
+      hasMakeExecutableReadable: paged,
     ),
     type: RiverCoreType.general,
     executionMode: u == Uarch.inOrder

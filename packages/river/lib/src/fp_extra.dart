@@ -35,8 +35,8 @@ RiscVOperation _binFp(
     FpuResource(),
   ],
   microcode: [
-    RiscVReadRegister(RiscVMicroOpField.rs1),
-    RiscVReadRegister(RiscVMicroOpField.rs2),
+    RiscVReadRegister(RiscVMicroOpField.rs1, fp: true),
+    RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
     RiscVFpuOp(
       funct,
       RiscVMicroOpField.rs1,
@@ -44,7 +44,7 @@ RiscVOperation _binFp(
       b: RiscVMicroOpField.rs2,
       doublePrecision: dp,
     ),
-    RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd),
+    RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd, fp: true),
     RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
   ],
 );
@@ -65,7 +65,7 @@ RiscVOperation _fpToInt(
   format: rType,
   resources: [RfResource(fp, rs1), RfResource(_int, rd), FpuResource()],
   microcode: [
-    RiscVReadRegister(RiscVMicroOpField.rs1),
+    RiscVReadRegister(RiscVMicroOpField.rs1, fp: true),
     RiscVFpuOp(
       funct,
       RiscVMicroOpField.rs1,
@@ -99,7 +99,7 @@ RiscVOperation _intToFp(
       RiscVMicroOpField.rd,
       doublePrecision: dp,
     ),
-    RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd),
+    RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd, fp: true),
     RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
   ],
 );

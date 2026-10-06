@@ -299,7 +299,9 @@ void main() {
         clockFrequency: 48000000,
         oscFrequency: 48000000,
         devices: [
-          Device.parse('sram:0x80000000:64K'),
+          // 4K = 1024 words on this 32-bit bus, the most HarborSram builds
+          // without a `target`. These tests assert fabric wiring, not capacity.
+          Device.parse('sram:0x80000000:4K'),
           Device.parse('uart:0x10000000:ns16550a'),
           Device.parse('spi:0x10001000:sdcard=true,dma=true'),
         ],
@@ -325,7 +327,9 @@ void main() {
         clockFrequency: 48000000,
         oscFrequency: 48000000,
         devices: [
-          Device.parse('sram:0x80000000:64K'),
+          // 4K = 1024 words on this 32-bit bus, the most HarborSram builds
+          // without a `target`. These tests assert fabric wiring, not capacity.
+          Device.parse('sram:0x80000000:4K'),
           Device.parse('uart:0x10000000:ns16550a'),
           Device.parse('spi:0x10001000:sdcard=true'),
         ],

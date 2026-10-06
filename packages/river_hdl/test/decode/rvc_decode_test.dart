@@ -75,4 +75,68 @@ void main() {
       );
     }
   });
+
+  test(
+    'RV64C floating-point loads and stores decode on the D-bearing tiers',
+    () {
+      // Reference words from GNU as (riscv64-none-elf-as -march=rv64gc).
+      final cases = {
+        0x2D18: 'c.fld', // c.fld f14, 24(x10)
+        0x25E4: 'c.fld', // c.fld f9, 200(x11)
+        0xAD10: 'c.fsd', // c.fsd f12, 24(x10)
+        0xA6FC: 'c.fsd', // c.fsd f15, 200(x13)
+        0x2122: 'c.fldsp', // c.fldsp f2, 8(sp)
+        0x2FB2: 'c.fldsp', // c.fldsp f31, 264(sp)
+        0xA822: 'c.fsdsp', // c.fsdsp f8, 16(sp)
+        0xA282: 'c.fsdsp', // c.fsdsp f0, 320(sp)
+      };
+      for (final e in cases.entries) {
+        expect(
+          decode(e.key)?.mnemonic,
+          e.value,
+          reason: '0x${e.key.toRadixString(16)} should decode to ${e.value}',
+        );
+      }
+      // The integer forms keep funct3 011 and 111. There is no c.flw on RV64.
+      expect(decode(0x6118)?.mnemonic, 'c.ld');
+      expect(decode(0xE118)?.mnemonic, 'c.sd');
+    },
+  );
+
+  test('a tier with C but no D traps the floating-point compressed ops', () {
+    final small = RiverCoreConfigV1.small(
+      mmu: HarborMmuConfig(
+        mxlen: RiscVMxlen.rv64,
+        pagingModes: const [RiscVPagingMode.bare],
+        tlbLevels: const [],
+        pmp: HarborPmpConfig.none,
+      ),
+      interrupts: [],
+      clock: const HarborClockConfig(
+        name: 'test',
+        rate: HarborFixedClockRate(10000),
+      ),
+    );
+    RiscVOperation? decodeSmall(int instr) {
+      for (final ext in small.extensions) {
+        final op = ext.findOperation(
+          instr & 0x3,
+          funct3: (instr >> 13) & 0x7,
+          instruction: instr,
+        );
+        if (op != null) return op;
+      }
+      return null;
+    }
+
+    for (final word in [0x2D18, 0xAD10, 0x2122, 0xA822]) {
+      expect(
+        decodeSmall(word),
+        isNull,
+        reason: '0x${word.toRadixString(16)} must be illegal without D',
+      );
+    }
+    // The integer compressed ops still decode there.
+    expect(decodeSmall(0x6118)?.mnemonic, 'c.ld');
+  });
 }
