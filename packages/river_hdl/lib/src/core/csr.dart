@@ -1299,17 +1299,11 @@ class RiscVCsrFile extends Module {
         out = applyMask(e.key, _aliasWriteMask(e.key), physAddr: e.value);
       }
       out = applyMask(CsrAddress.satp.address, fullMask);
-      // scounteren: only the counters River actually implements are writable
-      // (WARL). CY (bit0) and IR (bit2) are backed by mcycle/minstret, so they
-      // stay writable. TM (bit1) is WARL-0 because River has NO native `time`
-      // CSR wired to the CLINT mtime: the time CSR reads 0, so S-mode rdtime
-      // MUST keep trapping to the SBI (Weir) timer emulation, which reads the
-      // real mtime over the bus. Leaving TM writable let firmware's 0x7 write
-      // enable a direct S-mode read of the dead time CSR (always 0), which
-      // stalled systemd-boot's countdown timer forever. Mask = CY|IR = 0x5.
+      // TM is writable only when time is backed by a live source. Without
+      // one, rdtime must trap for firmware emulation.
       out = applyMask(
         CsrAddress.scounteren.address,
-        Const(0x5, width: mxlen.size),
+        Const(_timeIn == null ? 0x5 : 0x7, width: mxlen.size),
       );
       // senvcfg/menvcfg: River implements none of the envcfg-controlled features
       // (Zicbo, pointer-masking, Sstc, Svpbmt), so all fields are WARL-0. Mask 0
@@ -1322,12 +1316,10 @@ class RiscVCsrFile extends Module {
     }
 
     if (hasUser) {
-      // mcounteren: same counter set as scounteren. TM (bit1) is WARL-0 (no
-      // native `time` CSR; rdtime is SBI-emulated), CY|IR stay writable. See the
-      // scounteren note above. Weir writes 0x7 here, TM lands as 0.
+      // Same counter set as scounteren, including TM only with a live source.
       out = applyMask(
         CsrAddress.mcounteren.address,
-        Const(0x5, width: mxlen.size),
+        Const(_timeIn == null ? 0x5 : 0x7, width: mxlen.size),
       );
       out = applyMask(
         CsrAddress.ustatus.address,
@@ -1375,6 +1367,34 @@ class RiscVCsrFile extends Module {
     );
 
     return out;
+  }
+
+  // Machine counter enables apply below M-mode; supervisor enables further
+  // restrict U-mode when S-mode is implemented. CSR address privilege alone
+  // cannot enforce this because the counter aliases have U-level addresses.
+  Logic _counterReadOk(Logic addr) {
+    if (!hasUser) return Const(1);
+    final mc = _csrTop
+        .getBackdoorPortsByAddr(0, CsrAddress.mcounteren.address)
+        .rdData!;
+    final sc = hasSupervisor
+        ? _csrTop
+              .getBackdoorPortsByAddr(0, CsrAddress.scounteren.address)
+              .rdData!
+        : null;
+    Logic allowed = Const(1);
+    for (var bit = 0; bit < 3; bit++) {
+      final hit =
+          addr.eq(0xc00 + bit) |
+          (mxlen == RiscVMxlen.rv32 ? addr.eq(0xc80 + bit) : Const(0));
+      final enabled =
+          mode.eq(PrivilegeMode.machine.id) |
+          (mc[bit] &
+              (mode.neq(PrivilegeMode.user.id) |
+                  (sc == null ? Const(1) : sc[bit])));
+      allowed &= ~hit | enabled;
+    }
+    return allowed;
   }
 
   void _wireLegalityAndFrontdoor() {
@@ -1427,6 +1447,7 @@ class RiscVCsrFile extends Module {
     final rdLegal =
         (_addrExists(rdAddr12) | isTimeRd) &
         _privOk(rdAddr12) &
+        _counterReadOk(rdAddr12) &
         _stateenOk(rdAddr12);
     // _isFrontdoorWritable is a strict subset of _addrExists (same register
     // list, readWrite regs only), so it implies _addrExists. Dropping the

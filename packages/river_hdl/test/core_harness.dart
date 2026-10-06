@@ -29,6 +29,8 @@ Future<void> coreTest(
   // inject an async timer interrupt mid-execution. Null = never (no interrupt
   // input wired, so existing callers are unaffected).
   int? raiseTimerIrqAt,
+  // Optional live time source for architectural CSR access tests.
+  Logic? timeIn,
   // Lower mip.MTIP at this run-loop cycle, modelling the handler clearing the
   // timer (an mtimecmp write) so the interrupt is taken once and does not storm
   // on every mret. Null = leave it asserted (level) once raised.
@@ -71,6 +73,7 @@ Future<void> coreTest(
     prfSeedMode: prfSeedMode,
     resetPrivilege: startPriv?.id,
     timerPending: timerIrq,
+    timeIn: timeIn,
   );
   timerIrq?.inject(0);
 
