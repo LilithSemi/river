@@ -278,7 +278,10 @@ class FetchUnit extends Module {
                   ],
                   orElse: [
                     complete < 1,
-                    enableRead < 1,
+                    // Retire the request on its response edge. Waiting until
+                    // delivery leaves EN high beyond the MMU completion bubble,
+                    // allowing a duplicate walk to outlive a trap redirect.
+                    enableRead < 0,
                     memRead.addr < (pcLatch & alignment),
                   ],
                 ),
@@ -300,7 +303,7 @@ class FetchUnit extends Module {
                     complete < 1,
                     faulted < 1,
                     pcOut < pcLatch,
-                    enableRead < 1,
+                    enableRead < 0,
                     memRead.addr < (pcLatch & alignment),
                   ],
                   orElse: [
@@ -320,7 +323,7 @@ class FetchUnit extends Module {
               secondData < memRead.data,
               complete < 1,
               phase2 < 0,
-              enableRead < 1,
+              enableRead < 0,
               memRead.addr < (pcLatch & alignment),
             ]),
             // Second (straddle) read returned invalid: a page fault means the
@@ -333,7 +336,7 @@ class FetchUnit extends Module {
                   faulted < 1,
                   phase2 < 0,
                   pcOut < pcLatch,
-                  enableRead < 1,
+                  enableRead < 0,
                   memRead.addr < (pcLatch & alignment),
                 ],
                 orElse: [
