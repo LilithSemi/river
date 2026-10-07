@@ -3,6 +3,7 @@ import 'package:river/river.dart';
 import 'package:test/test.dart';
 
 import '../core_harness.dart';
+import 'fp_boot.dart';
 
 /// Floating-point ARITHMETIC on the microcoded execution path.
 ///
@@ -22,6 +23,7 @@ void main() {
   });
 
   RiverCoreConfig config() => RiverCoreConfigV1.full(
+    resetVector: fpResetVector,
     interrupts: [],
     mmu: HarborMmuConfig(
       mxlen: RiscVMxlen.rv64,
@@ -81,7 +83,7 @@ void main() {
       }
       sb.writeln();
     }
-    return sb.toString();
+    return withFpBoot(sb.toString());
   }
 
   // Single-precision operands in memory: 2.0f, 4.0f, -1.0f, 1.0f.
@@ -159,7 +161,7 @@ void main() {
         Register.x25: 0, // feq.s
         Register.x26: 1, // flt.s
         Register.x27: 1, // fle.s
-        Register.x28: 0xC0000000, // fsgnj.s -2.0f
+        Register.x28: 0xFFFFFFFFC0000000, // fmv.x.w sign-extends -2.0f bits
         Register.x29: 0x41100000, // fmadd.s 9.0f
         Register.x30: 0x3FB504F3, // fsqrt.s sqrt(2)
       },

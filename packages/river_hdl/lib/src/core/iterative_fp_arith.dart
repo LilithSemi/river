@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import 'fp_status.dart';
+
 /// Shared multi-cycle IEEE-754 add, multiply, divide and precision convert.
 ///
 /// One operation is in flight at a time, which matches the in-order execution
@@ -73,6 +75,9 @@ class IterativeFpArith extends Module {
   /// the low bits with zeros above it.
   Logic get result => output('result');
 
+  /// Architectural exception flags, valid with [done].
+  Logic get flags => output('flags');
+
   IterativeFpArith(
     Logic clk,
     Logic reset,
@@ -87,6 +92,7 @@ class IterativeFpArith extends Module {
     Logic selMul,
     Logic selCvt,
     Logic selSingle, {
+    Logic? rm,
     this.exponentWidth = 11,
     this.mantissaWidth = 52,
     this.singleExponentWidth = 8,
@@ -136,10 +142,12 @@ class IterativeFpArith extends Module {
     selMul = addInput('selMul', selMul);
     selCvt = addInput('selCvt', selCvt);
     selSingle = addInput('selSingle', selSingle);
+    final roundingInput = addInput('rm', rm ?? Const(0, width: 3), width: 3);
 
     final busy = addOutput('busy');
     final done = addOutput('done');
     final result = addOutput('result', width: w);
+    final flags = addOutput('flags', width: 5);
 
     const sIdle = 0,
         sNormA = 1,
@@ -186,6 +194,10 @@ class IterativeFpArith extends Module {
     // The answer takes the narrow format. Latched, because the pack stage
     // reads it many cycles after the operands went in.
     final dstNarrow = Logic(name: 'dstNarrow');
+    final roundingMode = Logic(name: 'roundingMode', width: 3);
+    final flagsReg = Logic(name: 'flagsReg', width: 5);
+    final specialFlags = Logic(name: 'specialFlags', width: 5);
+    final tinyAfterRounding = Logic(name: 'tinyAfterRounding');
     final special = Logic(name: 'special');
     final specialHold = Logic(name: 'specialHold', width: w);
     final resReg = Logic(name: 'resReg', width: w);
@@ -318,10 +330,12 @@ class IterativeFpArith extends Module {
     final isInfRes =
         ~isNaNres &
         mux(newIsAdd, aInf, mux(newIsMul, aInf | bInfs, aInf | bZero));
-    // Two zeros added give +0 unless both are negative, which is the
-    // round-to-nearest rule. A NaN is always the positive canonical one.
+    // Opposite-sign zeros give -0 only for RDN; like-sign zeros keep their sign.
+    // Initial special cases use the incoming mode, before it is latched.
+    final roundDown = roundingInput.eq(Const(2, width: 3));
+    final addZeroSign = (signA & signB) | (roundDown & (signA | signB));
     final constSign =
-        ~isNaNres & mux(newIsAdd, mux(aInf, signA, signA & signB), xorSign);
+        ~isNaNres & mux(newIsAdd, mux(aInf, signA, addZeroSign), xorSign);
     final specHit = mux(
       newIsAdd,
       anyNaN | aInf | bInfs | (aZero & bZero),
@@ -364,7 +378,12 @@ class IterativeFpArith extends Module {
         mux(
           fmaProductInf,
           fmaProductSign,
-          mux(uc.isInf, uc.sign, fmaProductSign & uc.sign),
+          mux(
+            uc.isInf,
+            uc.sign,
+            (fmaProductSign & uc.sign) |
+                (roundDown & (fmaProductSign | uc.sign)),
+          ),
         );
     Logic fmaConstant(bool narrow) {
       final eb = narrow ? eS : e;
@@ -386,6 +405,22 @@ class IterativeFpArith extends Module {
         ? mux(narrowOut, fmaConstant(true), fmaConstant(false))
         : fmaConstant(false);
     final initialSpecial = mux(selFma, fmaNaN | fmaInf | fmaZero, specHit);
+    Logic quietBit(Logic operand) =>
+        dual ? mux(selSingle, operand[mS - 1], operand[m - 1]) : operand[m - 1];
+    final signalingA = ua.isNaN & ~quietBit(opA);
+    final signalingB = ub.isNaN & ~quietBit(opB);
+    final signalingC = uc.isNaN & ~quietBit(opC);
+    final invalid = mux(
+      selFma,
+      signalingA | signalingB | signalingC | mulBad | fmaInvalidSum,
+      signalingA | (~cvt & signalingB) | opBad,
+    );
+    final divideByZero =
+        ~selFma & opNew.eq(oc(opDiv)) & bZero & ~aZero & ~aInf & ~anyNaN;
+    final initialFlags = fpExceptionFlags(
+      invalid: invalid,
+      divideByZero: divideByZero,
+    );
 
     // ------------------------------------------------------------- iteration
 
@@ -502,7 +537,7 @@ class IterativeFpArith extends Module {
       downAmt,
     );
 
-    // Round to nearest, ties to even, then pack. The destination format picks
+    // Round in the accepted instruction's mode, then pack. The destination picks
     // where the significand stops and where guard and sticky begin.
     final sigOutW = rw.slice(ww - 2, 3);
     final sigOut = dual
@@ -513,7 +548,13 @@ class IterativeFpArith extends Module {
         ? mux(dstNarrow, rw.slice(loS - 2, 0).or(), rw[1] | rw[0])
         : rw[1] | rw[0];
     final lBit = dual ? mux(dstNarrow, rw[loS], rw[3]) : rw[3];
-    final roundUp = gBit & (sBit | lBit);
+    final roundUp = fpRoundUp(
+      rm: roundingMode,
+      sign: sgn,
+      guard: gBit,
+      sticky: sBit,
+      lsb: lBit,
+    );
     final rounded = sigOut.zeroExtend(n + 1) + roundUp.zeroExtend(n + 1);
     final roundCarry = dual
         ? mux(dstNarrow, rounded[nS], rounded[n])
@@ -551,12 +592,29 @@ class IterativeFpArith extends Module {
       mux(hidden, expDst.slice(eS - 1, 0), Const(0, width: eS)),
       mux(roundCarry, Const(0, width: mS), rounded.slice(mS - 1, 0)),
     ].swizzle();
-    Logic infWide() => [sgn, allOne, Const(0, width: m)].swizzle();
+    final overflowInfinity = fpOverflowToInfinity(roundingMode, sgn);
+    Logic infWide() => [
+      sgn,
+      mux(overflowInfinity, allOne, Const((1 << e) - 2, width: e)),
+      mux(
+        overflowInfinity,
+        Const(0, width: m),
+        Const((BigInt.one << m) - BigInt.one, width: m),
+      ),
+    ].swizzle();
     Logic infNarrow() => [
       Const(0, width: w - wS),
       sgn,
-      Const((1 << eS) - 1, width: eS),
-      Const(0, width: mS),
+      mux(
+        overflowInfinity,
+        Const((1 << eS) - 1, width: eS),
+        Const((1 << eS) - 2, width: eS),
+      ),
+      mux(
+        overflowInfinity,
+        Const(0, width: mS),
+        Const((BigInt.one << mS) - BigInt.one, width: mS),
+      ),
     ].swizzle();
     final packed = dual
         ? mux(
@@ -569,6 +627,25 @@ class IterativeFpArith extends Module {
     busy <= state.neq(st(sIdle));
     done <= state.eq(st(sDone));
     result <= resReg;
+    flags <= flagsReg;
+    final inexact = gBit | sBit;
+    final roundedFlags = fpExceptionFlags(
+      overflow: overflow,
+      underflow: tinyAfterRounding & inexact,
+      inexact: overflow | inexact,
+    );
+    final cancelledSign = roundingMode.eq(Const(2, width: 3));
+    final cancelledZero = dual
+        ? mux(
+            dstNarrow,
+            [
+              Const(0, width: w - wS),
+              cancelledSign,
+              Const(0, width: wS - 1),
+            ].swizzle(),
+            [cancelledSign, Const(0, width: w - 1)].swizzle(),
+          )
+        : [cancelledSign, Const(0, width: w - 1)].swizzle();
 
     Sequential(clk, [
       If(
@@ -593,6 +670,10 @@ class IterativeFpArith extends Module {
           fmaLarge < 0,
           fmaWork < 0,
           dstNarrow < 0,
+          roundingMode < 0,
+          flagsReg < 0,
+          specialFlags < 0,
+          tinyAfterRounding < 0,
           special < 0,
           specialHold < 0,
           resReg < 0,
@@ -611,6 +692,10 @@ class IterativeFpArith extends Module {
                   expA < expAload,
                   expB < expBload,
                   dstNarrow < narrowOut,
+                  roundingMode < roundingInput,
+                  flagsReg < 0,
+                  specialFlags < initialFlags,
+                  tinyAfterRounding < 0,
                   fmaC < uc.sig,
                   fmaCExponent < uc.exp,
                   special < initialSpecial,
@@ -772,17 +857,20 @@ class IterativeFpArith extends Module {
                             downCap.getRange(0, cntW),
                             Const(0, width: cntW),
                           ),
+                      // Unbounded-exponent rounding determines tininess;
+                      // subnormal rounding can subsequently reach minNormal.
+                      tinyAfterRounding <
+                          underflow & ~(downAmt.eq(1) & roundCarry),
                       expR < mux(underflow, expThresh, expR),
                       state < sDenorm,
                     ],
                     orElse: [
-                      // A subtract that cancels every bit gives +0 under
-                      // round to nearest, whatever the operand signs were.
+                      // Exact cancellation gives -0 only for RDN.
                       If(
                         rZero,
                         then: [
                           special < 1,
-                          specialHold < Const(0, width: w),
+                          specialHold < cancelledZero,
                           state < sRound,
                         ],
                         orElse: [
@@ -804,6 +892,7 @@ class IterativeFpArith extends Module {
             ]),
             CaseItem(st(sRound), [
               resReg < mux(special, specialHold, packed),
+              flagsReg < mux(special, specialFlags, roundedFlags),
               state < sDone,
             ]),
             CaseItem(st(sDone), [

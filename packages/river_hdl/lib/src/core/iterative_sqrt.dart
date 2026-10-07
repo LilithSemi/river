@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import 'fp_status.dart';
+
 /// Shared multi-cycle IEEE-754 square root (radix-2 restoring digit recurrence).
 ///
 /// One square root in flight at a time, matching the in-order exec unit: an
@@ -7,7 +9,7 @@ import 'package:rohd/rohd.dart';
 /// the unrolled combinational root (a 53-bit subtract array, about 7000 LUTs at
 /// binary64) with one subtract per cycle, a few hundred LUTs.
 ///
-/// The result is CORRECTLY ROUNDED to nearest, ties to even. The recurrence
+/// The result honors the requested RISC-V rounding mode. The recurrence
 /// gives the truncated root Q and the exact remainder R = N - Q*Q, and the true
 /// root passes the halfway point exactly when R > Q. A square root is never
 /// exactly halfway between two floats, so the tie rule never fires.
@@ -44,12 +46,16 @@ class IterativeFpSqrt extends Module {
   /// The packed {sign, exponent, mantissa} root.
   Logic get result => output('result');
 
+  /// Architectural exception flags, valid with [done].
+  Logic get flags => output('flags');
+
   IterativeFpSqrt(
     Logic clk,
     Logic reset,
     Logic start,
     Logic operand,
     Logic narrow, {
+    Logic? rm,
     this.exponentWidth = 11,
     this.mantissaWidth = 52,
     this.narrowExponentWidth = 8,
@@ -85,10 +91,12 @@ class IterativeFpSqrt extends Module {
     start = addInput('start', start);
     operand = addInput('operand', operand, width: w);
     narrow = addInput('narrow', narrow);
+    final roundingInput = addInput('rm', rm ?? Const(0, width: 3), width: 3);
 
     final busy = addOutput('busy');
     final done = addOutput('done');
     final result = addOutput('result', width: w);
+    final flags = addOutput('flags', width: 5);
 
     // Operand classes. The square root of a negative number and of a NaN is the
     // canonical quiet NaN; +-0 and +infinity give themselves back.
@@ -142,6 +150,10 @@ class IterativeFpSqrt extends Module {
     final isInf = expAll1 & man0;
     final isZero = exp0 & man0;
     final isSub = exp0 & ~man0;
+    final quiet = dual
+        ? mux(narrow, narrowMan[mN - 1], wideMan[m - 1])
+        : wideMan[m - 1];
+    final invalid = (isNaN & ~quiet) | (sign & ~isZero & ~isNaN);
     final isSpecial = isNaN | isInf | isZero | sign;
     // The root of a NaN, and of any negative number that is not -0, is the
     // canonical quiet NaN. +infinity gives itself; +-0 keeps its sign. Each
@@ -188,6 +200,8 @@ class IterativeFpSqrt extends Module {
     // The answer takes the narrow format. Latched, because the pack stage runs
     // many cycles after the operand went in.
     final narrowOut = Logic(name: 'narrowOut');
+    final roundingMode = Logic(name: 'roundingMode', width: 3);
+    final invalidHold = Logic(name: 'invalidHold');
 
     // One restoring step: pull the next two radicand bits into the remainder,
     // then subtract the trial root (4*root + 1) if it fits.
@@ -207,7 +221,13 @@ class IterativeFpSqrt extends Module {
     // Rounding. The remainder passes the halfway point exactly when it is
     // greater than the truncated root, and a carry out of the mantissa means
     // the root rounded up to 2.0, so the exponent takes the carry instead.
-    final roundUp = rem.gt(root.zeroExtend(remW));
+    final roundUp = fpRoundUp(
+      rm: roundingMode,
+      sign: Const(0),
+      guard: rem.gt(root.zeroExtend(remW)),
+      sticky: rem.or(),
+      lsb: root[0],
+    );
     final rounded = root.zeroExtend(n + 1) + roundUp.zeroExtend(n + 1);
     final carry = rounded[n];
     // The result exponent is floor(E/2), so the working exponent shifts right
@@ -230,7 +250,13 @@ class IterativeFpSqrt extends Module {
       final sigN = root.slice(n - 1, lowN);
       final guardN = root[lowN - 1];
       final stickyN = root.slice(lowN - 2, 0).or() | rem.or();
-      final roundUpN = guardN & (stickyN | root[lowN]);
+      final roundUpN = fpRoundUp(
+        rm: roundingMode,
+        sign: Const(0),
+        guard: guardN,
+        sticky: stickyN,
+        lsb: root[lowN],
+      );
       final roundedN = sigN.zeroExtend(nN + 1) + roundUpN.zeroExtend(nN + 1);
       final carryN = roundedN[nN];
       final expN =
@@ -254,6 +280,15 @@ class IterativeFpSqrt extends Module {
     busy <= state.neq(Const(sIdle, width: 2));
     done <= state.eq(Const(sDone, width: 2));
     result <= mux(special, specialHold, computed);
+    final inexact = dual
+        ? mux(narrowOut, root.slice(lowN - 1, 0).or() | rem.or(), rem.or())
+        : rem.or();
+    flags <=
+        mux(
+          special,
+          fpExceptionFlags(invalid: invalidHold),
+          fpExceptionFlags(inexact: inexact),
+        );
 
     // Entry into the run phase: X is the significand, doubled when the working
     // exponent is odd, and the radicand is X shifted up by the mantissa width.
@@ -277,6 +312,8 @@ class IterativeFpSqrt extends Module {
           special < 0,
           specialHold < 0,
           narrowOut < 0,
+          roundingMode < 0,
+          invalidHold < 0,
         ],
         orElse: [
           Case(state, [
@@ -287,6 +324,8 @@ class IterativeFpSqrt extends Module {
                   special < isSpecial,
                   specialHold < specialVal,
                   narrowOut < narrow,
+                  roundingMode < roundingInput,
+                  invalidHold < invalid,
                   rem < 0,
                   root < 0,
                   cnt < n,

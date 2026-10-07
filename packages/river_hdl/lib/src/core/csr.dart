@@ -210,6 +210,16 @@ class RiscVCsrFile extends Module {
   // sticky FP-dirty flop below. Null when the core has no FP register file.
   Logic? _fpDirtyIn;
 
+  // H needs VS/host FS legality and dirty-state handling together. Preserve
+  // its current unsupported-FCSR behavior until that separate integration.
+  final bool enableFcsr;
+  bool get hasFcsr => enableFcsr && _hasFloat && !hasHypervisor;
+  Logic? get frm => hasFcsr ? output('frm') : null;
+  Logic? _fcsr;
+  Logic? _fpFlagsValid;
+  Logic? _fpFlags;
+  Logic? _fcsrDirty;
+
   // Asserted for one cycle when an instruction retires. It advances minstret.
   // Null when nothing drives it, in which case minstret does not count.
   Logic? _retireIn;
@@ -247,6 +257,11 @@ class RiscVCsrFile extends Module {
     Logic? supervisorExternalPending,
     // Asserted when an FP register write retires. Sets mstatus.FS to Dirty.
     Logic? fpDirty,
+    // Disable where precise FP retirement is not integrated (currently OoO).
+    this.enableFcsr = true,
+    // Exception flags from a successfully retiring FP instruction (NV..NX).
+    Logic? fpFlagsValid,
+    Logic? fpFlags,
     // Asserted when an instruction retires. Advances minstret.
     Logic? retire,
     Logic? timerPending,
@@ -298,6 +313,13 @@ class RiscVCsrFile extends Module {
     }
     if (fpDirty != null) {
       _fpDirtyIn = addInput('fpDirty', fpDirty);
+    }
+    if (hasFcsr) {
+      _fcsr = Logic(name: 'fcsr', width: 8);
+      _fpFlagsValid = addInput('fpFlagsValid', fpFlagsValid ?? Const(0));
+      _fpFlags = addInput('fpFlags', fpFlags ?? Const(0, width: 5), width: 5);
+      _fcsrDirty = Logic(name: 'fcsrDirty');
+      addOutput('frm', width: 3) <= _fcsr!.slice(7, 5);
     }
     if (retire != null) {
       _retireIn = addInput('retire', retire);
@@ -425,7 +447,9 @@ class RiscVCsrFile extends Module {
 
     // Created here because the mstatus/sstatus read paths below consume it.
     // It is DRIVEN in _wireFsDirty, which needs the frontdoor write port.
-    _fsDirty = _fpDirtyIn == null ? null : Logic(name: 'fsDirtySticky');
+    _fsDirty = _fpDirtyIn == null && !hasFcsr
+        ? null
+        : Logic(name: 'fsDirtySticky');
 
     _csrTop = CsrTop(
       config: cfg,
@@ -443,6 +467,7 @@ class RiscVCsrFile extends Module {
       // uses the ARCHITECTURAL address so an S-mode access to 0x100/0x104/0x144
       // is legal while the M-mode target address stays M-only.
       ...(hasSupervisor ? _supervisorAliases.keys : const <int>[]),
+      if (hasFcsr) ...[1, 2, 3],
     ];
 
     _frontdoorWritableAddrs = <int>{};
@@ -452,6 +477,7 @@ class RiscVCsrFile extends Module {
       }
     }
     if (hasSupervisor) _frontdoorWritableAddrs.addAll(_supervisorAliases.keys);
+    if (hasFcsr) _frontdoorWritableAddrs.addAll([1, 2, 3]);
 
     _wireLegalityAndFrontdoor();
 
@@ -1164,12 +1190,13 @@ class RiscVCsrFile extends Module {
     // The masked write data is the value that lands in the register, so the
     // sstatus write mask is already applied to it.
     final swDirty = _fdWrite.data.slice(14, 13).eq(Const(3, width: 2));
+    final hwDirty = (_fpDirtyIn ?? Const(0)) | (_fcsrDirty ?? Const(0));
     Sequential(clk, [
       If(
         swWrite,
-        then: [_fsDirty! < (swDirty | _fpDirtyIn!)],
+        then: [_fsDirty! < (swDirty | hwDirty)],
         orElse: [
-          If(_fpDirtyIn!, then: [_fsDirty! < 1]),
+          If(hwDirty, then: [_fsDirty! < 1]),
         ],
       ),
     ], reset: reset);
@@ -1472,7 +1499,11 @@ class RiscVCsrFile extends Module {
         : rdAddr12
               .eq(Const(CsrAddress.time.address, width: 12))
               .named('csrIsTime');
+    final rdFp = hasFcsr ? rdAddr12.gte(1) & rdAddr12.lte(3) : Const(0);
+    final wrFp = hasFcsr ? wrAddr12.gte(1) & wrAddr12.lte(3) : Const(0);
+    final fpEnabled = _statusRead(_mstatusRaw).slice(14, 13).neq(0);
     final rdLegal =
+        (~rdFp | fpEnabled) &
         (_addrExists(rdAddr12) | isTimeRd) &
         _privOk(rdAddr12) &
         _counterReadOk(rdAddr12) &
@@ -1482,12 +1513,13 @@ class RiscVCsrFile extends Module {
     // redundant existence term removes the _addrExists OR-tree from
     // write-legality (area diet). Read-legality still uses _addrExists.
     final wrLegal =
+        (~wrFp | fpEnabled) &
         _privOk(wrAddr12) &
         _stateenOk(wrAddr12) &
         _isFrontdoorWritable(wrAddr12);
 
     _fdRead.addr <= aliasAddr(rdAddr12, 'rd');
-    _fdRead.en <= csrRead.en & rdLegal;
+    _fdRead.en <= csrRead.en & rdLegal & ~rdFp;
     // An aliased S read gets the whole M register back, so narrow it to what
     // that S CSR is allowed to show. A plain `csrr mip` also has to show the
     // PLIC SEIP line, which the register itself does not hold.
@@ -1513,6 +1545,52 @@ class RiscVCsrFile extends Module {
         rdData,
       );
     }
+    if (hasFcsr) {
+      rdData = mux(
+        rdFp,
+        mux(
+          rdAddr12.eq(1),
+          _fcsr!.slice(4, 0).zeroExtend(mxlen.size),
+          mux(
+            rdAddr12.eq(2),
+            _fcsr!.slice(7, 5).zeroExtend(mxlen.size),
+            _fcsr!.zeroExtend(mxlen.size),
+          ),
+        ),
+        rdData,
+      );
+      final softwareWrite = csrWrite.en & wrLegal & wrFp;
+      final softwareData = mux(
+        wrAddr12.eq(1),
+        [_fcsr!.slice(7, 5), csrWrite.data.slice(4, 0)].swizzle(),
+        mux(
+          wrAddr12.eq(2),
+          [csrWrite.data.slice(2, 0), _fcsr!.slice(4, 0)].swizzle(),
+          csrWrite.data.slice(7, 0),
+        ),
+      );
+      // Software writes replace the addressed field; hardware flags accrue.
+      // A serialized CSR write takes precedence over a coincident flag update.
+      Sequential(clk, [
+        If(
+          reset,
+          then: [_fcsr! < 0],
+          orElse: [
+            If(
+              softwareWrite,
+              then: [_fcsr! < softwareData],
+              orElse: [
+                If(
+                  _fpFlagsValid!,
+                  then: [_fcsr! < (_fcsr! | _fpFlags!.zeroExtend(8))],
+                ),
+              ],
+            ),
+          ],
+        ),
+      ]);
+      _fcsrDirty! <= softwareWrite | (_fpFlagsValid! & _fpFlags!.or());
+    }
     // `time` (rdtime) returns the live CLINT mtime, not a stored register, so the
     // OS clocksource tracks the same counter its timer events compare against.
     if (_timeIn != null) {
@@ -1528,7 +1606,7 @@ class RiscVCsrFile extends Module {
     final maskedWriteData = _maskWriteData(wrAddr12, csrWrite.data);
     _fdWrite.data <= maskedWriteData;
 
-    _fdWrite.en <= csrWrite.en & wrLegal;
+    _fdWrite.en <= csrWrite.en & wrLegal & ~wrFp;
     csrWrite.done <= csrWrite.en;
     csrWrite.valid <= csrWrite.en & wrLegal;
   }
@@ -1612,7 +1690,33 @@ class RiscVCsrFile extends Module {
   /// are driven every cycle (0 when idle). PC/mode restore itself is in
   /// core.dart; this method only manages the CSR contents.
   void _wireTrapState() {
-    if (_trapActive == null) return;
+    if (_trapActive == null) {
+      // Optional trap controls must leave the hardware write ports idle, not
+      // floating: FS legality also reads mstatus in standalone CSR instances.
+      for (final address in [
+        CsrAddress.mstatus,
+        CsrAddress.mepc,
+        CsrAddress.mcause,
+        CsrAddress.mtval,
+        if (hasSupervisor) ...[
+          CsrAddress.sepc,
+          CsrAddress.scause,
+          CsrAddress.stval,
+        ],
+        if (hasHypervisor) ...[
+          CsrAddress.hstatus,
+          CsrAddress.vsstatus,
+          CsrAddress.vsepc,
+          CsrAddress.vscause,
+          CsrAddress.vstval,
+        ],
+      ]) {
+        final port = getBackdoor(LogicValue.ofInt(address.address, 12));
+        port.wrEn! <= Const(0);
+        port.wrData! <= Const(0, width: mxlen.size);
+      }
+      return;
+    }
 
     final trapToM = _trapActive! & _trapTargetIsM!;
     final retFromM = _returnActive! & _returnFromM!;

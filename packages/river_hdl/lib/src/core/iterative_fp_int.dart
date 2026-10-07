@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import 'fp_status.dart';
+
 /// Shared multi-cycle integer to floating-point and floating-point to integer
 /// conversion.
 ///
@@ -52,6 +54,10 @@ class IterativeFpIntConvert extends Module {
   /// The packed float, for the integer to float direction.
   Logic get fpOut => output('fpOut');
 
+  /// Integer-to-float exception flags, valid with [done]. Float-to-integer
+  /// flags are determined by the caller's rounding and saturation logic.
+  Logic get fpFlags => output('fpFlags');
+
   /// The magnitude of the float, truncated toward zero, for the other
   /// direction. [roundBit] and [sticky] carry everything below it.
   Logic get intMag => output('intMag');
@@ -70,6 +76,7 @@ class IterativeFpIntConvert extends Module {
     Logic intSigned,
     Logic toInt,
     Logic narrow, {
+    Logic? rm,
     this.exponentWidth = 11,
     this.mantissaWidth = 52,
     this.narrowExponentWidth = 8,
@@ -103,10 +110,12 @@ class IterativeFpIntConvert extends Module {
     intSigned = addInput('intSigned', intSigned);
     toInt = addInput('toInt', toInt);
     narrow = addInput('narrow', narrow);
+    final roundingInput = addInput('rm', rm ?? Const(0, width: 3), width: 3);
 
     final busy = addOutput('busy');
     final done = addOutput('done');
     final fpOut = addOutput('fpOut', width: w);
+    final fpFlags = addOutput('fpFlags', width: 5);
     final intMag = addOutput('intMag', width: intWidth);
     final roundBit = addOutput('roundBit');
     final sticky = addOutput('sticky');
@@ -125,6 +134,8 @@ class IterativeFpIntConvert extends Module {
     final ovfHold = Logic(name: 'ovfHold');
     final zeroInt = Logic(name: 'zeroInt');
     final resReg = Logic(name: 'resReg', width: w);
+    final roundingMode = Logic(name: 'roundingMode', width: 3);
+    final flagsReg = Logic(name: 'flagsReg', width: 5);
 
     // ------------------------------------------------------- integer to float
 
@@ -213,7 +224,7 @@ class IterativeFpIntConvert extends Module {
       stickyRight(val),
     );
 
-    // Round to nearest, ties to even, at the destination format. The
+    // Round in the accepted instruction's mode at the destination format. The
     // significand always starts at the top bit, because the normalise loop put
     // it there, so the only choice is where it stops.
     final loW = vw - n;
@@ -229,7 +240,13 @@ class IterativeFpIntConvert extends Module {
         ? mux(narrowOut, val.slice(loN - 2, 0).or(), val.slice(loW - 2, 0).or())
         : val.slice(loW - 2, 0).or();
     final lBit = dual ? mux(narrowOut, val[loN], val[loW]) : val[loW];
-    final roundUp = gBit & (sBit | lBit);
+    final roundUp = fpRoundUp(
+      rm: roundingMode,
+      sign: sgn,
+      guard: gBit,
+      sticky: sBit,
+      lsb: lBit,
+    );
     final rounded = sigOut.zeroExtend(n + 1) + roundUp.zeroExtend(n + 1);
     final carry = dual ? mux(narrowOut, rounded[nN], rounded[n]) : rounded[n];
     final expFin = expv + carry.zeroExtend(expW);
@@ -258,6 +275,7 @@ class IterativeFpIntConvert extends Module {
     busy <= state.neq(st(sIdle));
     done <= state.eq(st(sDone));
     fpOut <= resReg;
+    fpFlags <= flagsReg;
     intMag <= val.slice(vw - 1, 2);
     roundBit <= val[1];
     sticky <= val[0];
@@ -277,6 +295,8 @@ class IterativeFpIntConvert extends Module {
           ovfHold < 0,
           zeroInt < 0,
           resReg < 0,
+          roundingMode < 0,
+          flagsReg < 0,
         ],
         orElse: [
           Case(state, [
@@ -285,6 +305,8 @@ class IterativeFpIntConvert extends Module {
                 start,
                 then: [
                   narrowOut < narrow,
+                  roundingMode < roundingInput,
+                  flagsReg < 0,
                   If(
                     toInt,
                     then: [
@@ -330,7 +352,11 @@ class IterativeFpIntConvert extends Module {
                 orElse: [val < shiftStep, cnt < cnt - 1],
               ),
             ]),
-            CaseItem(st(sRound), [resReg < packed, state < sDone]),
+            CaseItem(st(sRound), [
+              resReg < packed,
+              flagsReg < fpExceptionFlags(inexact: gBit | sBit),
+              state < sDone,
+            ]),
             CaseItem(st(sDone), [
               If(~start, then: [state < sIdle]),
             ]),
