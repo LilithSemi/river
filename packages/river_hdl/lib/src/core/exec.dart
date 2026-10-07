@@ -10,6 +10,7 @@ import 'iterative_multiplier.dart';
 import 'iterative_fp_arith.dart';
 import 'iterative_fp_int.dart';
 import 'iterative_sqrt.dart';
+import 'fp_status.dart';
 import 'microcode_alu.dart';
 
 /// Supervisor address translation and protection register. A write to it
@@ -75,6 +76,9 @@ const _kIterativeDivRem = {
   Logic fmin,
   Logic fmax,
   Logic fclass,
+  Logic eqFlags,
+  Logic orderedCompareFlags,
+  Logic minMaxFlags,
   Logic signBit,
   Logic isNaN,
   Logic isInf,
@@ -85,9 +89,8 @@ fpBitOps(Logic a, Logic b, int w) {
   final cmp = fpCompare(a, b, w, expBits);
   final signF = Const(1, width: w) << (w - 1);
   final magMask = ~signF;
-  // min/max select the raw bit pattern using the same ordered compare the
-  // emulator's `a<b`/`a>b` uses (NaN compares false, so the second operand
-  // wins).
+  // Comparisons suppress their Boolean result for either NaN. FEQ is quiet;
+  // FLT/FLE signal invalid even for a quiet NaN.
   final ltOrdered = cmp.ordered & cmp.lt;
   final gtOrdered = cmp.ordered & ~(cmp.lt | cmp.eq);
   final expF = a.slice(w - 2, manBits);
@@ -103,6 +106,18 @@ fpBitOps(Logic a, Logic b, int w) {
   final isZero = exp0 & man0;
   final isSub = exp0 & ~man0;
   final isNorm = ~expAll1 & ~exp0;
+  final bMan = b.slice(manBits - 1, 0);
+  final bNaN =
+      b.slice(w - 2, manBits).eq(Const((1 << expBits) - 1, width: expBits)) &
+      bMan.or();
+  final signaling = isSNaN | (bNaN & ~bMan[manBits - 1]);
+  final quietNaN = Const(
+    (((BigInt.one << expBits) - BigInt.one) << manBits) |
+        (BigInt.one << (manBits - 1)),
+    width: w,
+  );
+  Logic minMax(Logic pickA) =>
+      mux(isNaN, mux(bNaN, quietNaN, b), mux(bNaN, a, mux(pickA, a, b)));
   return (
     eq: cmp.ordered & cmp.eq,
     lt: ltOrdered,
@@ -110,8 +125,11 @@ fpBitOps(Logic a, Logic b, int w) {
     fsgnj: (a & magMask) | (b & signF),
     fsgnjn: (a & magMask) | ((~b) & signF),
     fsgnjx: (a & magMask) | ((a ^ b) & signF),
-    fmin: mux(ltOrdered, a, b),
-    fmax: mux(gtOrdered, a, b),
+    fmin: minMax(ltOrdered | (cmp.eq & signBit)),
+    fmax: minMax(gtOrdered | (cmp.eq & ~signBit)),
+    eqFlags: fpExceptionFlags(invalid: signaling),
+    orderedCompareFlags: fpExceptionFlags(invalid: ~cmp.ordered),
+    minMaxFlags: fpExceptionFlags(invalid: signaling),
     fclass: [
       isQNaN,
       isSNaN,
@@ -147,6 +165,7 @@ Logic roundSatFpToInt({
   required Logic isL,
   required Logic uns,
   required RiscVMxlen mxlen,
+  Logic? flagsOut,
 }) {
   final ones64 = Const(BigInt.parse('FFFFFFFFFFFFFFFF', radix: 16), width: 64);
   final rne = roundBit & (sticky | intMag[0]);
@@ -221,6 +240,21 @@ Logic roundSatFpToInt({
     mux(isNaN | (isInf & ~signBit), ones64, Const(0, width: 64)),
     mux(signBit, Const(0, width: 64), mux(magOvf, ones64, rMag)),
   );
+  if (flagsOut != null) {
+    // Test the rounded magnitude, not merely the source sign: a negative
+    // fraction rounding to unsigned zero is valid. Invalid suppresses NX.
+    final signedLimit = mux(
+      isL,
+      mux(signBit, c63n, c63),
+      mux(signBit, Const(0x80000000, width: 64), Const(0x7fffffff, width: 64)),
+    );
+    final unsignedRange =
+        (signBit & rMag.or()) | (~isL & rMag.gt(Const(0xffffffff, width: 64)));
+    final invalid =
+        special | magOvf | mux(uns, unsignedRange, rMag.gt(signedLimit));
+    flagsOut <=
+        [invalid, Const(0, width: 3), ~invalid & (roundBit | sticky)].swizzle();
+  }
   // ws/wu are mxlen-wide; ls/lu are 64 (the L=fcvt.l.* form is rv64-only, dead
   // on rv32). Coerce the L side to mxlen so the W/L mux is uniform width (a
   // no-op on rv64). #71.
@@ -445,7 +479,7 @@ abstract class ExecutionUnit extends Module {
   Logic? _fpIntCvtStart;
   // Shared multi-cycle add/multiply/divide. ONE unit serves the whole
   // arithmetic family: it adds, multiplies and divides one bit per cycle, and
-  // it runs a fused multiply-add as two passes of its own. That replaces the
+  // it retains the full FMA product until the single final rounding. This replaces the
   // combinational adder (align shifter, normaliser, rounder) and the 53x53
   // partial-product array, which together were the largest block in the FP
   // datapath. An arithmetic mop holds [_fpArithStart] while resident and reads
@@ -482,6 +516,54 @@ abstract class ExecutionUnit extends Module {
   Logic? _imulA;
   Logic? _imulB;
 
+  late final Logic _fpRm;
+  late final bool _fpControlEnabled;
+  bool _fpHasDouble = false;
+
+  // Computational F32 reads on FLEN=64 treat invalid boxes as quiet NaNs.
+  // Raw moves and stores deliberately bypass this helper.
+  Logic _fpOperand(Logic value, int width) {
+    final bits = value.getRange(0, width);
+    if (!_fpControlEnabled ||
+        !_fpHasDouble ||
+        width != 32 ||
+        value.width <= 32) {
+      return bits;
+    }
+    return mux(
+      value.getRange(32, value.width).and(),
+      bits,
+      Const(0x7fc00000, width: 32),
+    );
+  }
+
+  Logic _fpBoxResult(Logic value, Logic single) {
+    if (!_fpControlEnabled || !_fpHasDouble || value.width != 64) return value;
+    return mux(
+      single,
+      [Const(0xffffffff, width: 32), value.slice(31, 0)].swizzle(),
+      value,
+    );
+  }
+
+  bool _fpSingleResult(RiscVFpuOp mop) => switch (mop.funct) {
+    RiscVFpuFunct.fcvtSD || RiscVFpuFunct.fcvtSW => true,
+    RiscVFpuFunct.fcvtDS || RiscVFpuFunct.fcvtDW => false,
+    _ => !mop.doublePrecision,
+  };
+
+  Logic _fpMoveToIntWord = Const(0), _fpMoveFromIntWord = Const(0);
+  Logic _fpMoveResult(Logic value) {
+    if (!_fpControlEnabled) return value;
+    return mux(
+      _fpMoveToIntWord,
+      value.slice(31, 0).signExtend(value.width),
+      mux(_fpMoveFromIntWord, _fpBoxResult(value, Const(1)), value),
+    );
+  }
+
+  late final Logic _csrNoWrite;
+  Logic get fpFlags => output('fpFlags');
   Logic get done => output('done');
   Logic get valid => output('valid');
   Logic get nextSp => output('nextSp');
@@ -542,6 +624,8 @@ abstract class ExecutionUnit extends Module {
     // Faulting instruction portion's VA; the instruction start remains EPC.
     Logic? fetchFaultTval,
     Logic? memAccessFault,
+    Logic? frm,
+    Logic? fpEnabled,
     // Floating-point register ports. The FP register file belongs in the core
     // module next to the integer file, which is where the device target is
     // known and where a BRAM backend can be selected. When these are supplied
@@ -730,6 +814,52 @@ abstract class ExecutionUnit extends Module {
       this.memFaultGuest = null;
     }
 
+    addOutput('fpFlags', width: 5);
+    _fpControlEnabled = frm != null;
+    final frmIn = addInput('frm', frm ?? Const(0, width: 3), width: 3);
+    final fpEnabledIn = addInput('fpEnabled', fpEnabled ?? Const(1));
+    final instructionRm = fields['funct3'] ?? Const(0, width: 3);
+    _csrNoWrite =
+        instructionRm[1] & (fields['rs1'] ?? Const(0, width: 5)).eq(0);
+    _fpRm = mux(instructionRm.eq(Const(7, width: 3)), frmIn, instructionRm);
+    final fpUnitRm = _fpControlEnabled ? _fpRm : Const(0, width: 3);
+    Logic fpInstruction = Const(0), roundedInstruction = Const(0);
+    const roundedFunctions = {
+      RiscVFpuFunct.fadd,
+      RiscVFpuFunct.fsub,
+      RiscVFpuFunct.fmul,
+      RiscVFpuFunct.fdiv,
+      RiscVFpuFunct.fsqrt,
+      RiscVFpuFunct.fmadd,
+      RiscVFpuFunct.fmsub,
+      RiscVFpuFunct.fnmsub,
+      RiscVFpuFunct.fnmadd,
+      RiscVFpuFunct.fcvtSD,
+      RiscVFpuFunct.fcvtDS,
+      RiscVFpuFunct.fcvtWS,
+      RiscVFpuFunct.fcvtWD,
+      RiscVFpuFunct.fcvtSW,
+      RiscVFpuFunct.fcvtDW,
+    };
+    for (final entry in microcode.execLookup.entries) {
+      final hit = instrIndex.eq(Const(entry.key, width: instrIndex.width));
+      if (entry.value.mnemonic == 'fmv.x.w') {
+        _fpMoveToIntWord = _fpMoveToIntWord | hit;
+      }
+      if (entry.value.mnemonic == 'fmv.w.x') {
+        _fpMoveFromIntWord = _fpMoveFromIntWord | hit;
+      }
+      if (entry.value.resources.any(
+        (r) => r is RfResource && r.regfile is RiscVFloatRegFile,
+      )) {
+        fpInstruction = fpInstruction | hit;
+      }
+      if (entry.value.indexedMicrocode.values.any(
+        (mop) => mop is RiscVFpuOp && roundedFunctions.contains(mop.funct),
+      )) {
+        roundedInstruction = roundedInstruction | hit;
+      }
+    }
     addOutput('done');
     addOutput('valid');
     addOutput('nextSp', width: mxlen.size);
@@ -765,6 +895,11 @@ abstract class ExecutionUnit extends Module {
         .fold(0, (a, b) => a > b ? a : b);
 
     final mopStep = Logic(name: 'mopStep', width: maxLen.bitLength);
+    final fpIllegal =
+        Const(_fpControlEnabled ? 1 : 0) &
+        mopStep.eq(0) &
+        ((fpInstruction & ~fpEnabledIn) |
+            (roundedInstruction & _fpRm.gt(Const(4, width: 3))));
 
     final alu = Logic(name: 'aluState', width: mxlen.size);
     final rs1 = Logic(name: 'rs1State', width: mxlen.size);
@@ -927,10 +1062,14 @@ abstract class ExecutionUnit extends Module {
               (r.regfile as RiscVFloatRegFile).width == 64,
         ),
       );
+      _fpHasDouble = hasDouble;
       if (hasDouble) {
+        final fpA = mux(selSingle, _fpOperand(rs1, 32).zeroExtend(64), rs1);
+        final fpB = mux(selSingle, _fpOperand(rs2, 32).zeroExtend(64), rs2);
+        final fpC = mux(selSingle, _fpOperand(rs3, 32).zeroExtend(64), rs3);
         // Shared arithmetic. ONE multi-cycle unit adds, multiplies, divides
-        // and converts between the two precisions, and it runs a fused
-        // multiply-add as two passes of its own, so the whole family costs one
+        // and converts between the two precisions. FMA retains the full product
+        // through addition and rounds once, so the whole family shares one
         // align/normalise/round datapath and one adder instead of an unrolled
         // adder plus a 53x53 product array. It reads its operands at the
         // source width and rounds the answer at the destination width, which
@@ -940,9 +1079,9 @@ abstract class ExecutionUnit extends Module {
           clk,
           reset,
           _fpArithStart!,
-          rs1,
-          rs2,
-          rs3,
+          fpA,
+          fpB,
+          fpC,
           selFma,
           selNegA,
           selNegB,
@@ -952,6 +1091,7 @@ abstract class ExecutionUnit extends Module {
           selSingle,
           exponentWidth: 11,
           mantissaWidth: 52,
+          rm: fpUnitRm,
         );
         _fpArithD = _fpArith!.result;
 
@@ -965,10 +1105,11 @@ abstract class ExecutionUnit extends Module {
           clk,
           reset,
           _fsqrtStart!,
-          rs1,
+          fpA,
           selSingle,
           exponentWidth: 11,
           mantissaWidth: 52,
+          rm: fpUnitRm,
         );
         _fpSqrtD = _fsqrt!.result;
 
@@ -980,13 +1121,14 @@ abstract class ExecutionUnit extends Module {
           clk,
           reset,
           _fpIntCvtStart!,
-          rs1,
+          mux(selFpNarrow, _fpOperand(rs1, 32).zeroExtend(64), rs1),
           intSrc,
           ~cvtUns,
           selToInt,
           selFpNarrow,
           exponentWidth: 11,
           mantissaWidth: 52,
+          rm: fpUnitRm,
         );
       } else {
         // F without D: no double unit to borrow, so the single family builds
@@ -1007,6 +1149,7 @@ abstract class ExecutionUnit extends Module {
           selSingle,
           exponentWidth: 8,
           mantissaWidth: 23,
+          rm: fpUnitRm,
         );
         _fpArithS = _fpArith!.result;
 
@@ -1020,6 +1163,7 @@ abstract class ExecutionUnit extends Module {
           Const(0),
           exponentWidth: 8,
           mantissaWidth: 23,
+          rm: fpUnitRm,
         );
         _fpSqrtS = _fsqrt!.result;
 
@@ -1036,6 +1180,7 @@ abstract class ExecutionUnit extends Module {
           Const(0),
           exponentWidth: 8,
           mantissaWidth: 23,
+          rm: fpUnitRm,
         );
       }
     }
@@ -1119,6 +1264,7 @@ abstract class ExecutionUnit extends Module {
           alu < 0,
           mopStep < 0,
           done < 0,
+          fpFlags < 0,
           output('trap') < 0,
           output('trapInterrupt') < 0,
           output('trapEpc') < currentPc,
@@ -1234,8 +1380,17 @@ abstract class ExecutionUnit extends Module {
                 ),
                 orElse: [
                   If(
-                    fetchFaultIn,
-                    then: doTrap(Trap.instructionPageFault, currentPc),
+                    fetchFaultIn | fpIllegal,
+                    then: [
+                      If(
+                        fetchFaultIn,
+                        then: doTrap(Trap.instructionPageFault, currentPc),
+                        orElse: doTrap(
+                          Trap.illegal,
+                          Const(0, width: mxlen.size),
+                        ),
+                      ),
+                    ],
                     orElse: microcodeRead != null
                         ? cycleMicrocode(
                             instrIndex,
@@ -1276,6 +1431,7 @@ abstract class ExecutionUnit extends Module {
               alu < 0,
               mopStep < 0,
               done < 0,
+              fpFlags < 0,
               rs1Read.en < 0,
               rs1Read.addr < 0,
               rs2Read.en < 0,
@@ -1645,6 +1801,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.fetchAccessFault,
     super.fetchFaultTval,
     super.memAccessFault,
+    super.frm,
+    super.fpEnabled,
     super.fpRs1Port,
     super.fpRs2Port,
     super.fpRdPort,
@@ -2098,6 +2256,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
     // the MemLoad arm uses. [fpIsArith] and [fpIsSqrt] park the micro-op on
     // the two multi-cycle units.
     Logic? fpResult;
+    Logic? fpResultFlags;
     Logic? fpIsArith;
     Logic? fpIsSqrt;
     Logic? fpIsIntCvt;
@@ -2126,7 +2285,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
       // Bit-level results at both precisions (compares, sign injection,
       // min/max, classify). Each is a narrow value, so one precision mux per
       // result is cheaper than a second function-wide mux for the double side.
-      final sBits = fpBitOps(rs1.slice(31, 0), rs2.slice(31, 0), 32);
+      final sBits = fpBitOps(_fpOperand(rs1, 32), _fpOperand(rs2, 32), 32);
       final dBits = hasDp ? fpBitOps(rs1, rs2, 64) : null;
 
       // fp -> int. The precision bit of an fcvt names the SOURCE precision, so
@@ -2135,6 +2294,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
       // serves both. The shared unit reports the truncated magnitude with a
       // round and a sticky bit, and the per-rm rounding and the saturation
       // happen here.
+      final fpToIntFlags = Logic(width: 5);
       final fpToInt = roundSatFpToInt(
         intMag: _fpIntCvt!.intMag,
         roundBit: _fpIntCvt!.roundBit,
@@ -2143,7 +2303,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
         signBit: byPrec(dBits?.signBit, sBits.signBit),
         isNaN: byPrec(dBits?.isNaN, sBits.isNaN),
         isInf: byPrec(dBits?.isInf, sBits.isInf),
-        rm: fields['funct3']!,
+        rm: _fpControlEnabled ? _fpRm : fields['funct3']!,
+        flagsOut: fpToIntFlags,
         isL: fields['rs2']![1],
         uns: fields['rs2']![0],
         mxlen: mxlen,
@@ -2295,7 +2456,52 @@ class DynamicExecutionUnit extends ExecutionUnit {
         res = mux(isSqrtRes, fit(_fpSqrtS!), res);
         res = mux(fpIsArith, fit(_fpArithS!), res);
       }
-      fpResult = res.named('fpResult');
+      final writesFloat =
+          fpIsArith |
+          fpIsSqrt |
+          (fpIsIntCvt & ~isToIntFn) |
+          isFn(MicroOpFpuFunct.fsgnj) |
+          isFn(MicroOpFpuFunct.fsgnjn) |
+          isFn(MicroOpFpuFunct.fsgnjx) |
+          isFn(MicroOpFpuFunct.fmin) |
+          isFn(MicroOpFpuFunct.fmax);
+      fpResult = _fpMoveResult(
+        _fpBoxResult(
+          res,
+          writesFloat &
+              mux(
+                isCvtFn,
+                isFn(MicroOpFpuFunct.fcvtSD),
+                mux(fpIsIntCvt, isFn(MicroOpFpuFunct.fcvtSW), ~dp),
+              ),
+        ),
+      ).named('fpResult');
+      final bitFlags = mux(
+        isFn(MicroOpFpuFunct.feq),
+        byPrec(dBits?.eqFlags, sBits.eqFlags),
+        mux(
+          isFn(MicroOpFpuFunct.flt) | isFn(MicroOpFpuFunct.fle),
+          byPrec(dBits?.orderedCompareFlags, sBits.orderedCompareFlags),
+          mux(
+            isFn(MicroOpFpuFunct.fmin) | isFn(MicroOpFpuFunct.fmax),
+            byPrec(dBits?.minMaxFlags, sBits.minMaxFlags),
+            Const(0, width: 5),
+          ),
+        ),
+      );
+      fpResultFlags = mux(
+        fpIsArith,
+        _fpArith!.flags,
+        mux(
+          fpIsSqrt,
+          _fsqrt!.flags,
+          mux(
+            fpIsIntCvt,
+            mux(isToIntFn, fpToIntFlags, _fpIntCvt!.fpFlags),
+            bitFlags,
+          ),
+        ),
+      );
     }
 
     Conditional writeField(Logic field, Logic value) => Case(
@@ -2523,7 +2729,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
                   then: [
                     writeField(
                       mop['ReadRegister']!['source']!,
-                      fprs1Read!.data,
+                      fprs1Read!.data.getRange(0, mxlen.size),
                     ),
                     mopStep < mopStep + 1,
                     microcodeRead.en < 0,
@@ -2542,7 +2748,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
                   then: [
                     writeField(
                       mop['ReadRegister']!['source']!,
-                      fprs2Read!.data,
+                      fprs2Read!.data.getRange(0, mxlen.size),
                     ),
                     mopStep < mopStep + 1,
                     microcodeRead.en < 0,
@@ -3627,7 +3833,11 @@ class DynamicExecutionUnit extends ExecutionUnit {
                         _virtualUserCsrBlocked,
                         then: doTrap(Trap.illegal),
                         orElse: [
-                          csrWrite.en < 1,
+                          csrWrite.en < ~_csrNoWrite,
+                          If(
+                            _csrNoWrite,
+                            then: [mopStep < mopStep + 1, microcodeRead.en < 0],
+                          ),
                           csrWrite.addr < csrAddr!,
                           csrWrite.data < sharedSourceVal,
                           // A satp write switches the address space. Both L1
@@ -3640,9 +3850,10 @@ class DynamicExecutionUnit extends ExecutionUnit {
                           // satp write with sfence.vma (Linux uses ASIDs, so it
                           // does not), which is why the caches went stale.
                           If(
-                            csrAddr.eq(
-                              Const(_satpCsrAddress, width: csrAddr.width),
-                            ),
+                            ~_csrNoWrite &
+                                csrAddr.eq(
+                                  Const(_satpCsrAddress, width: csrAddr.width),
+                                ),
                             then: [fence < 1],
                           ),
                         ],
@@ -3668,7 +3879,10 @@ class DynamicExecutionUnit extends ExecutionUnit {
                         (~fpIsArith! | _fpArith!.done) &
                             (~fpIsSqrt! | _fsqrt!.done) &
                             (~fpIsIntCvt! | _fpIntCvt!.done),
-                        then: [writeField(mop['FpuOp']!['dest']!, fpResult!)],
+                        then: [
+                          writeField(mop['FpuOp']!['dest']!, fpResult!),
+                          fpFlags < fpResultFlags!,
+                        ],
                       ),
                       If(
                         fpIsSqrt,
@@ -3835,6 +4049,8 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.fetchAccessFault,
     super.fetchFaultTval,
     super.memAccessFault,
+    super.frm,
+    super.fpEnabled,
     super.fpRs1Port,
     super.fpRs2Port,
     super.fpRdPort,
@@ -5697,9 +5913,8 @@ class StaticExecutionUnit extends ExecutionUnit {
               if (arithFuncts.contains(mop.funct)) {
                 // Multi-cycle arithmetic: park at this mopStep with the shared
                 // unit started, then write the result and advance. One unit
-                // serves every form, a fused multiply-add takes two of its own
-                // passes before it reports done, and the answer already sits
-                // at the destination format.
+                // serves every form; FMA retains the full product through the
+                // addition and rounds only once at the destination format.
                 final resultBits = _fpArithD ?? _fpArithS!;
                 steps.add(
                   CaseItem(Const(i, width: maxLen.bitLength), [
@@ -5707,8 +5922,15 @@ class StaticExecutionUnit extends ExecutionUnit {
                     If(
                       _fpArith!.done,
                       then: [
-                        writeField(mop.dest, resultBits.zeroExtend(mxlen.size)),
+                        writeField(
+                          mop.dest,
+                          _fpBoxResult(
+                            resultBits.zeroExtend(mxlen.size),
+                            Const(_fpSingleResult(mop) ? 1 : 0),
+                          ),
+                        ),
                         _fpArithStart! < 0,
+                        fpFlags < _fpArith!.flags,
                         mopStep < mopStep + 1,
                       ],
                     ),
@@ -5721,11 +5943,12 @@ class StaticExecutionUnit extends ExecutionUnit {
                 // per-rm rounding and the RISC-V saturation happen here.
                 final srcW = mop.doublePrecision ? 64 : 32;
                 final srcM = mop.doublePrecision ? 52 : 23;
-                final src = rs1.slice(srcW - 1, 0);
+                final src = _fpOperand(rs1, srcW);
                 final srcExp = src.slice(srcW - 2, srcM);
                 final srcMan = src.slice(srcM - 1, 0);
                 final srcMax = srcExp.and();
                 final Logic resultBits;
+                final conversionFlags = Logic(width: 5);
                 if (mop.funct == RiscVFpuFunct.fcvtWS ||
                     mop.funct == RiscVFpuFunct.fcvtWD) {
                   resultBits = roundSatFpToInt(
@@ -5736,13 +5959,18 @@ class StaticExecutionUnit extends ExecutionUnit {
                     signBit: src[srcW - 1],
                     isNaN: srcMax & srcMan.or(),
                     isInf: srcMax & ~srcMan.or(),
-                    rm: fields['funct3']!,
+                    rm: _fpControlEnabled ? _fpRm : fields['funct3']!,
+                    flagsOut: conversionFlags,
                     isL: fields['rs2']![1],
                     uns: fields['rs2']![0],
                     mxlen: mxlen,
                   );
                 } else {
-                  resultBits = _fpIntCvt!.fpOut;
+                  resultBits = _fpBoxResult(
+                    _fpIntCvt!.fpOut,
+                    Const(_fpSingleResult(mop) ? 1 : 0),
+                  );
+                  conversionFlags <= _fpIntCvt!.fpFlags;
                 }
                 steps.add(
                   CaseItem(Const(i, width: maxLen.bitLength), [
@@ -5752,6 +5980,7 @@ class StaticExecutionUnit extends ExecutionUnit {
                       then: [
                         writeField(mop.dest, resultBits),
                         _fpIntCvtStart! < 0,
+                        fpFlags < conversionFlags,
                         mopStep < mopStep + 1,
                       ],
                     ),
@@ -5769,8 +5998,15 @@ class StaticExecutionUnit extends ExecutionUnit {
                     If(
                       _fsqrt!.done,
                       then: [
-                        writeField(mop.dest, resultBits.zeroExtend(mxlen.size)),
+                        writeField(
+                          mop.dest,
+                          _fpBoxResult(
+                            resultBits.zeroExtend(mxlen.size),
+                            Const(_fpSingleResult(mop) ? 1 : 0),
+                          ),
+                        ),
                         _fsqrtStart! < 0,
+                        fpFlags < _fsqrt!.flags,
                         mopStep < mopStep + 1,
                       ],
                     ),
@@ -5783,8 +6019,8 @@ class StaticExecutionUnit extends ExecutionUnit {
                 // gives the same values to the microcoded unit.
                 final w = mop.doublePrecision ? 64 : 32;
                 final bits = fpBitOps(
-                  rs1.slice(w - 1, 0),
-                  rs2.slice(w - 1, 0),
+                  _fpOperand(rs1, w),
+                  _fpOperand(rs2, w),
                   w,
                 );
                 final cmpEq = bits.eq.zeroExtend(mxlen.size);
@@ -5837,7 +6073,35 @@ class StaticExecutionUnit extends ExecutionUnit {
                 }
                 steps.add(
                   CaseItem(Const(i, width: maxLen.bitLength), [
-                    writeField(mop.dest, result),
+                    writeField(
+                      mop.dest,
+                      _fpMoveResult(
+                        _fpBoxResult(
+                          result,
+                          Const(
+                            w == 32 &&
+                                    {
+                                      RiscVFpuFunct.fsgnj,
+                                      RiscVFpuFunct.fsgnjn,
+                                      RiscVFpuFunct.fsgnjx,
+                                      RiscVFpuFunct.fmin,
+                                      RiscVFpuFunct.fmax,
+                                    }.contains(mop.funct)
+                                ? 1
+                                : 0,
+                          ),
+                        ),
+                      ),
+                    ),
+                    fpFlags <
+                        switch (mop.funct) {
+                          RiscVFpuFunct.feq => bits.eqFlags,
+                          RiscVFpuFunct.flt ||
+                          RiscVFpuFunct.fle => bits.orderedCompareFlags,
+                          RiscVFpuFunct.fmin ||
+                          RiscVFpuFunct.fmax => bits.minMaxFlags,
+                          _ => Const(0, width: 5),
+                        },
                     mopStep < mopStep + 1,
                   ]),
                 );
@@ -6000,9 +6264,9 @@ class StaticExecutionUnit extends ExecutionUnit {
               // csrrs/csrrc with rs1=x0 (and csrr*i with uimm=0) must NOT
               // write the CSR and must NOT trap on a read-only CSR. funct3[1]
               // marks the set/clear forms (RS/RC/RSI/RCI); instr[19:15] (the
-              // rs1 / uimm field) == 0 is the no-write case. The write still
-              // fires harmlessly on a writable CSR (unchanged value); only
-              // the read-only trap (valid=0) must be suppressed.
+              // rs1 / uimm field) == 0 is the no-write case. Suppress the port
+              // itself: an unchanged-value write still has side effects (FS
+              // dirty state for fcsr, for example).
               final csrNoWrite =
                   (fields['funct3']![1] &
                           fields['rs1']!.eq(
@@ -6027,16 +6291,26 @@ class StaticExecutionUnit extends ExecutionUnit {
                         _virtualUserCsrBlocked,
                         then: doTrap(Trap.illegal, null, '_${op.mnemonic}'),
                         orElse: [
-                          csrWrite.en < 1,
+                          csrWrite.en < ~csrNoWrite,
                           csrWrite.addr < wrCsrAddr,
                           csrWrite.data < readSource(mop.source),
-                          mopStep < mopStep + 1,
+                          mopStep <
+                              mopStep +
+                                  mux(
+                                    csrNoWrite,
+                                    Const(2, width: mopStep.width),
+                                    Const(1, width: mopStep.width),
+                                  ),
                           // See the dynamic path: a satp write invalidates
                           // both virtually tagged L1 caches.
                           If(
-                            wrCsrAddr.eq(
-                              Const(_satpCsrAddress, width: wrCsrAddr.width),
-                            ),
+                            ~csrNoWrite &
+                                wrCsrAddr.eq(
+                                  Const(
+                                    _satpCsrAddress,
+                                    width: wrCsrAddr.width,
+                                  ),
+                                ),
                             then: [fence < 1],
                           ),
                         ],

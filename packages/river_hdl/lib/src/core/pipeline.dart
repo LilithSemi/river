@@ -41,6 +41,7 @@ class RiverPipeline extends Module {
   Logic get trapCause => output('trapCause');
   Logic get trapInterrupt => output('trapInterrupt');
   Logic get trapTval => output('trapTval');
+  Logic get fpFlags => output('fpFlags');
   Logic get trapEpc => output('trapEpc');
   Logic get isReturn => output('isReturn');
   Logic get returnLevel => output('returnLevel');
@@ -127,6 +128,8 @@ class RiverPipeline extends Module {
     // In-order access/page classification; queued OoO frontends are separate.
     Logic? ifetchAccessFault,
     Logic? memAccessFault,
+    Logic? frm,
+    Logic? fpEnabled,
     DataPortInterface? rdWrite1,
     DataPortInterface? memFetchRead1,
     Logic? wr0Ready,
@@ -376,6 +379,11 @@ class RiverPipeline extends Module {
     addOutput('trapCause', width: 6);
     addOutput('trapInterrupt');
     addOutput('trapTval', width: mxlen.size);
+    addOutput('fpFlags', width: 5);
+    final frmIn = frm == null ? null : addInput('frm', frm, width: 3);
+    final fpEnabledIn = fpEnabled == null
+        ? null
+        : addInput('fpEnabled', fpEnabled);
     addOutput('trapEpc', width: mxlen.size);
     addOutput('isReturn');
     addOutput('returnLevel', width: 3);
@@ -632,6 +640,8 @@ class RiverPipeline extends Module {
                   ? fetcher.output('fetch_fault_tval')
                   : null,
               memAccessFault: memAccessFaultIn,
+              frm: frmIn,
+              fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
               fpRs2Port: fpRs2Port,
@@ -676,6 +686,8 @@ class RiverPipeline extends Module {
                   ? fetcher.output('fetch_fault_tval')
                   : null,
               memAccessFault: memAccessFaultIn,
+              frm: frmIn,
+              fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
               fpRs2Port: fpRs2Port,
@@ -743,6 +755,7 @@ class RiverPipeline extends Module {
             trapCause < 0,
             trapInterrupt < 0,
             trapTval < 0,
+            fpFlags < 0,
             trapEpc < 0,
             isReturn < 0,
             returnLevel < 0,
@@ -765,6 +778,7 @@ class RiverPipeline extends Module {
                 trapCause < illegalCause,
                 trapInterrupt < 0,
                 trapTval < 0,
+                fpFlags < 0,
                 trapEpc < currentPc,
                 isReturn < 0,
                 returnLevel < 0,
@@ -782,6 +796,7 @@ class RiverPipeline extends Module {
                 trapCause < exec.trapCause,
                 trapInterrupt < exec.trapInterrupt,
                 trapTval < exec.trapTval,
+                fpFlags < exec.fpFlags,
                 trapEpc < exec.trapEpc,
                 isReturn < exec.isReturn,
                 returnLevel < exec.returnLevel,
@@ -802,6 +817,7 @@ class RiverPipeline extends Module {
       // OoO dual-issue pipeline
       // =======================================================================
 
+      fpFlags <= Const(0, width: 5);
       // Decoded field signals (combinational from decoder)
       final decoderFields = decoder0.fields;
       final decodedRd = (decoderFields['rd'] ?? Const(0, width: 5))

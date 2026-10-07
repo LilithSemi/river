@@ -1050,6 +1050,7 @@ class RiverCore extends BridgeModule {
     // Driven from the same `committing` gate the trap/xRET controls use, so a
     // multi-cycle microcoded instruction counts once.
     final csrRetire = config.hasCsrs ? Logic(name: 'csrRetire') : null;
+    final csrFpFlags = Logic(name: 'csrFpFlags', width: 5);
 
     final csrs = config.hasCsrs
         ? RiscVCsrFile(
@@ -1069,6 +1070,9 @@ class RiverCore extends BridgeModule {
             // file keeps a sticky flop and shows FS=Dirty on every mstatus and
             // sstatus read while it is set.
             fpDirty: fpRdPort?.en,
+            enableFcsr: config.executionMode != ExecutionMode.outOfOrder,
+            fpFlagsValid: csrRetire,
+            fpFlags: csrFpFlags,
             retire: csrRetire,
             timerPending: timerPendingIn,
             swPending: swPendingIn,
@@ -1546,6 +1550,10 @@ class RiverCore extends BridgeModule {
       hasSupervisor: config.hasSupervisor,
       hasUser: config.hasUser,
       hasCompressed: config.extensions.any((e) => e.name == 'C'),
+      frm: csrs?.frm,
+      fpEnabled: csrs?.hasFcsr == true
+          ? csrs!.mstatus.slice(14, 13).or()
+          : null,
       mideleg: csrs?.mideleg,
       medeleg: csrs?.medeleg,
       mtvec: csrs?.mtvec,
@@ -1656,6 +1664,7 @@ class RiverCore extends BridgeModule {
           (pipeline.trapInterrupt.zeroExtend(xlen) << (xlen - 1)) |
               pipeline.trapCause.zeroExtend(xlen);
       csrTrapTval <= pipeline.trapTval;
+      csrFpFlags <= pipeline.fpFlags;
       csrReturnActive <= committing & pipeline.isReturn;
       csrReturnFromM <= pipeline.returnLevel.eq(Const(3, width: 3));
       // minstret counts instructions that RETIRE. An instruction that takes a

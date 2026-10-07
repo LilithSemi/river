@@ -2,6 +2,8 @@ import 'package:rohd/rohd.dart';
 import 'package:river/river.dart';
 import 'package:test/test.dart';
 import '../core_harness.dart';
+import '../adversarial_memory.dart';
+import 'fp_boot.dart';
 
 void main() {
   tearDown(() async {
@@ -13,6 +15,7 @@ void main() {
   // the value went into (and came out of) the FP regfile (not the int one).
   group('RC1.fd - F/D load/store (RV64)', () {
     final config = RiverCoreConfig(
+      resetVector: fpResetVector,
       clock: const HarborClockConfig(
         name: 'test',
         rate: HarborFixedClockRate(10000),
@@ -73,7 +76,7 @@ void main() {
           sb.write(' ');
         }
       }
-      return '$sb\n';
+      return withFpBoot('$sb\n');
     }
 
     test(
@@ -91,6 +94,7 @@ void main() {
         ]),
         {Register.x10: 0x100, Register.x11: 0x200},
         config,
+        memory: const AdversarialMemory(readLatency: 1), // honor byte SEL
         nextPc: 0x18,
         memStates: {0x200: 0x7B},
       ),
@@ -122,6 +126,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x44,
         memStates: {
           0x120: 0x40400000, // 3.0f
@@ -147,6 +152,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x1C,
         memStates: {0x120: 0x40000000}, // 2.0f
       ),
@@ -181,6 +187,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x48,
         memStates: {0x120: 1, 0x130: 1, 0x140: 7},
       ),
@@ -211,6 +218,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x38,
         memStates: {0x100: 0x40A00000, 0x110: 5, 0x130: 2},
       ),
@@ -240,6 +248,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x38,
         memStates: {
           0x100: 0x4014000000000000, // 5.0d
@@ -281,6 +290,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x48,
         memStates: {0x120: 0x40400000, 0x140: 0x40600000},
       ),
@@ -308,6 +318,7 @@ void main() {
         ])}@100\n00 00 00 00 00 00 f0 3f\n@110\n00 00 00 00 00 00 00 40\n',
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x28,
         memStates: {
           0x120: 0x4008000000000000, // 3.0d
@@ -367,6 +378,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x80,
         memStates: {
           0x120: 0xBF800000,
@@ -423,6 +435,7 @@ void main() {
         ])}@100\n00 00 00 00 00 00 f0 3f\n@110\n00 00 00 00 00 00 00 c0\n',
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x64,
         memStates: {
           0x120: 0xBFF0000000000000,
@@ -463,6 +476,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x34,
         memStates: {
           0x100: 0x40A00000, // 5.0f
@@ -504,6 +518,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x3C,
         memStates: {
           0x100: 0x4F800000, // 2^32 as f32 (unsigned 0xFFFFFFFF rounds up)
@@ -544,6 +559,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x48,
         memStates: {
           0x100: 0x41200000, // 10.0
@@ -571,6 +587,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x24,
         memStates: {
           0x100: 0x4024000000000000, // 10.0d
@@ -607,6 +624,7 @@ void main() {
         ]),
         const <Register, int>{},
         config,
+        memory: const AdversarialMemory(readLatency: 1),
         nextPc: 0x44,
         memStates: {
           0x110: 2, // RNE(2.5) -> 2
