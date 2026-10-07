@@ -73,43 +73,74 @@ void main() {
   group('Device.parse - params', () {
     test('dram with ddr clock params', () {
       final d = Device.parse(
-        'dram:0x80000000:128M:arty-s7-x8:ddr3fast=true,clockfreq=200000000',
+        'dram:0x80000000:128M:arty-s7-x8:clockfreq=200000000',
       );
       expect(d.board, 'arty-s7-x8');
       expect(d.params, isNotNull);
-      expect(d.params!.ddr3Fast, isTrue);
       expect(d.params!.clockFreq, 200000000);
     });
 
-    test('dram tuning params still parse (back-compat)', () {
-      final d = Device.parse(
-        'dram:0x80000000:128M:arty-s7-x8:cmdslot=2,wrshift=-1,readretry=6',
+    test('train=hw|runtime is the only training-related key', () {
+      final hw = Device.parse('dram:0x80000000:256M:arty-s7:train=hw');
+      expect(hw.params!.runtimeTrain, isFalse);
+      final runtime = Device.parse(
+        'dram:0x80000000:256M:arty-s7:train=runtime',
       );
-      expect(d.params!.cmdSlot, 2);
-      expect(d.params!.wrShift, -1); // negative int
-      expect(d.params!.readRetry, 6);
+      expect(runtime.params!.runtimeTrain, isTrue);
     });
 
-    test('ddr3v2 ctrlgear=2 selects the CK/8 gearbox controller', () {
-      final d = Device.parse(
-        'dram:0x80000000:256M:arty-s7:ddr3v2=true,ctrlgear=2',
+    test('train only accepts hw or runtime', () {
+      expect(
+        () => Device.parse('dram:0x80000000:256M:arty-s7:train=bogus'),
+        throwsA(isA<FormatException>()),
       );
-      expect(d.params!.ddr3v2, isTrue);
+    });
+
+    test('every key the deleted old DDR stack read is now rejected, not '
+        'silently ignored', () {
+      for (final key in const [
+        'trainable=true',
+        'cmdslot=2',
+        'wrshift=-1',
+        'wrbeat=0',
+        'readtap=40',
+        'readslack=1',
+        'readretry=6',
+        'window=5',
+        'writeverify=true',
+        'readlevel=true',
+        'selftest=true',
+        'laprobe=true',
+        'mpr=true',
+        'ddr3fast=true',
+        'ddr3v2=true',
+        'dqsgate=true',
+        'readclextra=1',
+      ]) {
+        expect(
+          () => Device.parse('dram:0x80000000:256M:arty-s7:$key'),
+          throwsA(isA<FormatException>()),
+          reason: '"$key" must be rejected, not parsed-and-ignored',
+        );
+      }
+    });
+
+    test('ctrlgear=2 selects the CK/8 gearbox controller', () {
+      final d = Device.parse('dram:0x80000000:256M:arty-s7:ctrlgear=2');
       expect(d.params!.ctrlGear, 2);
     });
 
     test(
       'ctrlgear absent defaults to null (= gearRatio 1, byte-identical)',
       () {
-        final d = Device.parse('dram:0x80000000:256M:arty-s7:ddr3v2=true');
-        expect(d.params!.ctrlGear, isNull);
+        final d = Device.parse('dram:0x80000000:256M:arty-s7');
+        expect(d.params, isNull);
       },
     );
 
     test('ctrlgear only accepts 1 or 2', () {
       expect(
-        () =>
-            Device.parse('dram:0x80000000:256M:arty-s7:ddr3v2=true,ctrlgear=3'),
+        () => Device.parse('dram:0x80000000:256M:arty-s7:ctrlgear=3'),
         throwsA(isA<FormatException>()),
       );
     });
@@ -188,21 +219,6 @@ void main() {
   });
 
   group('DDR clock-tree agreement (buildSoC validation)', () {
-    test('two dram controllers disagreeing on ddr3fast throws', () {
-      final config = RiverGenIpConfig(
-        name: 'two_dram',
-        cores: const ['rc1-s'],
-        devices: [
-          Device.parse('dram:0x80000000:128M:arty-s7-x8:ddr3fast=true'),
-          Device.parse('dram:0x90000000:128M:arty-s7-x8:ddr3fast=false'),
-          Device.parse('uart:0x10000000:ns16550a'),
-        ],
-      );
-      // The validation is the first line of buildSoC, so it rejects before any
-      // heavy elaboration.
-      expect(config.buildSoC(), throwsA(isA<ArgumentError>()));
-    });
-
     test('two dram controllers disagreeing on clockfreq throws', () {
       final config = RiverGenIpConfig(
         name: 'two_dram',

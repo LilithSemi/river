@@ -77,18 +77,20 @@ in
           "clk=A9"
           "uart_tx=uart@tx:N17"
           "uart_rx=uart@rx:M18"
+          # OrangeCrab RGB LED red channel (gsd_orangecrab.py r0.2 user_led 0,
+          # "K4"). Active low: lit means DDR3 calibration failed.
+          "ddr_cal_failed=K4"
         ];
       }
     );
   };
 
   # Digilent Arty S7-50 (xc7s50, csga324, 100MHz osc), Xilinx via the openXC7
-  # flow. The DDR3 is the silicon-proven ddr3v2 stack (the harbor-native ROHD
-  # port of UberDDR3): full x16 256MB (MT41K128M16) at 300MHz CK. This PHY runs
-  # its OWN calibration in hardware, so the host does not need a training pass.
-  # cmdslot=2 sets the command slot and wrshift=-1 sets the write launch. Add
-  # train=runtime to the dram params to expose the FSBL knob-ABI window instead
-  # (per controller, optional).
+  # flow. The DDR3 is the silicon-proven HarborDdr3 stack (the harbor-native
+  # ROHD port of UberDDR3): full x16 256MB (MT41K128M16) at 300MHz CK. This PHY
+  # runs its own calibration in hardware (train=hw), so the host does not need
+  # a training pass. Set train=runtime instead to expose the FSBL knob-ABI
+  # window (per controller, optional). Both modes are hardware-proven.
   #
   # FSBL-from-SRAM boot (the DDR bootstrap decouple): a 64K on-chip BRAM at
   # 0x08000000 holds the FSBL stack, .data and .bss (its console struct
@@ -118,7 +120,7 @@ in
         memories = [
           "0x20000000:16M:flash:arty-s7"
           "0x08000000:64K:sram"
-          "0x80000000:256M:dram:arty-s7:ddr3v2=true,clockfreq=300000000,cmdslot=2,wrshift=-1,trainable=true"
+          "0x80000000:256M:dram:arty-s7:clockfreq=300000000,train=hw,ctrlgear=1"
         ];
         # PmodSD (SD card in SPI mode) on Pmod JA. `iface=pmod@ja` binds
         # cs/mosi/miso/sck to JA1..JA4 via the board's connector catalog. Weir
@@ -152,7 +154,7 @@ in
         memories = [
           "0x20000000:16M:flash:arty-s7"
           "0x08000000:64K:sram"
-          "0x80000000:256M:dram:arty-s7:ddr3v2=true,clockfreq=300000000,cmdslot=2,wrshift=-1,trainable=true"
+          "0x80000000:256M:dram:arty-s7:clockfreq=300000000,train=hw,ctrlgear=1"
         ];
         # Native 4-bit SDIO host (4x the 1-bit SPI throughput) with an ADMA engine on
         # the fabric. dmashared puts the ADMA on the PRIMARY channel (no separate
@@ -257,7 +259,7 @@ in
         # the default the system PLL multiplies x4 and the whole SoC would
         # run at 192MHz on hardware.
         oscFreq = 48000000;
-        # DDR3 (MT41K64M16, 128MB, hardware-verified) sits beside the SRAM
+        # DDR3 (MT41K64M16, 128MB, sim-proven) sits beside the SRAM
         # boot path; promoting it to main RAM at 0x80000000 is a follow-up.
         # The dram region pulls the board's full sdram_* pad constraint set
         # with it.
@@ -271,6 +273,9 @@ in
           "clk=A9"
           "uart_tx=uart@tx:N17"
           "uart_rx=uart@rx:M18"
+          # OrangeCrab RGB LED red channel (gsd_orangecrab.py r0.2 user_led 0,
+          # "K4"). Active low: lit means DDR3 calibration failed.
+          "ddr_cal_failed=K4"
         ];
       }
     );

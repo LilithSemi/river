@@ -50,7 +50,7 @@ Future<void> main(List<String> arguments) async {
           'board + tuning params; MMIO peripherals (uart/clint/plic/gpio) need an '
           'addr; pseudo-devices (usb-dfu/debug-jtag/flash-firmware) drive a '
           'subsystem. Examples: sram:0x08000000:64K | uart:0x10000000:ns16550a | '
-          'dram:0x80000000:128M:arty-s7-x8:ddr3fast=true,clockfreq=200000000 | '
+          'dram:0x80000000:128M:arty-s7-x8:clockfreq=200000000,train=hw | '
           'usb-dfu:0x0C000000:mode=software | debug-jtag | '
           'flash-firmware:0x100000:path=weir-fsbl.bin',
     )
@@ -108,11 +108,6 @@ Future<void> main(List<String> arguments) async {
         'trapwfi',
         'ddrtest',
         'ddrprobe',
-        'ddrlevel',
-        'ddrlevelx',
-        'ddrdiag',
-        'ddreye',
-        'ddrverify',
         'dramexec',
         'dramping',
         'dramstress',

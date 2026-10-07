@@ -4,74 +4,110 @@ import 'package:river/river.dart';
 import '../dev.dart';
 import '../soc.dart';
 
-/// DRAM model with an optional CPU-driven read-training control window, mirroring
-/// the HDL [HarborDdrController] trainable path. When [trainable], an MMIO
-/// register window sits just above the array (offsets `>= [arraySize]`). The
-/// array is unusable until the read tap is walked into the valid eye:
-///   0x00 RDTAP_TARGET (RW, 7b)  tap the controller walks to
-///   0x08 CTL          (W)       [0] SET (walk to target), [1] LOAD (reload 0)
-///   0x10 RDSLACK      (RW)      runtime read-window slack
-///   0x18 STATUS       (RO)      [0] busy (always 0, instant walk), [8:1] tap
-/// Array reads are correct only while `currentTap` is in [[eyeLo], [eyeHi]];
-/// outside the eye a read returns a deterministically wrong value so a training
-/// sweep can find it. Writes always land (read training, not write training).
+/// DRAM model for the new Harbor DDR3 stack's two calibration modes. A
+/// `train=hw` build has no control window: the controller calibrates itself
+/// in hardware, so every array access is correct from reset. A `train=runtime`
+/// build keeps a knob register window just above the array (offsets
+/// `>= [arraySize]`), mirroring [Ddr3Controller._buildWb2Knobs]
+/// (stride 8 bytes):
+///   0x00 WLEVEL  (rw, per-lane) write-leveling bit, no effect on correctness
+///   0x08 ODELAY  (rw, per-lane) write tap 0..31, no effect on correctness
+///   0x10 IDELAY  (rw, per-lane) read tap 0..31, gates read correctness
+///   0x18 BITSLIP (rw, per-lane) bitslip bit, no effect on correctness
+///   0x20 CTL     (wo) bit0 SET (latch lane from bits[11:8]), bit1 APPLY
+///   0x28 STATUS  (ro) always 0 (APPLY commits instantly, cal_failed is a
+///                non-concern in train=runtime, which skips the BIST)
+///   0x30 CAP     (ro) bit0 active, bits[7:4] lanes, bits[15:8] tapMax
+/// Byte lane `b`'s reads are correct only once that lane's IDELAY sits inside
+/// its own eye (`[eyeLo[b % lanes], eyeHi[b % lanes]]`). Writes always land,
+/// since read training never touches the write path.
 class Dram extends Device {
-  /// Size of the training control-register window above the array (matches the
-  /// HDL [HarborDdrController.trainCtrlSize]).
+  /// Size of the wb2 control-register window above the array.
   static const int trainCtrlSize = 0x1000;
 
-  // Register indices within the control window (8-byte strided for 64-bit-bus
-  // lane alignment, matching the HDL).
-  static const int _regRdTap = 0;
-  static const int _regCtl = 1;
-  static const int _regRdSlack = 2;
-  static const int _regStatus = 3;
-  static const int _regMpr = 4; // MPRCTL (0x20): bit0 = MPR mode
+  // Register indices within the control window (8-byte stride, matching the
+  // HDL's wb2 knob-ABI layout).
+  static const int _regWlevel = 0;
+  static const int _regOdelay = 1;
+  static const int _regIdelay = 2;
+  static const int _regBitslip = 3;
+  static const int _regCtl = 4;
+  static const int _regStatus = 5;
+  static const int _regCap = 6;
 
-  /// The fixed multi-purpose-register pattern a DDR3 part returns in MPR mode
-  /// (what a read-training read sees instead of array data). Matches Weir's
-  /// FSBL (src/fsbl/ddr.zig MPR_PATTERN).
-  static const int _mprPattern = 0xFFFF0000;
+  static const int _ctlSet = 0x1;
+  static const int _ctlApply = 0x2;
+  static const int _tapMax = 31;
 
   final bool trainable;
   final int arraySize;
-  final int eyeLo;
-  final int eyeHi;
+  final int lanes;
+  final List<int> eyeLo;
+  final List<int> eyeHi;
 
   List<int> data;
 
-  int currentTap = 0;
-  int targetTap = 0;
-  int rdSlack = 1;
+  // Per-lane committed knob state.
+  final List<int> idelay;
+  final List<int> odelay;
+  final List<int> bitslip;
+  final List<int> wlevel;
 
-  /// MPR (multi-purpose register) read-training mode. A trainable part boots in
-  /// MPR mode so a sweep that has not written real data yet reads the fixed
-  /// training pattern; the first real array WRITE drops it (the controller is
-  /// now serving array data). Software can also toggle it via MPRCTL.
-  bool mprMode;
+  // Shadow (staged) knob values + dirty flags, committed to the lane
+  // selected by CTL SET when CTL APPLY pulses, matching the HDL protocol.
+  int _shWlevel = 0, _shOdelay = 0, _shIdelay = 0, _shBitslip = 0;
+  bool _dWlevel = false, _dOdelay = false, _dIdelay = false, _dBitslip = false;
+  int _laneSel = 0;
+  bool _active = false;
 
-  Dram(super.config, {this.trainable = false, this.eyeLo = 8, this.eyeHi = 40})
-    : arraySize = trainable
-          ? config.range!.size - trainCtrlSize
-          : config.range!.size,
-      data = List.filled(
-        trainable ? config.range!.size - trainCtrlSize : config.range!.size,
-        0,
-      ),
-      mprMode = trainable;
+  Dram(
+    super.config, {
+    this.trainable = false,
+    this.lanes = 2,
+    List<int>? eyeLo,
+    List<int>? eyeHi,
+  }) : arraySize = trainable
+           ? config.range!.size - trainCtrlSize
+           : config.range!.size,
+       data = List.filled(
+         trainable ? config.range!.size - trainCtrlSize : config.range!.size,
+         0,
+       ),
+       eyeLo = eyeLo ?? List.filled(lanes, 8),
+       eyeHi = eyeHi ?? List.filled(lanes, 20),
+       idelay = List.filled(lanes, 0),
+       odelay = List.filled(lanes, 0),
+       bitslip = List.filled(lanes, 0),
+       wlevel = List.filled(lanes, 0);
 
-  /// True when the read tap sits inside the valid eye, so array reads are
-  /// reliable. Untrainable DRAM is always reliable.
-  bool get trained =>
-      !trainable || (currentTap >= eyeLo && currentTap <= eyeHi);
+  /// True once every lane's read tap sits inside its own eye, so the whole
+  /// array reads back correctly. Untrainable (`train=hw`) DRAM is always
+  /// trained: hardware calibrated it before the first bus access.
+  bool get trained {
+    if (!trainable) return true;
+    for (var l = 0; l < lanes; l++) {
+      if (idelay[l] < eyeLo[l] || idelay[l] > eyeHi[l]) return false;
+    }
+    return true;
+  }
+
+  /// True when byte lane [addr]'s own read tap sits inside its eye.
+  bool _laneTrained(int addr) {
+    final l = addr % lanes;
+    return idelay[l] >= eyeLo[l] && idelay[l] <= eyeHi[l];
+  }
 
   @override
   void reset() {
     data.fillRange(0, data.length, 0);
-    currentTap = 0;
-    targetTap = 0;
-    rdSlack = 1;
-    mprMode = trainable;
+    idelay.fillRange(0, lanes, 0);
+    odelay.fillRange(0, lanes, 0);
+    bitslip.fillRange(0, lanes, 0);
+    wlevel.fillRange(0, lanes, 0);
+    _shWlevel = _shOdelay = _shIdelay = _shBitslip = 0;
+    _dWlevel = _dOdelay = _dIdelay = _dBitslip = false;
+    _laneSel = 0;
+    _active = false;
   }
 
   @override
@@ -82,13 +118,7 @@ class Dram extends Device {
     Map<String, String> options,
     RiverSoC soc,
   ) {
-    final trainable = options.containsKey('train');
-    return Dram(
-      config,
-      trainable: trainable,
-      eyeLo: int.tryParse(options['eye-lo'] ?? '') ?? 8,
-      eyeHi: int.tryParse(options['eye-hi'] ?? '') ?? 40,
-    );
+    return Dram(config, trainable: options['train'] == 'runtime');
   }
 }
 
@@ -107,38 +137,38 @@ class DramAccessor extends DeviceAccessor {
     if (_isCtrl(addr)) {
       final reg = (addr - dram.arraySize) >> 3;
       switch (reg) {
-        case Dram._regRdTap:
-          return dram.targetTap;
-        case Dram._regRdSlack:
-          return dram.rdSlack;
+        case Dram._regWlevel:
+          return dram.wlevel[dram._laneSel];
+        case Dram._regOdelay:
+          return dram.odelay[dram._laneSel];
+        case Dram._regIdelay:
+          return dram.idelay[dram._laneSel];
+        case Dram._regBitslip:
+          return dram.bitslip[dram._laneSel];
         case Dram._regStatus:
-          // [0] busy (instant walk -> always 0), [8:1] current tap.
-          return dram.currentTap << 1;
-        case Dram._regMpr:
-          return dram.mprMode ? 1 : 0;
+          return 0;
+        case Dram._regCap:
+          return (dram._active ? 1 : 0) |
+              (dram.lanes << 4) |
+              (Dram._tapMax << 8);
         default:
           return 0;
       }
     }
 
-    // Array read. In MPR (read-training) mode the part returns its fixed MPR
-    // pattern instead of array data; otherwise it returns what was stored.
-    int value;
-    if (dram.mprMode) {
-      value = width >= 8
-          ? (Dram._mprPattern << 32) | Dram._mprPattern
-          : Dram._mprPattern & _widthMask(width);
-    } else {
-      if (addr + width > dram.data.length) return 0;
-      value = 0;
-      for (int i = 0; i < width; i++) {
-        value |= (dram.data[addr + i] & 0xFF) << (8 * i);
+    if (addr + width > dram.data.length) return 0;
+    var value = 0;
+    for (var i = 0; i < width; i++) {
+      value |= (dram.data[addr + i] & 0xFF) << (8 * i);
+    }
+    if (dram.trainable) {
+      // Corrupt whichever byte lanes are not yet trained, so a per-lane sweep
+      // can tell a bad tap from a good one, one byte at a time.
+      for (var i = 0; i < width; i++) {
+        if (!dram._laneTrained(addr + i)) value ^= 0xFF << (8 * i);
       }
     }
-    // Outside the read eye the captured data is garbage: corrupt it
-    // deterministically so a training sweep can tell a bad tap from a good one.
-    if (!dram.trained) value = (~value) & _widthMask(width);
-    return value;
+    return value & _widthMask(width);
   }
 
   @override
@@ -146,32 +176,46 @@ class DramAccessor extends DeviceAccessor {
     if (_isCtrl(addr)) {
       final reg = (addr - dram.arraySize) >> 3;
       switch (reg) {
-        case Dram._regRdTap:
-          dram.targetTap = value & 0x7F;
+        case Dram._regWlevel:
+          dram._shWlevel = value & 0x1;
+          dram._dWlevel = true;
+          break;
+        case Dram._regOdelay:
+          dram._shOdelay = value & 0x1F;
+          dram._dOdelay = true;
+          break;
+        case Dram._regIdelay:
+          dram._shIdelay = value & 0x1F;
+          dram._dIdelay = true;
+          break;
+        case Dram._regBitslip:
+          dram._shBitslip = value & 0x1;
+          dram._dBitslip = true;
           break;
         case Dram._regCtl:
-          if (value & 0x1 != 0) dram.currentTap = dram.targetTap; // SET (walk)
-          if (value & 0x2 != 0) dram.currentTap = 0; // LOAD (reload)
+          if (value & Dram._ctlSet != 0) dram._laneSel = (value >> 8) & 0xF;
+          if (value & Dram._ctlApply != 0) {
+            dram._active = true;
+            final l = dram._laneSel;
+            if (dram._dWlevel) dram.wlevel[l] = dram._shWlevel;
+            if (dram._dOdelay) dram.odelay[l] = dram._shOdelay;
+            if (dram._dIdelay) dram.idelay[l] = dram._shIdelay;
+            if (dram._dBitslip) dram.bitslip[l] = dram._shBitslip;
+            dram._dWlevel = false;
+            dram._dOdelay = false;
+            dram._dIdelay = false;
+            dram._dBitslip = false;
+          }
           break;
-        case Dram._regRdSlack:
-          dram.rdSlack = value & 0x7;
-          break;
-        case Dram._regMpr:
-          dram.mprMode = value & 0x1 != 0;
-          break;
-        // STATUS is read-only.
+        // STATUS and CAP are read-only.
       }
       return;
     }
 
-    // The first real array write takes the part out of MPR/training mode (it is
-    // now serving array data). Writes always land (read training does not
-    // corrupt the write path).
-    dram.mprMode = false;
+    // Writes always land: read training never touches the write path.
     if (addr + width > dram.data.length) return;
-    for (int i = 0; i < width; i++) {
-      final byte = (value >> (8 * i)) & 0xFF;
-      dram.data[addr + i] = byte;
+    for (var i = 0; i < width; i++) {
+      dram.data[addr + i] = (value >> (8 * i)) & 0xFF;
     }
   }
 }

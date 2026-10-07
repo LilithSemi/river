@@ -27,91 +27,25 @@ enum UsbDfuMode {
 }
 
 /// Structured `key=val,...` params carried by a [Device] spec (e.g.
-/// `dram:0x...:arty-s7-x8:ddr3fast=true,clockfreq=200000000`). Every field is
+/// `dram:0x...:arty-s7-x8:train=runtime,clockfreq=200000000`). Every field is
 /// nullable: null means "not set", so genip falls back to the board default then
 /// a literal default.
 class DeviceParams {
   // --- DDR controller tuning (`dram` devices) ---
 
-  /// Expose the CPU read-training MMIO window (HarborDdrController.trainableRead).
-  final bool? trainable;
-
-  /// ddr3v2 training mode: `train=runtime` exposes the knob-ABI window so the
-  /// FSBL sweep engine drives calibration; `train=hw` (default) keeps the
-  /// controller's internal cal FSM. Distinct from the legacy [trainable].
+  /// `train=runtime` exposes the HarborDdr3 knob-ABI window so the FSBL sweep
+  /// engine drives calibration; `train=hw` (default, absent) keeps the
+  /// controller's internal cal FSM. The only training-related key: there is
+  /// one DDR3 stack now, so there is nothing else to train.
   final bool? runtimeTrain;
 
-  /// ddr3Fast command CK edge (0..3), forwarded to the Xilinx PHY.
-  final int? cmdSlot;
-
-  /// ddr3Fast write-launch window slide (may be negative).
-  final int? wrShift;
-
-  /// ddr3Fast sub-tick DDR write beat rotation (null derives from CWL).
-  final int? wrBeat;
-
-  /// Static/initial read tap (the per-DQ read-eye centering knob).
-  final int? readTap;
-
-  /// Read-capture window slack in cycles.
-  final int? readSlack;
-
-  /// DRAM read-retry / read-voting depth (0 disables).
-  final int? readRetry;
-
-  /// ddr3Fast runtime read-window tap reset (reg12 default).
-  final int? window;
-
-  /// Hardware write-verify-retry on every array write.
-  final bool? writeVerify;
-
-  /// Hardware MPR read-calibration: the sequencer sweeps each byte lane's read
-  /// window x IDELAY tap against the DRAM MPR pattern and locks the eye before
-  /// the bus opens (ddr3Fast only). Kills the per-boot read coin-flip.
-  final bool? readLevel;
-
-  /// Post-read-cal cadence self-test: bus opens only after a varied-cadence read
-  /// verify passes (ddr3Fast + readlevel only). Kills the read cadence coin-flip.
-  final bool? selfTest;
-
-  /// Expose the DDR controller's dbg_la LA-probe bundle ([3:0]=stateCode,
-  /// [4]=rd_cal_active, [5]=phy.rdValid) to top pins so a logic analyzer can
-  /// watch the sequencer FSM + read completion live (bus-independent). The 6
-  /// dbg_la[*] pins must be assigned via --pin.
-  final bool? laprobe;
-
-  /// Diagnostic MR3.MPR mode (every read returns the part MPR pattern).
-  final bool? mpr;
-
-  /// Real-speed DDR3-667 ISERDESE2 datapath (else the DLL-off IDDR read path).
-  /// Per controller: two dram devices may differ.
-  final bool? ddr3Fast;
-
-  /// Use the new silicon-proven [HarborDdr3] stack (Ddr3Controller + Ddr3Phy,
-  /// with proper calibration + bank anticipate) instead of the legacy
-  /// HarborDdrController + DdrSequencer/DdrPhyXilinx. Implies ddr3Fast.
-  final bool? ddr3v2;
-
-  /// DDR3 controller-logic gearing (ddr3v2 only). 1 (absent) = the controller
-  /// runs on CK/4 (byte-identical to today). 2 = the CK/8 gearbox controller:
-  /// the DDR MMCM emits CLKOUT5 as CK/8, HarborDdr3 interposes the fabric 2:1
-  /// gearbox, and the congestion-limited command scheduler gets timing margin
-  /// on a dense open-tools part while DDR CK stays at full speed.
+  /// DDR3 controller-logic gearing. 1 (absent) = the controller runs on CK/4
+  /// (byte-identical to today). 2 = the CK/8 gearbox controller: the DDR MMCM
+  /// emits CLKOUT5 as CK/8, HarborDdr3 interposes the fabric 2:1 gearbox, and
+  /// the congestion-limited command scheduler gets timing margin on a dense
+  /// open-tools part while DDR CK stays at full speed. Xilinx only; the ECP5
+  /// PHY needs gearRatio 1 (HarborDdr3 rejects anything else for it).
   final int? ctrlGear;
-
-  /// Open the ddr3Fast read window from the DRAM's read strobe (DQS as data) so
-  /// each read self-frames, instead of a fixed CL tap that mis-frames under the
-  /// i+d cadence. ddr3Fast only.
-  final bool? dqsGate;
-
-  /// LiteDRAM read margin: extra CK added to the programmed DRAM CAS latency
-  /// (MR0) so the read burst lands one memory-clock phase INTO the ISERDESE2
-  /// word, not at the CLKDIV edge where setup/hold is marginal and the i+d read
-  /// cadence tips it over. LiteDRAM s7ddrphy notes "Artix-7 requires read data
-  /// one memory-clock phase into the ISERDESE2 word for reliable read leveling"
-  /// (originally CL+1 in MR0). The DRAM drives read data [readClExtra] CK later,
-  /// clTicks/MR0 track it, and the FSBL read sweep re-centres. ddr3Fast only.
-  final int? readClExtra;
 
   /// DRAM clock-domain (CDC) frequency in Hz. Above the oscillator PLLs the
   /// `ddr` domain to a higher DLL-off / DLL-on rate than the core drives.
@@ -183,25 +117,8 @@ class DeviceParams {
   final int? pins;
 
   const DeviceParams({
-    this.trainable,
     this.runtimeTrain,
-    this.cmdSlot,
-    this.wrShift,
-    this.wrBeat,
-    this.readTap,
-    this.readSlack,
-    this.readRetry,
-    this.window,
-    this.writeVerify,
-    this.readLevel,
-    this.selfTest,
-    this.laprobe,
-    this.mpr,
-    this.ddr3Fast,
-    this.ddr3v2,
     this.ctrlGear,
-    this.dqsGate,
-    this.readClExtra,
     this.clockFreq,
     this.oscFreq,
     this.mode,
@@ -217,27 +134,14 @@ class DeviceParams {
     this.pins,
   });
 
-  /// Accepted param keys (case-insensitive), for error messages.
+  /// Accepted param keys (case-insensitive), for error messages. An unknown
+  /// key throws, including every key the old (now-deleted) DDR stack read:
+  /// `trainable`, `cmdslot`, `wrshift`, `wrbeat`, `readtap`, `readslack`,
+  /// `readretry`, `window`, `writeverify`, `readlevel`, `selftest`, `laprobe`,
+  /// `mpr`, `ddr3fast`, `ddr3v2`, `dqsgate`, `readclextra`.
   static const _keys = [
-    'trainable',
     'train',
-    'cmdslot',
-    'wrshift',
-    'wrbeat',
-    'readtap',
-    'readslack',
-    'readretry',
-    'window',
-    'writeverify',
-    'readlevel',
-    'selftest',
-    'laprobe',
-    'mpr',
-    'ddr3fast',
-    'ddr3v2',
     'ctrlgear',
-    'dqsgate',
-    'readclextra',
     'clockfreq',
     'oscfreq',
     'mode',
@@ -269,29 +173,12 @@ class DeviceParams {
   }
 
   /// Parses `key=val,key=val,...` into a [DeviceParams]. Keys are
-  /// case-insensitive. Unknown keys throw. Int values use [int.parse] so
-  /// negatives (e.g. `wrshift=-1`) work. Split on the FIRST `=`, so a path may
+  /// case-insensitive. Unknown keys throw. Int values use [int.parse], so a
+  /// negative value parses correctly. Split on the first `=`, so a path may
   /// contain `=`.
   static DeviceParams parse(String s) {
-    bool? trainable;
     bool? runtimeTrain;
-    int? cmdSlot;
-    int? wrShift;
-    int? wrBeat;
-    int? readTap;
-    int? readSlack;
-    int? readRetry;
-    int? window;
-    bool? writeVerify;
-    bool? readLevel;
-    bool? selfTest;
-    bool? laprobe;
-    bool? mpr;
-    bool? ddr3Fast;
-    bool? ddr3v2;
     int? ctrlGear;
-    bool? dqsGate;
-    int? readClExtra;
     int? clockFreq;
     int? oscFreq;
     String? mode;
@@ -313,50 +200,16 @@ class DeviceParams {
       final key = pair.substring(0, eq).trim().toLowerCase();
       final val = pair.substring(eq + 1).trim();
       switch (key) {
-        case 'trainable':
-          trainable = _parseBool(val);
         case 'train':
           if (val != 'hw' && val != 'runtime') {
             throw FormatException('train must be hw|runtime, got: $val');
           }
           runtimeTrain = val == 'runtime';
-        case 'cmdslot':
-          cmdSlot = int.parse(val);
-        case 'wrshift':
-          wrShift = int.parse(val);
-        case 'wrbeat':
-          wrBeat = int.parse(val);
-        case 'readtap':
-          readTap = int.parse(val);
-        case 'readslack':
-          readSlack = int.parse(val);
-        case 'readretry':
-          readRetry = int.parse(val);
-        case 'window':
-          window = int.parse(val);
-        case 'writeverify':
-          writeVerify = _parseBool(val);
-        case 'readlevel':
-          readLevel = _parseBool(val);
-        case 'selftest':
-          selfTest = _parseBool(val);
-        case 'laprobe':
-          laprobe = _parseBool(val);
-        case 'mpr':
-          mpr = _parseBool(val);
-        case 'ddr3fast':
-          ddr3Fast = _parseBool(val);
-        case 'ddr3v2':
-          ddr3v2 = _parseBool(val);
         case 'ctrlgear':
           ctrlGear = int.parse(val);
           if (ctrlGear != 1 && ctrlGear != 2) {
             throw FormatException('ctrlgear must be 1 or 2, got: $val');
           }
-        case 'dqsgate':
-          dqsGate = _parseBool(val);
-        case 'readclextra':
-          readClExtra = int.parse(val);
         case 'clockfreq':
           clockFreq = int.parse(val);
         case 'oscfreq':
@@ -395,25 +248,8 @@ class DeviceParams {
       }
     }
     return DeviceParams(
-      trainable: trainable,
       runtimeTrain: runtimeTrain,
-      cmdSlot: cmdSlot,
-      wrShift: wrShift,
-      wrBeat: wrBeat,
-      readTap: readTap,
-      readSlack: readSlack,
-      readRetry: readRetry,
-      window: window,
-      writeVerify: writeVerify,
-      readLevel: readLevel,
-      selfTest: selfTest,
-      laprobe: laprobe,
-      mpr: mpr,
-      ddr3Fast: ddr3Fast,
-      ddr3v2: ddr3v2,
       ctrlGear: ctrlGear,
-      dqsGate: dqsGate,
-      readClExtra: readClExtra,
       clockFreq: clockFreq,
       oscFreq: oscFreq,
       mode: mode,
@@ -681,7 +517,7 @@ class Device {
   /// is compatible. Examples:
   /// - `uart:0x10000000:ns16550a` (addr + compat, the legacy device form)
   /// - `sram:0x08000000:64K` (addr + size, a legacy memory region)
-  /// - `dram:0x80000000:128M:arty-s7-x8:ddr3fast=true` (addr+size+board+params)
+  /// - `dram:0x80000000:128M:arty-s7-x8:train=runtime` (addr+size+board+params)
   /// - `debug-jtag` (type only, addressless)
   /// - `usb-dfu:0x0C000000:mode=software`
   /// - `flash-firmware:0x100000:path=weir.bin` (addr field is the flash offset)
@@ -1231,12 +1067,9 @@ class RiverGenIpConfig {
   // Whole-SoC aggregates: the single-controller RTL stays byte-identical to the
   // old global flags.
 
-  /// True when ANY `dram` device selects the ISERDESE2 datapath.
-  bool get ddr3Fast => devices.any(
-    (d) =>
-        d.type == 'dram' &&
-        ((d.params?.ddr3Fast ?? false) || (d.params?.ddr3v2 ?? false)),
-  );
+  /// True when any `dram` device is present. One DDR3 stack now serves every
+  /// board-backed `dram` device, so this is just "is there one at all".
+  bool get hasDdrDevice => devices.any((d) => d.type == 'dram');
 
   /// DRAM clock-domain (CDC) frequency: the first `dram` device that sets one.
   int? get ddrClockFrequency {
@@ -1259,11 +1092,11 @@ class RiverGenIpConfig {
     return null;
   }
 
-  /// The clock-tree params (`ddr3fast`/`clockfreq`/`oscfreq`) mint ONE shared
-  /// `ddr_osc` pin and one DDR3 MMCM tree, so every `dram` controller shares them.
-  /// Two disagreeing `dram` devices would silently get the first one's clock, so
-  /// throw instead. Per-region data-eye tuning (cmdslot/wrshift/readtap/trainable)
-  /// may still differ. Independent per-controller trees are future work.
+  /// The clock-tree params (`clockfreq`/`oscfreq`) mint one shared `ddr_osc`
+  /// pin and one DDR3 clock tree, so every `dram` controller shares them. Two
+  /// disagreeing `dram` devices would silently get the first one's clock, so
+  /// throw instead. Per-region tuning (`ctrlgear`/`train`) may still differ.
+  /// Independent per-controller trees are future work.
   void _validateDdrClockAgreement() {
     final drams = [
       for (final d in devices)
@@ -1271,15 +1104,13 @@ class RiverGenIpConfig {
     ];
     if (drams.length < 2) return;
     bool differ<T>(T Function(Device) sel) => drams.map(sel).toSet().length > 1;
-    if (differ((d) => d.params?.ddr3Fast ?? false) ||
-        differ((d) => d.params?.clockFreq) ||
+    if (differ((d) => d.params?.clockFreq) ||
         differ((d) => d.params?.oscFreq)) {
       throw ArgumentError(
         'Multiple dram devices must agree on the shared-clock-tree params '
-        '(ddr3fast/clockfreq/oscfreq): they mint one shared ddr_osc pin and one '
-        'DDR3 clock tree. Per-controller data-eye tuning (cmdslot/wrshift/readtap/'
-        'trainable/readretry/window/etc) may still differ; independent '
-        'per-controller clock trees are not yet supported.',
+        '(clockfreq/oscfreq): they mint one shared ddr_osc pin and one DDR3 '
+        'clock tree. Per-controller tuning (ctrlgear/train) may still differ; '
+        'independent per-controller clock trees are not yet supported.',
       );
     }
   }
@@ -1499,19 +1330,17 @@ class RiverGenIpConfig {
 
   Map<String, String> get fpgaPinMap => {
     for (final p in effectivePins) p.externalName: p.fpgaPin,
-    // Board-qualified dram/flash regions bring their whole pad constraint table.
-    // DQS constraints are DLL-aware ([DdrBoard.pinsFor]). DLL-ON: the single
-    // SSTL135D_I diff pad (nextpnr derives _n). DLL-OFF: the explicit
-    // pseudo-differential pair (sdram_dqs[*] SSTL135_I + sdram_dqs_n[*]), matching
-    // the complement ODDR the PHY drives. dllOn = DDR CK rate > ~60 MHz.
+    // Board-qualified dram/flash regions bring their whole pad constraint
+    // table. HarborDdr3's controller/PHY stack always programs the DRAM DLL
+    // on (Ddr3ModeRegisters hardcodes DLL_EN, no CK-dependent branch), so DQS
+    // is always the true-differential SSTL135D_I pad ([DdrBoard.pinsFor]'s
+    // `dllOn: true` shape. nextpnr derives the _n complement itself).
     for (final mem in memories)
-      if (mem.ddrBoard != null)
-        ...mem.ddrBoard!.pinsFor(
-          dllOn:
-              (ddrClockFrequency != null && ddrClockFrequency! > oscFrequency)
-              ? ddrClockFrequency! > 60000000
-              : oscFrequency > 60000000,
-        ),
+      if (mem.ddrBoard != null) ...mem.ddrBoard!.pinsFor(dllOn: true),
+    for (final mem in memories)
+      if (mem.ddrBoard != null) ...mem.ddrBoard!.vccioPins,
+    for (final mem in memories)
+      if (mem.ddrBoard != null) ...mem.ddrBoard!.gndPins,
     for (final mem in memories)
       if (mem.flashBoard != null) ...mem.flashBoard!.pins,
   };
@@ -1529,7 +1358,7 @@ class RiverGenIpConfig {
     pdkRoot: pdkRoot,
   );
 
-  /// openXC7 clock-BEL placement constraints for the ddr3Fast DDR3 PHY.
+  /// openXC7 clock-BEL placement constraints for the Xilinx DDR3 PHY.
   ///
   /// All DDR clocks (CK / CLKDIV / idelayref / ck90) ride plain GLOBAL BUFGs and
   /// the read ISERDESE2 CLK shares the CK BUFG net, with zero regional BUFH/BUFHCE
@@ -1550,23 +1379,34 @@ class RiverGenIpConfig {
 
   Future<HarborSoC> buildSoC() async {
     _validateDdrClockAgreement();
-    // Single-oscillator Xilinx DDR3-fast (e.g. the Arty S7, one 100 MHz R2 osc):
-    // a second MMCM on the raw clock pin cannot share the pin's one dedicated
+    // Single-oscillator Xilinx DDR3 (e.g. the Arty S7, one 100 MHz R2 osc): a
+    // second MMCM on the raw clock pin cannot share the pin's one dedicated
     // clock-capable route on openXC7, so the core MMCM never clocks and the core
     // never leaves reset. Fold the core clock onto a spare CLKOUT of the DDR3
     // MMCM instead (one MMCM on the pin). A separate `ddr_osc` pin has no
-    // contention and keeps its own core MMCM.
-    // Under Verilator there is no Xilinx MMCM/PLL to build the DDR3 clock tree
-    // (BUFG/PLLE2_ADV have no sim model), and the behavioral DRAM runs off the
-    // plain bus clock, so never hang the core clock off a DDR tree in sim: fall
-    // back to the behavioral clock generation like a boardless SoC.
+    // contention and keeps its own core MMCM. ECP5 has no such restriction
+    // (nextpnr-ecp5 lets two EHXPLLL instances share one input pad), so the
+    // ECP5 DDR tree (built inline per dram device below) never shares the core
+    // clock this way.
+    // Under Verilator there is no vendor MMCM/PLL to build the DDR3 clock tree
+    // (BUFG/PLLE2_ADV/EHXPLLL have no sim model), and the behavioral DRAM runs
+    // off the plain bus clock, so never hang the core clock off a DDR tree in
+    // sim: fall back to the behavioral clock generation like a boardless SoC.
+    final isXilinxTarget =
+        effectiveTarget is FpgaTarget &&
+        (effectiveTarget as FpgaTarget).vendor == 'spartan7';
     final useDdr3TreeCoreClk =
-        ddr3Fast && ddrOscFrequency == null && effectiveTarget is! SimTarget;
-    // DDR controller gearing (shared tree): the CK/8 gearbox controller when any
-    // ddr3v2 DRAM sets ctrlgear=2. One tree serves every controller, so they use
-    // one gearRatio (the per-device HarborDdr3 controllerGearRatio matches it).
+        isXilinxTarget &&
+        hasDdrDevice &&
+        ddrOscFrequency == null &&
+        effectiveTarget is! SimTarget;
+    // DDR controller gearing (shared Xilinx tree): the CK/8 gearbox controller
+    // when any dram device sets ctrlgear=2. One tree serves every controller,
+    // so they use one gearRatio (the per-device HarborDdr3 controllerGearRatio
+    // matches it). ECP5 always runs gearRatio 1 (HarborDdr3 enforces this), so
+    // this only matters for the Xilinx tree.
     final ddrGearRatio = memories
-        .where((m) => m.ddrParams?.ddr3v2 ?? false)
+        .where((m) => m.ddrBoard != null)
         .map((m) => m.ddrParams?.ctrlGear ?? 1)
         .fold<int>(1, (a, b) => b > a ? b : a);
     final xilinxDdr3Tree = useDdr3TreeCoreClk
@@ -1604,22 +1444,11 @@ class RiverGenIpConfig {
       ],
     ];
 
-    // The clk90 DDR controller (DLL-off, CK = system clock) shares the single SoC
-    // clock domain: no separate DRAM clock, CDC bridge, or train-control MMIO. The
-    // matching GenIpConfig knobs are retained as accepted-but-ignored no-ops.
-
-    // A board-backed DRAM region runs its DQS PHY on the `ddr` clock domain while
-    // the core/fabric runs on the divided `sys` clock. The `ddr` domain is the raw
-    // osc (48 MHz CK, DLL-off) by default, or a PLL output at --ddr-clock-freq
-    // (e.g. 144 MHz CK, DLL-on) when set above the osc. The controller bridges its
-    // slow `bus` face with an internal HarborWishboneCdcBridge (asyncClock). The
-    // PHY halves `ddr_clk` to the sclk fabric the DQS x2 datapath runs on.
-    final hasDdrBoard = memories.any((m) => m.ddrBoard != null);
-    // ddr3Fast provides its OWN clocking (the DDR3 MMCM tree built inline below),
-    // so it does NOT use the ECP5-style shared `ddr`/`sys` PLL domain. The core
-    // rides a standalone `sys` domain and the DDR controller runs on the tree's
-    // ctrl83 (asyncClock), so the ECP5 DDR clock plumbing is gated off here.
-    final ecp5DdrDomain = hasDdrBoard && !ddr3Fast;
+    // Every board-backed `dram` device provides its own clocking (the DDR3
+    // clock tree, Xilinx MMCM or ECP5 EHXPLLL, built inline per device below),
+    // so the core/fabric always rides a standalone `sys` domain (shared with
+    // the DDR tree's spare CLKOUT only in the single-oscillator Xilinx case
+    // above). The ECP5 tree never shares `sys`'s PLL.
 
     final soc = HarborSoC(
       name: name,
@@ -1650,20 +1479,18 @@ class RiverGenIpConfig {
       xilinxDdr3Tree: xilinxDdr3Tree,
       clocks: [
         // System/bus domain: PLL from the osc down to the core clock. This is
-        // [defaultClock], so every master/peripheral lands here by default. When
-        // a DDR board is present the `sys` domain instead rides the DDR PLL's
-        // CLKOS (the `ddr` entry below is the CLKOP primary, since nextpnr only
-        // routes the dedicated ECLK network from CLKOP), sharing one EHXPLLL. So a
-        // standalone sys domain is only added when there is NO DDR board.
-        if (!ecp5DdrDomain)
-          HarborClockConfig(
-            name: 'sys',
-            rate: HarborFixedClockRate(clockFrequency),
-            sourceFrequency: oscFrequency,
-            // Single-oscillator Xilinx DDR3-fast: run the core off the DDR MMCM's
-            // spare core CLKOUT instead of a second MMCM contending for the pin.
-            providedByDdr3Tree: useDdr3TreeCoreClk,
-          ),
+        // [defaultClock], so every master/peripheral lands here by default.
+        // Every DDR tree (Xilinx MMCM or ECP5 EHXPLLL) is built inline per
+        // dram device further below and never through this declarative list,
+        // so `sys` is always its own standalone domain here. The single-osc
+        // Xilinx case shares the DDR MMCM's spare CLKOUT (providedByDdr3Tree)
+        // instead of a second contending MMCM on the same pin.
+        HarborClockConfig(
+          name: 'sys',
+          rate: HarborFixedClockRate(clockFrequency),
+          sourceFrequency: oscFrequency,
+          providedByDdr3Tree: useDdr3TreeCoreClk,
+        ),
         // USB full-speed domain: the RAW oscillator, passed straight through
         // (isPrimary). The 48 MHz osc is already the SoC `clk`, handed to the USB
         // engine while the core runs on the PLL-divided `sys`. Only when USB DFU
@@ -1674,45 +1501,6 @@ class RiverGenIpConfig {
             rate: HarborFixedClockRate(oscFrequency),
             isPrimary: true,
           ),
-        // DDR domain. Two cases, keyed on --ddr-clock-freq (ddrClockFrequency):
-        //   - unset or <= osc: the RAW osc (48 MHz), DLL-OFF at the osc rate (the
-        //     proven bring-up path), no DRAM DLL lock.
-        //   - above the osc (e.g. 144 MHz): an EHXPLLL CLKOP from the osc, so the
-        //     DRAM CK runs faster than the core. At 144 MHz the DRAM DLL locks and
-        //     the DQSBUFM DLL-on read scheme works, CDC bridging the slow `sys` bus
-        //     face. 48 -> 144 is a clean ECP5 target (VCO 576 MHz, in band).
-        // Only when a board-backed DRAM region is present.
-        if (ecp5DdrDomain)
-          (ddrClockFrequency != null && ddrClockFrequency! > oscFrequency)
-              // DLL-ON: the DDR CK is the CLKOP primary (its eclk needs the
-              // dedicated ECLK network) and the core/sys clock rides CLKOS off the
-              // same VCO. VCO = ddrCk*CLKOP_DIV (576) must be an integer multiple
-              // of the core clock. The CLKOS_CPHASE fix in
-              // createDomainWithSecondary makes this single PLL lock on silicon.
-              ? HarborClockConfig(
-                  name: 'ddr',
-                  rate: HarborFixedClockRate(ddrClockFrequency!),
-                  sourceFrequency: oscFrequency,
-                  coClkosSecondary: (name: 'sys', frequency: clockFrequency),
-                )
-              // DLL-OFF: the DDR CK is a real PLL CLKOP with the core/sys clock on
-              // CLKOS off the same PLL. Default CK = osc (48->48). Setting
-              // --ddr-clock-freq below the osc (e.g. 24 MHz) halves the CK, which
-              // doubles the absolute DLL-off read eye so the marginal DQS jitter is
-              // a smaller eye fraction. The ECP5 ECLK network only routes from a
-              // PLL CLKOP, not a raw osc pad. Sharing one PLL for ddr+sys leaves
-              // the 2nd EHXPLLL for the DQS clk90.
-              : HarborClockConfig(
-                  name: 'ddr',
-                  rate: HarborFixedClockRate(
-                    (ddrClockFrequency != null &&
-                            ddrClockFrequency! < oscFrequency)
-                        ? ddrClockFrequency!
-                        : oscFrequency,
-                  ),
-                  sourceFrequency: oscFrequency,
-                  coClkosSecondary: (name: 'sys', frequency: clockFrequency),
-                ),
       ],
     );
 
@@ -1819,13 +1607,13 @@ class RiverGenIpConfig {
     for (var i = 0; i < memories.length; i++) {
       final mem = memories[i];
       final board = mem.ddrBoard;
-      if (board != null && ddr3Fast) {
+      if (board != null) {
         // Verilator: HarborDdr3 builds a behavioral DRAM (_HarborSimDram) on the
         // bus/sys clock, loaded at runtime via +dram_image=<hex>. It has no DDR3
-        // clock tree (PLLE2/BUFG, which have no sim model) and no PHY pads, so
-        // skip all of that FPGA plumbing and just add it as a bus slave. The
-        // clock/period values are ignored by the behavioral body.
-        if (target is HarborSimTarget && (mem.ddrParams?.ddr3v2 ?? false)) {
+        // clock tree (PLLE2/BUFG/EHXPLLL, none of which have a sim model) and no
+        // PHY pads, so skip all of that FPGA plumbing and just add it as a bus
+        // slave. The clock/period values are ignored by the behavioral body.
+        if (target is HarborSimTarget) {
           final ddr = HarborDdr3(
             config: board.config,
             baseAddress: mem.address,
@@ -1855,17 +1643,14 @@ class RiverGenIpConfig {
           }
           continue;
         }
-        // Real-speed DDR3-667 (Xilinx ISERDESE2).
-        // Build the DDR3 clock tree from the board oscillator: an MMCM (ZHOLD +
-        // BUFG feedback, the only openXC7-lockable form) fans one VCO into ck333
-        // (DDR CK / ISERDESE2 CLK), ctrl83 (CK/4, controller + ISERDESE2 CLKDIV),
-        // a ~200 MHz IDELAYCTRL reference, and ck333@90 (write launch), each on
-        // its own BUFG. The controller runs on ctrl83 (asyncClock CDC to the slow
-        // sys core/bus). This is the UberDDR3 / LiteDRAM open-tools read
-        // arrangement (no BUFR/BUFIO/PHASER).
-        // Tree source: with --ddr-osc-freq, a separate `ddr_osc` pin (the Arty S7
-        // 100 MHz R2 osc), leaving the core/UART on the 12 MHz `clk`. Otherwise
-        // the main `clk` osc.
+
+        final isEcp5Target =
+            target is HarborFpgaTarget &&
+            target.vendor == HarborFpgaVendor.ecp5;
+
+        // Tree source: with --ddr-osc-freq, a separate `ddr_osc` pin (the Arty
+        // S7 100 MHz R2 osc), leaving the core/UART on the main `clk`.
+        // Otherwise the main `clk` osc feeds both the core and the DDR tree.
         final Logic ddrTreeSource;
         final int ddrTreeSourceHz;
         if (ddrOscFrequency != null) {
@@ -1876,6 +1661,94 @@ class RiverGenIpConfig {
           ddrTreeSource = soc.input('clk');
           ddrTreeSourceHz = oscFrequency;
         }
+
+        if (isEcp5Target) {
+          // ECP5: Ddr3PhyEcp5 via one EHXPLLL (CLKOP = DDR CK, CLKOS = CK/4),
+          // built inline the same way the Xilinx tree below is. Defaults to
+          // 96 MHz, the litex-boards gsd_orangecrab proven point (48 MHz osc
+          // x2). clockfreq= overrides it.
+          final tree = buildEcp5Ddr3ClockTree(
+            soc,
+            source: ddrTreeSource,
+            sourceHz: ddrTreeSourceHz,
+            ddrCkHz: ddrClockFrequency ?? 96000000,
+          );
+          final ddr = HarborDdr3(
+            config: board.config,
+            baseAddress: mem.address,
+            clockHz: (tree.controllerClkMhz * 1.0e6).round(),
+            busAddressWidth: busConfig.addressWidth,
+            busDataWidth: busConfig.dataWidth,
+            target: target,
+            // Match the DDR3 CK the tree actually solves, the same formula
+            // the Xilinx branch below uses.
+            ckPeriodPs: (1.0e6 / tree.ddrCkMhz).round(),
+            // train=runtime exposes the knob-ABI window for the FSBL engine.
+            runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
+            name: '${mem.type}_$i',
+          );
+          soc.addPeripheral(ddr);
+          if (mem.ddrParams?.runtimeTrain ?? false) {
+            // The knob-ABI window is a second bus slave carved from the top
+            // page of the DRAM aperture (usableSize excludes it).
+            soc.addPeripheralSlave(
+              ddr,
+              'train',
+              BusAddressRange(ddr.trainBase, HarborDdr3.trainWindowSize),
+            );
+          }
+          ddr.input('ddr_clk').srcConnection! <= tree.controllerClk;
+          final sysDomainForDdr = soc.clockDomain('sys');
+          if (sysDomainForDdr == null) {
+            throw StateError('DDR3 needs the sys clock domain for ddr_reset');
+          }
+          ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
+          ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
+          ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
+          ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
+          ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
+          // ECP5 DQS is true differential (SSTL135D_I on the _p site only),
+          // so there is no sdram_dqs_n pad here. The Xilinx branch below adds
+          // it back for its pseudo-differential pair.
+          for (final pad in DdrBoard.padPorts) {
+            soc.exposePin(ddr, pad, externalName: pad);
+          }
+          // Self-trained read-leveling gave up (Ddr3Controller.calFailed,
+          // STATUS bit 1 in the knob window). Wired to the OrangeCrab RGB
+          // LED red channel (the board catalog's ddr_cal_failed site). The
+          // LED is active low, so lit means calibration failed.
+          soc.createPort('ddr_cal_failed', PortDirection.output);
+          soc.output('ddr_cal_failed') <= ~ddr.output('cal_failed');
+          // OrangeCrab has no VTT regulator. Spare pins driven high and low
+          // carry the SSTL135 termination current. litex-boards drives them in
+          // gateware too (gsd_orangecrab target: vccio.eq(0b111111), gnd.eq(0)).
+          if (board.vccioPins.isNotEmpty) {
+            soc.createPort(
+              'ddr_vccio',
+              PortDirection.output,
+              width: board.vccioPins.length,
+            );
+            soc.output('ddr_vccio') <= ~Const(0, width: board.vccioPins.length);
+          }
+          if (board.gndPins.isNotEmpty) {
+            soc.createPort(
+              'ddr_gnd',
+              PortDirection.output,
+              width: board.gndPins.length,
+            );
+            soc.output('ddr_gnd') <= Const(0, width: board.gndPins.length);
+          }
+          continue;
+        }
+
+        // Xilinx 7-series (e.g. the Arty S7).
+        // Build the DDR3 clock tree from the board oscillator: an MMCM (ZHOLD +
+        // BUFG feedback, the only openXC7-lockable form) fans one VCO into ck333
+        // (DDR CK / ISERDESE2 CLK), ctrl83 (CK/4, controller + ISERDESE2 CLKDIV),
+        // a ~200 MHz IDELAYCTRL reference, and ck333@90 (write launch), each on
+        // its own BUFG. The controller runs on ctrl83 (asyncClock CDC to the slow
+        // sys core/bus). This is the UberDDR3 / LiteDRAM open-tools read
+        // arrangement (no BUFR/BUFIO/PHASER).
         // DDR3 CK target. With the 100 MHz osc the oracle PLLE2 solves CK 400 MHz
         // (DDR3-800), controller 100 MHz, IDELAYCTRL ref 200 MHz exact. Default to
         // 400 MHz on the 100 MHz path so the solver lands the exact oracle
@@ -1891,12 +1764,9 @@ class RiverGenIpConfig {
         // When the SoC already built the DDR3 clock tree in its clock generation
         // (single-oscillator core-clock-off-spare-CLKOUT path), reuse it so the
         // core and the DDR clocks share ONE MMCM. Otherwise build it here (the
-        // separate `ddr_osc` pin case has no clock-pin contention).
-        // DDR controller gearing for THIS dram device (ddr3v2 only). Must match
+        // separate `ddr_osc` pin case has no clock-pin contention). Must match
         // whatever the shared SoC tree was built with.
-        final ddrGear = (mem.ddrParams?.ddr3v2 ?? false)
-            ? (mem.ddrParams?.ctrlGear ?? 1)
-            : 1;
+        final ddrGear = mem.ddrParams?.ctrlGear ?? 1;
         final tree =
             soc.xilinxDdr3Clocks ??
             buildXilinxDdr3ClockTree(
@@ -1914,342 +1784,69 @@ class RiverGenIpConfig {
         // so the CK-relative JEDEC latencies + MR CL/CWL compute against the true
         // DDR CK.
         final ctrlHz = tree.controllerMhz.round() * 1000000;
-        // DDR3 speed-bin CL/CWL from the REALISED CK period (UberDDR3 JEDEC table,
-        // ddr3_controller.v CL_generator/CWL_generator):
-        //   tCK >= 3000 ps (DDR3-667) -> CL=5, CWL=5
-        //   2500..3000 ps (DDR3-800)  -> CL=6, CWL=5
-        //   1875..2500 ps             -> CL=7, CWL=6 ...
-        // Deriving from the realised period keeps MR CL/CWL correct whatever the
-        // tree solves. On the 100 MHz path hard-match the HW-verified oracle
-        // (CL=5, CWL=5): it runs the DDR3-667 MR latencies on the faster 400 MHz CK
-        // (read data arrives 1 nCK early, conservative + proven). The legacy 12 MHz
-        // path keeps deriving from the realised period.
-        final tCkPs = (1.0e6 / tree.ddrCkMhz);
-        final int ddr3Cl;
-        final int ddr3Cwl;
-        if (ddrOscFrequency == 100000000) {
-          ddr3Cl = 5;
-          ddr3Cwl = 5;
-        } else {
-          ddr3Cl = tCkPs >= 3000 ? 5 : (tCkPs >= 2500 ? 6 : 7);
-          ddr3Cwl = tCkPs >= 2500 ? 5 : (tCkPs >= 1875 ? 6 : 7);
-        }
-        final ddr3CwlEff = ddr3Cwl;
-        // --- new silicon-proven Ddr3Controller stack (ddr3v2) ---
-        if (mem.ddrParams?.ddr3v2 ?? false) {
-          final ddr = HarborDdr3(
-            config: board.config,
-            baseAddress: mem.address,
-            clockHz: ctrlHz,
-            busAddressWidth: busConfig.addressWidth,
-            busDataWidth: busConfig.dataWidth,
-            target: target,
-            // Match the DDR3 CK the tree actually solves (set clockfreq=
-            // 300000000 on the device for the proven 300 MHz x16 point).
-            ckPeriodPs: (1e6 / tree.ddrCkMhz).round(),
-            // ctrlgear=2: run the controller LOGIC on the tree's CK/8 clock
-            // (controllerClkPeriodPs = CK*4*gear -> the AC-timing counts are
-            // CK/8-correct, T6) and interpose the fabric gearbox.
-            controllerGearRatio: ddrGear,
-            // Strictly-ordered (non-posted) DRAM writes: a write is not ACKed to
-            // the fabric until it has crossed and committed. This buys two things,
-            // BOTH HW-proven necessary on the timing-marginal Arty S7 DDR:
-            //   1. Cross-master coherency: a later read by ANY master (CPU or SDIO
-            //      ADMA) sees the write. Posted writes ACK early and leave a stale
-            //      hole that QEMU + the functional ROHD sim never reproduce.
-            //   2. ADMA pacing: each ADMA card-read block-write waits for its
-            //      commit, which throttles the sustained read to a rate the
-            //      marginal DDR survives. Posted writes remove that pacing; the
-            //      unthrottled ADMA over-stresses the DDR and the board RESETS
-            //      mid-read (HW-verified 2026-08-15: a posted build resets at the
-            //      boot-file read where this non-posted build loads the kernel).
-            // Costs CPU write throughput (~220-cycle commit per store), which the
-            // real fix (a fast, non-marginal DDR route, or per-master posted so
-            // only the ADMA is paced) would recover. See project #68.
-            postedWrites: false,
-            // train=runtime exposes the knob-ABI window for the FSBL engine.
-            runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
-            name: '${mem.type}_$i',
-          );
-          soc.addPeripheral(ddr);
-          if (mem.ddrParams?.runtimeTrain ?? false) {
-            // The knob-ABI window is a second bus slave carved from the top page
-            // of the DRAM aperture (usableSize excludes it). Map it explicitly.
-            soc.addPeripheralSlave(
-              ddr,
-              'train',
-              BusAddressRange(ddr.trainBase, HarborDdr3.trainWindowSize),
-            );
-          }
-          // Under Verilator, HarborDdr3 builds a behavioral DRAM (_HarborSimDram,
-          // loadable via +dram_image) with only the bus + clk/reset, and NO DDR3
-          // PHY: no ddr_clk/ck_fast inputs and no physical pads. So the whole PHY
-          // wiring and pad exposure below is FPGA/ASIC only. The bus side and
-          // clk/reset are auto-wired by addPeripheral for both.
-          if (target is! HarborSimTarget) {
-            // gearRatio 1: single clock (ddr_clk = CK/4). gearRatio 2: the
-            // controller runs on CK/8 (tree.controllerClk = CLKOUT5) and the
-            // SERDES/PHY + gearbox on CK/4 (tree.controller) via ddr_serdes_clk.
-            ddr.input('ddr_clk').srcConnection! <= tree.controllerClk;
-            if (ddrGear > 1) {
-              ddr.input('ddr_serdes_clk').srcConnection! <= tree.controller;
-            }
-            final sysDomainForDdr = soc.clockDomain('sys');
-            if (sysDomainForDdr == null) {
-              throw StateError(
-                'ddr3v2 needs the sys clock domain for ddr_reset',
-              );
-            }
-            ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
-            ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
-            ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
-            ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
-            ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
-            final padPorts = [...DdrBoard.padPorts, 'sdram_dqs_n'];
-            for (final pad in padPorts) {
-              soc.exposePin(ddr, pad, externalName: pad);
-            }
-          }
-          continue;
-        }
-        final ddr = HarborDdrController(
+        final ddr = HarborDdr3(
           config: board.config,
           baseAddress: mem.address,
           clockHz: ctrlHz,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
           target: target,
-          // Sequencer/PHY on ctrl83, bus face on the slow sys clock (CDC).
-          asyncClock: true,
-          // The real-speed ISERDESE2 DW8 read gearbox.
-          ddr3Fast: true,
-          // Open the read window from the DRAM's read strobe (DQS as data) so each
-          // read self-frames instead of a fixed CL tap (region `dqsgate` param).
-          dqsGatedRead: mem.ddrParams?.dqsGate ?? false,
-          ddr3FastCkMhz: tree.ddrCkMhz,
-          ddr3FastIdelayRefMhz: tree.idelayRefMhz,
-          // LiteDRAM one-memory-clock-phase read margin: the DRAM drives read
-          // data readClExtra CK later so the burst lands INTO the ISERDESE2 word
-          // (not at the marginal CLKDIV edge). CWL/writes untouched.
-          ddr3FastCl: ddr3Cl + (mem.ddrParams?.readClExtra ?? 0),
-          ddr3FastCwl: ddr3CwlEff,
-          // ddr3Fast write/command timing. Effective value = region param, else
-          // board default, else the global default. cmdSlot/wrShift/window fall
-          // back to 0/0/5. wrBeat falls back to null (the PHY then derives it
-          // from CWL).
-          cmdSlot: mem.ddrParams?.cmdSlot ?? board.cmdSlot ?? 0,
-          writeShift: mem.ddrParams?.wrShift ?? board.wrShift ?? 0,
-          wrBeatOffset: mem.ddrParams?.wrBeat ?? board.wrBeat,
-          windowTapReset: mem.ddrParams?.window ?? board.window ?? 5,
-          // Per-lane IDELAY(VAR_LOAD) + BITSLIP leveling MMIO for the ddrlevelx
-          // firmware (defaults on for the DDR read-path boot programs). Region
-          // param / board default win over the boot-program default set.
-          trainableRead:
-              mem.ddrParams?.trainable ??
-              board.trainable ??
-              const {
-                'ddrtest',
-                'ddrprobe',
-                'ddrlevel',
-                'ddrlevelx',
-                'ddreye',
-                'ddrdiag',
-              }.contains(bootProgram),
-          readSlack: mem.ddrParams?.readSlack ?? board.readSlack ?? 1,
-          readTaps: mem.ddrParams?.readTap ?? board.readTap ?? 40,
-          readRetryTries: mem.ddrParams?.readRetry ?? board.readRetry ?? 0,
-          // Bring-up diagnostic: leave MR3.MPR set so every read returns the part
-          // MPR pattern (0xFFFF0000) with no write dependency, decoupling a broken
-          // write from a broken init/read. From the dram region `mpr` param
-          // (defaults off), on both the ddr3Fast and ECP5 paths.
-          mprDebug: mem.ddrParams?.mpr ?? false,
-          // Marginal-write boards (openXC7 Arty x8) carry writeVerify in their
-          // DdrBoard so a plain build is correct with no extra flag. A region
-          // param can still force it on/off.
-          writeVerify: mem.ddrParams?.writeVerify ?? board.writeVerify,
-          // Hardware MPR read-calibration before the bus opens (openXC7 ddr3Fast
-          // read eye drifts per boot). Board default, region param can override.
-          readLevel: mem.ddrParams?.readLevel ?? board.readLevel,
-          selfTest: mem.ddrParams?.selfTest ?? board.selfTest,
-          // Write-leveling / write-DQS actuator on the ddr3Fast (Xilinx) path.
-          // This was MISSING from this controller call (only the legacy/ECP5 call
-          // below had it), so writeLevel silently defaulted to false and the whole
-          // Xilinx WL + write-beat block never built. Same DLL-on-band gate as the
-          // ECP5 call. Needed for the runtime write-beat override at rated CK.
-          writeLevel:
-              (ddrClockFrequency != null &&
-                  ddrClockFrequency! > oscFrequency) &&
-              (mem.ddrParams?.trainable ??
-                  board.trainable ??
-                  const {
-                    'ddrtest',
-                    'ddrprobe',
-                    'ddrlevel',
-                    'ddreye',
-                    'ddrdiag',
-                  }.contains(bootProgram)),
+          // Match the DDR3 CK the tree actually solves (set clockfreq=
+          // 300000000 on the device for the proven 300 MHz x16 point).
+          ckPeriodPs: (1e6 / tree.ddrCkMhz).round(),
+          // ctrlgear=2: run the controller logic on the tree's CK/8 clock
+          // (controllerClkPeriodPs = CK*4*gear -> the AC-timing counts are
+          // CK/8-correct) and interpose the fabric gearbox.
+          controllerGearRatio: ddrGear,
+          // Strictly-ordered (non-posted) DRAM writes: a write is not ACKed to
+          // the fabric until it has crossed and committed. This buys two things,
+          // both HW-proven necessary on the timing-marginal Arty S7 DDR:
+          //   1. Cross-master coherency: a later read by any master (CPU or SDIO
+          //      ADMA) sees the write. Posted writes ACK early and leave a stale
+          //      hole that QEMU + the functional ROHD sim never reproduce.
+          //   2. ADMA pacing: each ADMA card-read block-write waits for its
+          //      commit, which throttles the sustained read to a rate the
+          //      marginal DDR survives. Posted writes remove that pacing. The
+          //      unthrottled ADMA over-stresses the DDR and the board resets
+          //      mid-read (HW-verified 2026-08-15: a posted build resets at the
+          //      boot-file read where this non-posted build loads the kernel).
+          // Costs CPU write throughput (~220-cycle commit per store), which the
+          // real fix (a fast, non-marginal DDR route, or per-master posted so
+          // only the ADMA is paced) would recover. See project #68.
+          postedWrites: false,
+          // train=runtime exposes the knob-ABI window for the FSBL engine.
+          runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
           name: '${mem.type}_$i',
         );
         soc.addPeripheral(ddr);
-        // Wire the DDR domain: controller/CLKDIV = ctrl83, plus the three tree
-        // clocks into the PHY (ck333, ck333@90, 200 MHz IDELAYCTRL ref).
-        ddr.input('ddr_clk').srcConnection! <= tree.controller;
-        // ddr_reset: the sys clock domain reset (an FPGA target uses an internal
-        // power-on reset, no external `reset` pin). The controller stretches the
-        // IDELAYCTRL RST internally, so this only needs a valid domain reset for
-        // the sequencer/PHY. The `sys` domain is always present on ddr3Fast.
+        if (mem.ddrParams?.runtimeTrain ?? false) {
+          // The knob-ABI window is a second bus slave carved from the top page
+          // of the DRAM aperture (usableSize excludes it). Map it explicitly.
+          soc.addPeripheralSlave(
+            ddr,
+            'train',
+            BusAddressRange(ddr.trainBase, HarborDdr3.trainWindowSize),
+          );
+        }
+        // gearRatio 1: single clock (ddr_clk = CK/4). gearRatio 2: the
+        // controller runs on CK/8 (tree.controllerClk = CLKOUT5) and the
+        // SERDES/PHY + gearbox on CK/4 (tree.controller) via ddr_serdes_clk.
+        ddr.input('ddr_clk').srcConnection! <= tree.controllerClk;
+        if (ddrGear > 1) {
+          ddr.input('ddr_serdes_clk').srcConnection! <= tree.controller;
+        }
         final sysDomainForDdr = soc.clockDomain('sys');
         if (sysDomainForDdr == null) {
-          throw StateError('ddr3Fast needs the sys clock domain for ddr_reset');
+          throw StateError('DDR3 needs the sys clock domain for ddr_reset');
         }
         ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
         ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
         ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
-        // 180-deg DQS launch clock (CLKOUT4): DQS edge centered in the DQ eye +
-        // edge-framed to CK (tDQSS), the UberDDR3 Arty HR-bank oracle scheme.
         ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
         ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
-        // DDR3 pads (single-ended SSTL135 _p + explicit _n complement, like the
-        // ECP5 DLL-off path). The Xilinx PHY drives both DQS rails.
         final padPorts = [...DdrBoard.padPorts, 'sdram_dqs_n'];
         for (final pad in padPorts) {
           soc.exposePin(ddr, pad, externalName: pad);
-        }
-      } else if (board != null) {
-        // DQS-strobed (DQSBUFM) DDR3 PHY. The ECP5 read path captures DQ with the
-        // DRAM's own DQS strobe (DQSBUFM DQSR90 + IDDRX2DQA), so the DQ IOLOGIC is
-        // x2-geared. An ECP5 DQ pad's input and output IOLOGIC must share gearing,
-        // so the write is x2 too. The x2 gearbox needs a half-rate fabric clock:
-        // the PHY derives eclk (CK rate = 48 MHz) and sclk (eclk/2 = 24 MHz) from
-        // the `ddr` domain. The asyncClock controller keeps its `bus` slave face
-        // on the slow `sys` fabric (24 MHz) and runs the sequencer/PHY on the
-        // 48 MHz `ddr_clk`, bridged by an internal HarborWishboneCdcBridge. CK
-        // stays 48 MHz. The controller also owns the 64->32 downsizer.
-        //
-        // The DDR CK rate = the `ddr` clock domain rate: the raw osc (DLL-off) by
-        // default, or the PLL'd --ddr-clock-freq when set above the osc (DLL-on).
-        // All DRAM timing counters and the DLL-on/off init choice derive from this
-        // CK rate. Any explicit --ddr-clock-freq is the real CK. Only an unset
-        // frequency falls back to the raw osc. A sub-osc CK (e.g. 24 MHz) widens
-        // the DLL-off read eye.
-        final ddrCkHz = ddrClockFrequency ?? oscFrequency;
-        // DLL engagement (CK > ~60 MHz). DLL-OFF takes the x1 IDDRX1F/ODDRX1F
-        // read/write datapath whose write->read turnaround eats beat0's rise
-        // sample. readCrossPair recovers it via the cross-cycle sliding pair.
-        // readSlack=1 is the proven full-cycle window for the x1 read.
-        final ddrCkDllOn = ddrCkHz > 60000000;
-        final ddr = HarborDdrController(
-          config: board.config,
-          baseAddress: mem.address,
-          // Sequencer/PHY clock = the `ddr` domain CK rate (osc for DLL-off, the
-          // PLL'd rate for DLL-on). The PHY halves it to the sclk fabric. All
-          // DRAM timing counters derive from this CK rate.
-          clockHz: ddrCkHz,
-          busAddressWidth: busConfig.addressWidth,
-          busDataWidth: busConfig.dataWidth,
-          // ECP5 board target so the controller builds the Lattice DQS PHY.
-          target: target,
-          // Second (faster) DRAM clock domain: bus face on `sys`, sequencer/PHY
-          // on `ddr_clk`, bridged by the controller's internal CDC.
-          asyncClock: true,
-          // Runtime-trainable DQS read: anchors beat0 on the DQSBUFM DATAVALID
-          // burst (the cold-read fix) and exposes the train-control MMIO window
-          // (the controller auto-extends its decoded span by trainCtrlSize).
-          // Resolves region param, then board default, then default ON for the
-          // DDR3 read-path boot programs. The set MUST include every program that
-          // touches the train-control window, else its accesses are unmapped and
-          // hang on the first STATUS read.
-          trainableRead:
-              mem.ddrParams?.trainable ??
-              board.trainable ??
-              const {
-                'ddrtest',
-                'ddrprobe',
-                'ddrlevel',
-                'ddrlevelx',
-                'ddreye',
-                'ddrdiag',
-              }.contains(bootProgram),
-          // JEDEC DDR3 write-leveling FSM (MR1 A7=1, sweep the write DQS delay
-          // until the CK-vs-DQS feedback flips, exit WL): trains tDQSS so the BL8
-          // deposit lands aligned. DLL-ON only. DLL-OFF used the fixed litedram
-          // tie-off and worked. Enabling WL there parks the pointer at a mistrained
-          // tap and garbages every write. So gate WL (and the DYNDELAY write-trim)
-          // on the DLL-on band. ddreye/ddrdiag MUST be in the set too: without the
-          // WL FSM the trainable sequencer never completes DLL-on init and hangs.
-          writeLevel:
-              (ddrClockFrequency != null &&
-                  ddrClockFrequency! > oscFrequency) &&
-              (mem.ddrParams?.trainable ??
-                  board.trainable ??
-                  const {
-                    'ddrtest',
-                    'ddrprobe',
-                    'ddrlevel',
-                    'ddreye',
-                    'ddrdiag',
-                  }.contains(bootProgram)),
-          // Firmware DQSBUFM DYNDELAY[7:0] write-trim (reg8): a per-byte-lane
-          // dynamic DQS-delay sweep to trim the fixed below-strobe-pad write skew
-          // that floats the first-cycle DQ bits. DLL-on only (same reason as WL).
-          writeTrimTrainable:
-              (ddrClockFrequency != null &&
-                  ddrClockFrequency! > oscFrequency) &&
-              (mem.ddrParams?.trainable ??
-                  board.trainable ??
-                  const {
-                    'ddrtest',
-                    'ddrprobe',
-                    'ddrlevel',
-                    'ddreye',
-                    'ddrdiag',
-                  }.contains(bootProgram)),
-          mprDebug: mem.ddrParams?.mpr ?? false,
-          // Read-eye knobs (bench sweep axes), from the dram region
-          // `read-tap`/`read-slack` params or board defaults:
-          //   readTaps  = per-DQ static DELAYG delay (the eye-centering knob).
-          //   readSlack = full-cycle read-window slide. DLL-on keeps 2 (proven x2).
-          //               DLL-off uses the region read-slack (default 1).
-          readTaps: mem.ddrParams?.readTap ?? board.readTap ?? 40,
-          readSlack: ddrCkDllOn
-              ? 2
-              : (mem.ddrParams?.readSlack ?? board.readSlack ?? 1),
-          // x1 read deserialize assembly. With the write-side DQS fix (DQS on the
-          // 50%-duty CLKOS2, both write beats centered), the read uses HEAD
-          // same-cycle MODE 0 {q1,q0}. No effect on the DLL-on x2 path.
-          readPairMode: 0,
-          readRetryTries: mem.ddrParams?.readRetry ?? board.readRetry ?? 0,
-          name: '${mem.type}_$i',
-        );
-        // The fabric-facing `bus` slave auto-clocks on `sys` (24 MHz): this is the
-        // peripheral the SoC decoder maps at mem.address. The internal CDC's fast
-        // master side + sequencer + PHY run on the `ddr` 48 MHz domain wired below.
-        // The PHY divides it to the 24 MHz sclk for the DQS x2 datapath.
-        soc.addPeripheral(ddr);
-        final ddrDomain = soc.clockDomain('ddr');
-        if (ddrDomain == null) {
-          throw StateError(
-            'board-backed DRAM present but the "ddr" clock domain is missing',
-          );
-        }
-        ddr.input('ddr_clk').srcConnection! <= ddrDomain.clk;
-        ddr.input('ddr_reset').srcConnection! <= ddrDomain.reset;
-        // The pads keep their port names so the board's constraint table (sdram_*)
-        // lines up with the netlist. DLL-OFF: the controller adds an explicit
-        // sdram_dqs_n complement port, so expose it too. DLL-ON: the single
-        // SSTL135D_I diff DQS pad has no _n port (nextpnr derives _n).
-        final ddrDllOn = ddrCkHz > 60000000;
-        final padPorts = [...DdrBoard.padPorts, if (!ddrDllOn) 'sdram_dqs_n'];
-        for (final pad in padPorts) {
-          soc.exposePin(ddr, pad, externalName: pad);
-        }
-        // LA probe: expose the DDR controller's 6-bit dbg_la bundle
-        // ([3:0]=stateCode [4]=rd_cal_active [5]=phy.rdValid) as top pins so a
-        // logic analyzer can watch the read-cal FSM + read completion live
-        // (bus-independent). Gated on the dram `laprobe=true` param; the
-        // dbg_la[*] pads come from --pin.
-        if (mem.ddrParams?.laprobe ?? false) {
-          soc.exposePin(ddr, 'dbg_la', externalName: 'dbg_la');
         }
       } else if (mem.type == 'flash') {
         // Real SPI NOR flash with XIP: the CPU fetches firmware directly from the
@@ -3074,9 +2671,6 @@ class RiverGenIpConfig {
           isa: coreConfig.isa,
           uartBase: uart.address,
           dramBase: dram.address,
-          // Train-control MMIO sits just above the DRAM array (board-relative,
-          // NOT a fixed 128M offset which lands inside a 256M array).
-          trainCtrlBase: dram.address + dram.size,
           clockHz: clockFrequency,
           // Loop the verdict: FPGA reconfig glitches the first UART bytes on
           // hardware, so a one-shot print is unreadable. Streaming repeats
@@ -3098,108 +2692,6 @@ class RiverGenIpConfig {
           isa: coreConfig.isa,
           uartBase: uart.address,
           dramBase: dram.address,
-          clockHz: clockFrequency,
-        );
-      case 'ddrlevel':
-        // DDR3 READ-vs-WRITE discriminator (no scope). Programs the trainable-read
-        // MMIO block and runs two sub-tests across RDSLACK 0..4 x READCLKSEL 0..7,
-        // judged by data. Test A (RDADDR) reads four distinct rows/banks with no
-        // writes: DISTINCT = read captures array, ALLSAME = read-side bug. Test B
-        // (WRCHG) writes then re-reads A0: CHANGES = writes modify the cell,
-        // NOCHANGE = writes never land. Needs trainableRead (genip auto-enables it
-        // plus writeLevel here).
-        final dram = memories.firstWhere(
-          (m) => m.type == 'dram',
-          orElse: () =>
-              throw StateError('ddrlevel boot program needs a dram region'),
-        );
-        program = RiverDdrLevel(
-          isa: coreConfig.isa,
-          uartBase: uart.address,
-          dramBase: dram.address,
-          // The train-control window sits immediately above the DRAM array.
-          trainCtrlBase: dram.address + dram.size,
-          clockHz: clockFrequency,
-        );
-      case 'ddrlevelx':
-        // Xilinx (Arty S7) ISERDESE2 read-leveling. Walks the per-lane IDELAY
-        // tap (reg10 LD/CE/INC) to center each DQ eye against a written pattern,
-        // then searches the fabric BITSLIP (reg11) for the beat rotation that
-        // reads it clean, reporting LVLX L=<lane> TAP/LO/HI + LVLX SLIP over the
-        // UART. Drives the train-control MMIO exposed by the Xilinx DDR PHY when
-        // the read path is trainable (genip auto-enables trainableRead here).
-        final dram = memories.firstWhere(
-          (m) => m.type == 'dram',
-          orElse: () =>
-              throw StateError('ddrlevelx boot program needs a dram region'),
-        );
-        program = RiverDdrLevelXilinx(
-          isa: coreConfig.isa,
-          uartBase: uart.address,
-          dramBase: dram.address,
-          // The train-control window sits immediately above the DRAM array.
-          trainCtrlBase: dram.address + dram.size,
-          clockHz: clockFrequency,
-          // dram region `mpr` param => run MPR read-eye centering (write-
-          // independent 0101 target). Real build => park the baked center + run
-          // the A/B/C write-store test with the clean read.
-          mprMode: dram.ddrParams?.mpr ?? false,
-        );
-      case 'ddrdiag':
-        // DDR train-control ADDRESS diagnostic (no scope). Prints the train-control
-        // STATUS address as a full 64-bit value (CTLADDR=<hi> <lo>) to check
-        // whether the upper 32 bits are sign-extended, then brackets a control
-        // WRITE (TRYWR/WROK) and READ (TRYRD/RDOK=) so a missing OK marker
-        // pinpoints which access never acks. Needs the train-control window
-        // (genip auto-enables trainableRead here).
-        final dram = memories.firstWhere(
-          (m) => m.type == 'dram',
-          orElse: () =>
-              throw StateError('ddrdiag boot program needs a dram region'),
-        );
-        program = RiverDdrDiag(
-          isa: coreConfig.isa,
-          uartBase: uart.address,
-          dramBase: dram.address,
-          // The train-control window sits immediately above the DRAM array.
-          trainCtrlBase: dram.address + dram.size,
-          clockHz: clockFrequency,
-        );
-      case 'ddreye':
-        // DDR3 read-leveling EYE SWEEP. Sweeps RDTAP {0,8,..,120} x READCLKSEL 0..7
-        // x RDSLACK 0..4 (640 combos), writing + reading the C0DE pattern each,
-        // printing INTERESTING lines (EYE ... [MATCH]) and a looped summary
-        // (EYEBEST / EYEDV) so a UART read finds the read eye (or proves DATAVALID
-        // never fires, a deeper analog read-strobe issue). Needs the train-control
-        // window + writeLevel (genip auto-enables both here).
-        final dram = memories.firstWhere(
-          (m) => m.type == 'dram',
-          orElse: () =>
-              throw StateError('ddreye boot program needs a dram region'),
-        );
-        program = RiverDdrEyeSweep(
-          isa: coreConfig.isa,
-          uartBase: uart.address,
-          dramBase: dram.address,
-          // The train-control window sits immediately above the DRAM array.
-          trainCtrlBase: dram.address + dram.size,
-          clockHz: clockFrequency,
-        );
-      case 'ddrverify':
-        // Minimal DDR probe: prints the STATUS reg (DLL lock / valid flags), then
-        // a write->readback loop + a retention check. Unambiguous output where the
-        // eye diagnostics are degraded. Needs the train-control window for STATUS
-        // (genip builds it here via the board default trainable).
-        final dram = memories.firstWhere(
-          (m) => m.type == 'dram',
-          orElse: () =>
-              throw StateError('ddrverify boot program needs a dram region'),
-        );
-        program = RiverDdrVerify(
-          isa: coreConfig.isa,
-          uartBase: uart.address,
-          dramBase: dram.address,
-          trainCtrlBase: dram.address + dram.size,
           clockHz: clockFrequency,
         );
       case 'dramexec':

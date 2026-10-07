@@ -27,60 +27,21 @@ class DdrBoard {
   /// single-ended SSTL135_I (see [pinsFor]). Empty for boards with no _n ball.
   final Map<String, String> dqsComplementPins;
 
-  /// Whether the controller exposes the opt-in CPU read-training MMIO window
-  /// (see [HarborDdrController.trainableRead]). DLL-off DDR3 boards want it so
-  /// the FSBL can sweep the read tap per board; the proven static path stays
-  /// the default when false.
-  final bool trainableRead;
+  /// Extra fixed-level pins outside the controller's pad ports: the
+  /// OrangeCrab fake-VTT network (see [gndPins]). Driven to all-1 by genip
+  /// when non-empty. Empty for boards with no such network (Arty S7).
+  final Map<String, String> vccioPins;
 
-  /// Whether the controller must hardware write-verify-retry every array write
-  /// (read back, re-issue until it matches, bounded). The openXC7 Arty x8 path
-  /// needs it: no output ODELAY and the MMCM 90-degree write-launch phase is
-  /// inert under openXC7, so the DQ-vs-DQS write eye cannot be centred (reads are
-  /// clean). False for boards whose write eye closes on its own (ECP5/x16).
-  final bool writeVerify;
-
-  /// Whether the controller runs hardware MPR read-calibration before opening
-  /// the bus (sequencer sweeps each byte lane's read window x IDELAY tap against
-  /// the DRAM MPR pattern and locks the eye). The openXC7 Arty ddr3Fast path
-  /// needs it: the CK-based ISERDESE2 capture eye drifts per boot, so a static
-  /// tap only boots ~half the time (the Ferrite first-ifetch coin-flip). False
-  /// for boards whose read eye is stable (ECP5 DQS-strobed capture).
-  final bool readLevel;
-
-  /// Post-read-cal cadence self-test gate (ddr3Fast). Requires [readLevel].
-  final bool selfTest;
-
-  /// Per-board DDR tuning defaults, forwarded to the controller when a memory
-  /// region does not override them (see genip's effective-value merge). Null
-  /// leaves the genip global default in force. cmdSlot/wrShift/wrBeat/window
-  /// are the ddr3Fast (Xilinx) write/read-window knobs; trainable/readTap/
-  /// readSlack/readRetry apply to both PHY paths.
-  final int? cmdSlot;
-  final int? wrShift;
-  final int? wrBeat;
-  final bool? trainable;
-  final int? readTap;
-  final int? readSlack;
-  final int? readRetry;
-  final int? window;
+  /// Spare pins driven low to complete the OrangeCrab's fake-VTT network, as
+  /// litex-boards does in gateware. Empty for boards without one (Arty S7).
+  final Map<String, String> gndPins;
 
   const DdrBoard({
     required this.config,
     required this.pins,
     this.dqsComplementPins = const {},
-    this.trainableRead = false,
-    this.writeVerify = false,
-    this.readLevel = false,
-    this.selfTest = false,
-    this.cmdSlot,
-    this.wrShift,
-    this.wrBeat,
-    this.trainable,
-    this.readTap,
-    this.readSlack,
-    this.readRetry,
-    this.window,
+    this.vccioPins = const {},
+    this.gndPins = const {},
   });
 
   /// The pin/constraint table for a given DLL engagement. DLL-ON returns [pins]
@@ -117,8 +78,8 @@ class DdrBoard {
   };
 
   /// Digilent Arty S7-50: Micron MT41K128M16 DDR3L (256MB, 16-bit), sites from
-  /// the litex/migen `arty_s7` platform. Xilinx xc7s50-csga324. The [DdrPhyXilinx]
-  /// DLL-off PHY drives an explicit pseudo-differential complement, so CK/DQS are
+  /// the litex/migen `arty_s7` platform. Xilinx xc7s50-csga324. The Xilinx DDR3
+  /// PHY drives an explicit pseudo-differential complement, so CK/DQS are
   /// single-ended SSTL135 on both _p and _n balls (dqs_n via [dqsComplementPins]);
   /// the litex true-diff DIFF_SSTL135 is for a hard OBUFDS pair this soft PHY does
   /// not build. 14 row lines (a[13:0]) => rowWidth 14 (part is 16K x 1K x 8). The
@@ -135,8 +96,6 @@ class DdrBoard {
       colWidth: 10,
       casLatency: 6,
     ),
-    // Read-cal PARKED OFF (see _artyS7x8): wedges the boot on HW.
-    readLevel: false,
     pins: {
       'sdram_ck': 'R5 DIFF_SSTL135',
       'sdram_ck_n': 'T4 DIFF_SSTL135',
@@ -185,7 +144,7 @@ class DdrBoard {
       'sdram_dq[14]': 'M1 SSTL135',
       'sdram_dq[15]': 'P2 SSTL135',
       // DQS _p balls (K1/N3) AND the explicit _n complement balls (L1/N2). The
-      // DdrPhyXilinx PHY always drives both rails, so both are constrained here in
+      // Xilinx DDR3 PHY always drives both rails, so both are constrained here in
       // `pins` rather than the dllOff-only dqsComplementPins (else the dllOn path
       // drops the _n pads and PnR fails "no IOSTANDARD").
       'sdram_dqs[0]': 'K1 SSTL135',
@@ -213,22 +172,6 @@ class DdrBoard {
       colWidth: 10,
       casLatency: 6,
     ),
-    // x8 write eye is marginal-but-recoverable on openXC7 (no output ODELAY, MMCM
-    // 90-degree phase inert): reads clean, a re-driven write always lands, so
-    // write-verify-retry makes CPU writes correct.
-    writeVerify: true,
-    // Read-cal (MPR eye sweep) is PARKED OFF: on HW the sRdCal FSM does not
-    // complete (sim-clean, unsimmable on the real PHY), so its bus gate wedges
-    // the whole wishbone before the FSBL prints. The RTL stays behind the flag
-    // (readlevel=true) for on-board debugging; the default boot is the base.
-    readLevel: false,
-    // HW-proven x8 DDR3 tuning, baked in so a plain build needs no per-region params.
-    cmdSlot: 2,
-    wrShift: -1,
-    wrBeat: 0,
-    trainable: true,
-    readRetry: 6,
-    window: 5,
     pins: {
       'sdram_ck': 'R5 DIFF_SSTL135',
       'sdram_ck_n': 'T4 DIFF_SSTL135',
@@ -289,15 +232,6 @@ class DdrBoard {
       colWidth: 10,
       casLatency: 6,
     ),
-    writeVerify: true,
-    // Read-cal PARKED OFF (see _artyS7x8): wedges the boot on HW.
-    readLevel: false,
-    cmdSlot: 2,
-    wrShift: -1,
-    wrBeat: 0,
-    trainable: true,
-    readRetry: 6,
-    window: 5,
     pins: {
       'sdram_ck': 'R5 DIFF_SSTL135',
       'sdram_ck_n': 'T4 DIFF_SSTL135',
@@ -349,10 +283,6 @@ class DdrBoard {
   /// pad (SSTL135D_I on the LDQS _p ball B15/G18) whose LDQSN _n partner (A16/H17)
   /// nextpnr drives as the complement for a clean DQSBUFM.DQSI read strobe.
   static const _orangeCrab = DdrBoard(
-    // Static DELAYG read path (trainableRead=false) so the bitstream fits the 25F
-    // alongside the MMU (the runtime DELAYF training controller will not route).
-    // The read tap is swept at build time via readTaps (RIVER_DDR_READTAPS env,
-    // default 40) to centre the eye across a few static bitstreams.
     config: HarborDdrConfig.orangeCrab(),
     pins: {
       'sdram_ck': 'J18 SSTL135_I SLEWRATE=FAST',
@@ -367,6 +297,11 @@ class DdrBoard {
       'sdram_ba[0]': 'D6 SSTL135_I SLEWRATE=FAST',
       'sdram_ba[1]': 'B7 SSTL135_I SLEWRATE=FAST',
       'sdram_ba[2]': 'A6 SSTL135_I SLEWRATE=FAST',
+      // 13 lines (a[0:12]): the MT41K64M16 is a 1Gb part (13 rows), matching
+      // HarborDdrConfig.orangeCrab's rowWidth. litex-boards reserves 16 pad
+      // sites for the bigger-part board variants (gsd_orangecrab.py:118-121,
+      // the "a" Subsignal), but only the first 13 are wired for this part.
+      // The rest float. Take the first 13 sites in that same order.
       'sdram_addr[0]': 'C4 SSTL135_I SLEWRATE=FAST',
       'sdram_addr[1]': 'D2 SSTL135_I SLEWRATE=FAST',
       'sdram_addr[2]': 'D3 SSTL135_I SLEWRATE=FAST',
@@ -380,8 +315,6 @@ class DdrBoard {
       'sdram_addr[10]': 'A7 SSTL135_I SLEWRATE=FAST',
       'sdram_addr[11]': 'C2 SSTL135_I SLEWRATE=FAST',
       'sdram_addr[12]': 'B6 SSTL135_I SLEWRATE=FAST',
-      'sdram_addr[13]': 'C1 SSTL135_I SLEWRATE=FAST',
-      'sdram_addr[14]': 'A2 SSTL135_I SLEWRATE=FAST',
       // DM sites in litex order so each lane's DM shares its lane's ECP5 DQS group:
       // D16 in LDQ20 with DQ[0..7]+DQS[0] (lane 0), G16 in LDQ32 with DQ[8..15]+
       // DQS[1] (lane 1). nextpnr enforces DQS-group membership via the DQSBUFM
@@ -419,6 +352,22 @@ class DdrBoard {
     dqsComplementPins: {
       'sdram_dqs_n[0]': 'A16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
       'sdram_dqs_n[1]': 'H17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    },
+    // Fake-VTT network (no onboard VTT regulator): 6 spare pins sourcing
+    // current (driven high by genip) and 2 sinking it (driven low), sites
+    // from litex-boards gsd_orangecrab.py's `vccio`/`gnd` ddram Subsignals
+    // (:140-141). r0.1 has no such network (absent from its _io_r0_1 list).
+    vccioPins: {
+      'ddr_vccio[0]': 'K16 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[1]': 'D17 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[2]': 'K15 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[3]': 'K17 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[4]': 'B18 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[5]': 'C6 SSTL135_II SLEWRATE=FAST',
+    },
+    gndPins: {
+      'ddr_gnd[0]': 'L15 SSTL135_II SLEWRATE=FAST',
+      'ddr_gnd[1]': 'L16 SSTL135_II SLEWRATE=FAST',
     },
   );
 

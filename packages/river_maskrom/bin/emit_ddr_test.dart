@@ -17,9 +17,6 @@ Future<void> main(List<String> args) async {
     isa: isa,
     uartBase: uart,
     dramBase: dram,
-    // Train-control MMIO window sits just above the DRAM array (dramBase +
-    // dramSize). 128M is the standard creek/x8 layout.
-    trainCtrlBase: dram + 0x08000000,
     clockHz: clockHz,
   );
   await payloadProg.build();

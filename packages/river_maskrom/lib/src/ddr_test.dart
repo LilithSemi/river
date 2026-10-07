@@ -23,11 +23,6 @@ class RiverDdrTest extends Module {
     required this.isa,
     required int uartBase,
     required int dramBase,
-    // Train-control MMIO base (STATUS/reg block), just above the DRAM array at
-    // dramBase + dramSize. MUST be passed per-board: hardcoding a fixed offset
-    // (e.g. dramBase+128M for a 128MB part) lands INSIDE a larger array on a
-    // 256MB board, so the STATUS read returns array data, not the register.
-    required int trainCtrlBase,
     int clockHz = 48000000,
     int baud = 115200,
     // When true, re-run the readback+verdict forever (with a delay between
@@ -142,24 +137,6 @@ class RiverDdrTest extends Module {
       register(Register.x14).bind(lbu(register(Register.x10), offset: 1));
       checkXa('b');
     }
-
-    // DQS PHY bring-up probe: read train-control STATUS (reg3 @ trainCtrlBase+0x18)
-    // once as "DDR ST=<hex>". Bits: [8]DATAVALID [9]BURSTDET [10]DLL_LOCK
-    // [11]BDET_SEEN(sticky) [12]DVALID_SEEN(sticky). The read rides the bus-clock
-    // control window, so it ACKs even when the DQS datapath is dead: it shows
-    // WHERE the DLL-on read breaks.
-    // _print clobbers x14 (its THRE poll does x14 = LSR & 0x20), so print the tag
-    // BEFORE loading the value into x14, else _printHexX14 streams the leaked 0x20
-    // mask instead of the register. _printHexX14 polls on x16, preserving x14.
-    void dumpWord(String tag, int addr) {
-      _print(tag);
-      register(Register.x10).bind(li(addr));
-      register(Register.x14).bind(lw(register(Register.x10)));
-      _printHexX14();
-      _print('\r\n');
-    }
-
-    dumpWord('DDR ST=', trainCtrlBase + 0x18); // reg3 STATUS
 
     // Verdict, streamed in a loop: "DDR OK" only when x25 (mismatch count) is 0,
     // else "DDR ERRS=<count>". The per-offset "DDR E<tag>=<val>" lines above

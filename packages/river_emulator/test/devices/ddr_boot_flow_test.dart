@@ -2,14 +2,15 @@ import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
 
-/// End-to-end boot flow in the emulator: an FSBL (the kind Weir's first-stage
-/// bootloader will be) runs from SRAM, SWEEPS the DDR read tap through the
-/// training MMIO to find the eye, INITIALISES main RAM by writing a tiny payload
-/// into the now-usable DRAM, then JUMPS to and EXECUTES that payload from DRAM.
-/// Proves the DDR-training -> main-RAM -> jump leg works as a whole. CAR
-/// (rcache* CSRs -> l1d.lockRange) and flash XIP are exercised separately; this
-/// focuses on the DRAM bring-up that was the missing emulator piece. See
-/// project_ddr_training / project_weir_bios.
+/// End-to-end boot flow in the emulator: an FSBL (Weir's first-stage boot
+/// loader, in `train=runtime` mode) runs from SRAM, drives the real wb2
+/// knob-ABI sequence to sweep the IDELAY read tap into the eye, initialises
+/// main RAM by writing a tiny payload into the now-usable DRAM, then jumps to
+/// and executes that payload from DRAM. Proves the DDR-training -> main-RAM
+/// -> jump leg works as a whole, against the same register protocol Weir's
+/// `ddr_train.zig` drives on real hardware: write the knob, CTL SET, CTL
+/// APPLY, then check the array. CAR (rcache* CSRs -> l1d.lockRange) and flash
+/// XIP are exercised separately. This focuses on the DRAM bring-up leg.
 void main() {
   // RV64 instruction encoders (subset).
   int lui(int rd, int imm20) => ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x37;
@@ -94,8 +95,13 @@ void main() {
     // sign-extends bit31; 0x80000000 would become 0xFFFFFFFF80000000).
     const dramBase = 0x40000000;
     const arraySize = 0x10000; // 64KB array
-    const ctrlBase = dramBase + arraySize;
-    const eyeLo = 8, eyeHi = 40;
+    const eyeLo = 8, eyeHi = 20;
+
+    // The wb2 knob-ABI register offsets, relative to ctrlBase (matches
+    // Ddr3Controller._buildWb2Knobs, stride 8 bytes).
+    const regIdelay = 0x10;
+    const regCtl = 0x20;
+    const ctlSet = 0x1, ctlApply = 0x2;
 
     final sram = Sram(
       const RiverDevice(
@@ -111,8 +117,9 @@ void main() {
         range: BusAddressRange(dramBase, arraySize + Dram.trainCtrlSize),
       ),
       trainable: true,
-      eyeLo: eyeLo,
-      eyeHi: eyeHi,
+      lanes: 1,
+      eyeLo: const [eyeLo],
+      eyeHi: const [eyeHi],
     );
 
     // The payload that runs from DRAM: store the boot magic to SRAM[0x100],
@@ -126,21 +133,24 @@ void main() {
     const payloadDram = dramBase + 0x400; // 0x40000400
 
     // FSBL program (at 0x0 in SRAM). Registers:
-    //   x10=ctrl base, x20=dram base, x21=pattern, x5=tap, x22=marker, x23=magic
+    //   x10=ctrl base, x20=dram base, x21=pattern, x5=tap (IDELAY), x6=CTL
+    //   value, x22=marker, x23=magic
     final prog = <int>[
       lui(10, 0x40010), // x10 = ctrlBase (0x40010000)
       lui(20, 0x40000), // x20 = dramBase (0x40000000)
       ...li(21, pattern), // x21 = pattern
       addi(5, 0, 0), // x5 = tap = 0
       // sweep: (pc of this instr = sweepPc)
-      sw(5, 10, 0x00), // RDTAP_TARGET = tap
-      addi(6, 0, 1),
-      sw(6, 10, 0x08), // CTL = SET
+      sw(5, 10, regIdelay), // IDELAY = tap
+      addi(6, 0, ctlSet),
+      sw(6, 10, regCtl), // CTL = SET (lane 0)
+      addi(6, 0, ctlApply),
+      sw(6, 10, regCtl), // CTL = APPLY
       sw(21, 20, 0x00), // DRAM[0] = pattern
       lw(7, 20, 0x00), // read back
       beq(7, 21, 0), // placeholder offset -> patched to 'found'
       addi(5, 5, 1), // tap++
-      addi(8, 0, 128),
+      addi(8, 0, 32),
       bne(5, 8, 0), // placeholder -> back to sweep
       jal(0, 0), // fail: halt-in-place (offset 0 = self loop)
       // found:
@@ -159,7 +169,7 @@ void main() {
 
     // Patch the branch offsets now that the layout is known (4 bytes/instr).
     // Indices are into the FLATTENED prog list, so they count li()'s two words.
-    final sweepIdx = prog.indexOf(sw(5, 10, 0x00)); // first sweep instr
+    final sweepIdx = prog.indexOf(sw(5, 10, regIdelay)); // first sweep instr
     final beqIdx = prog.indexOf(beq(7, 21, 0)); // the beq placeholder
     final bneIdx = prog.indexOf(bne(5, 8, 0)); // the bne placeholder
     final foundIdx = prog.indexOf(addi(22, 0, markerAddr)); // 'found:' instr
@@ -198,7 +208,7 @@ void main() {
     expect(
       tap,
       inInclusiveRange(eyeLo, eyeHi),
-      reason: 'FSBL should have trained the read tap into the eye',
+      reason: 'FSBL should have trained the IDELAY tap into the eye',
     );
   });
 }

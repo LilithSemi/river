@@ -1,16 +1,13 @@
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
 
-/// End-to-end T4+T5: a `ddr3v2` SoC threads `ctrlgear` from the device param
-/// through the DDR MMCM (CLKOUT5 = CK/8) and the HarborDdr3 two-clock interface.
-/// gearRatio 1 (absent) stays byte-identical (no gearbox, no serdes clock, no
-/// CLKOUT5); gearRatio 2 elaborates with all three present.
+/// End-to-end: the single DDR3 stack threads `ctrlgear` from the device
+/// param through the DDR MMCM (CLKOUT5 = CK/8) and the HarborDdr3 two-clock
+/// interface. gearRatio 1 (absent) stays byte-identical (no gearbox, no
+/// serdes clock, no CLKOUT5); gearRatio 2 elaborates with all three present.
 void main() {
-  Future<String> genDdr3v2Sv({
-    required bool geared,
-    bool withDram = true,
-  }) async {
-    final gearSuffix = geared ? ',ctrlgear=2' : '';
+  Future<String> genDdr3Sv({required bool geared, bool withDram = true}) async {
+    final gearSuffix = geared ? ':ctrlgear=2' : '';
     final config = RiverGenIpConfig(
       name: geared ? 'gear2_soc' : 'gear1_soc',
       cores: const ['rc1-s'],
@@ -25,8 +22,7 @@ void main() {
         Device.parse('uart:0x10000000:ns16550a'),
         if (withDram)
           Device.parse(
-            'dram:0x80000000:256M:arty-s7:ddr3v2=true,'
-            'clockfreq=300000000$gearSuffix',
+            'dram:0x80000000:256M:arty-s7:clockfreq=300000000$gearSuffix',
           ),
       ],
       pins: [
@@ -45,7 +41,7 @@ void main() {
     () async {
       // Isolates whether the mmioDevices/buildSoC path is broken by unrelated WIP
       // (a build failure here == pre-existing, independent of the DDR gearing).
-      final sv = await genDdr3v2Sv(geared: false, withDram: false);
+      final sv = await genDdr3Sv(geared: false, withDram: false);
       expect(sv, contains('module'));
     },
     timeout: const Timeout(Duration(minutes: 3)),
@@ -54,7 +50,7 @@ void main() {
   test(
     'ctrlgear absent (gearRatio 1) is byte-identical: no gearbox/serdes/CK8',
     () async {
-      final sv = await genDdr3v2Sv(geared: false);
+      final sv = await genDdr3Sv(geared: false);
       expect(sv, isNot(contains('ddr3_gearbox')));
       expect(sv, isNot(contains('ddr_serdes_clk')));
       // No spare CLKOUT5 on the DDR MMCM.
@@ -66,7 +62,7 @@ void main() {
   test(
     'ctrlgear=2 wires the CK/8 controller + CK/4 serdes + gearbox',
     () async {
-      final sv = await genDdr3v2Sv(geared: true);
+      final sv = await genDdr3Sv(geared: true);
       // The DDR MMCM emits CK/8 on CLKOUT5.
       expect(sv, contains('.CLKOUT5_DIVIDE('));
       // HarborDdr3 gained its second (serdes) clock port and the gearbox module.
