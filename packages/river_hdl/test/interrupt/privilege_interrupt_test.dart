@@ -153,7 +153,10 @@ Future<void> runProgram(
   );
   core.input('dataBus_ACK').srcConnection! <= ack;
   core.input('dataBus_DAT_MISO').srcConnection! <= data;
-  Simulator.setMaxSimTime(30000);
+  // RV64 microcode uses substantially more cycles for the boot CSR sequence.
+  // Leave room for the complete handler, not just its first CSR read.
+  final maxCycles = microcoded && xlen == RiscVMxlen.rv64 ? 4000 : 1800;
+  Simulator.setMaxSimTime((maxCycles + 100) * 10);
   unawaited(Simulator.run());
   try {
     await clk.nextNegedge;
@@ -165,7 +168,7 @@ Future<void> runProgram(
         lines[i].inject((pending >> bits[i]) & 1);
       }
     }
-    for (var cycle = 0; cycle < 1800; cycle++) {
+    for (var cycle = 0; cycle < maxCycles; cycle++) {
       await clk.nextNegedge;
       await observe(core, lines, cycle);
       if (reg(core, 31) == 1) break;
@@ -256,7 +259,7 @@ void main() {
                 sie: c.$6,
               ),
               pending: pending,
-              observe: (_, __, ___) {},
+              observe: (_, _, _) {},
               check: (core) {
                 expect(reg(core, 24), c.$7, reason: 'wrong handler privilege');
                 if (c.$7 == 0) {
@@ -329,13 +332,19 @@ void main() {
             );
           }, timeout: const Timeout(Duration(minutes: 3)));
         }
-        for (final change in ['mie', 'mstatus', 'mideleg', 'pending']) {
+        for (final change in [
+          'mie',
+          'mstatus',
+          'mideleg',
+          'pending',
+          'priority',
+        ]) {
           test(
             'revalidate unaccepted candidate after $change changes',
             () async {
               final code = program(
                 mode: 3,
-                enabled: 1 << 7,
+                enabled: (1 << 7) | (change == 'priority' ? 1 << 11 : 0),
                 pending: 0,
                 mie: true,
               );
@@ -384,8 +393,11 @@ void main() {
                   }
                   if (armed && take.value.toBool()) {
                     candidateSeen = true;
-                    if (change == 'pending' && !changed) {
-                      lines[1].inject(0);
+                    if ((change == 'pending' || change == 'priority') &&
+                        !changed) {
+                      lines[change == 'pending' ? 1 : 0].inject(
+                        change == 'pending' ? 0 : 1,
+                      );
                       changed = true;
                     }
                   }
@@ -395,16 +407,30 @@ void main() {
                         'mie' => csrs!.mie.value[7] == LogicValue.zero,
                         'mstatus' => csrs!.mstatus.value[3] == LogicValue.zero,
                         'mideleg' => csrs!.mideleg.value[7] == LogicValue.one,
+                        'priority' =>
+                          changed && csrs!.mip.value[11] == LogicValue.one,
                         _ => changed && csrs!.mip.value[7] == LogicValue.zero,
                       };
                   if (invalid) {
                     // This checks the candidate interface, before acceptance;
                     // it does not demand cancellation of an already taken trap.
-                    expect(
-                      take.value.toBool(),
-                      isFalse,
-                      reason: '$change changed but candidate remains eligible',
-                    );
+                    if (change == 'priority') {
+                      if (take.value.toBool()) {
+                        expect(
+                          core.pipeline.input('interruptCause').value.toInt(),
+                          11,
+                          reason:
+                              'lower-priority candidate survived MEI assertion',
+                        );
+                      }
+                    } else {
+                      expect(
+                        take.value.toBool(),
+                        isFalse,
+                        reason:
+                            '$change changed but candidate remains eligible',
+                      );
+                    }
                     checked = true;
                   }
                 },
@@ -420,12 +446,19 @@ void main() {
                     isTrue,
                     reason: 'no eligibility change exercised',
                   );
-                  expect(
-                    reg(core, 29),
-                    1,
-                    reason: 'CSR sequence did not finish',
-                  );
-                  expect(reg(core, 31), 0, reason: 'stale candidate trapped');
+                  if (change == 'priority') {
+                    expect(reg(core, 31), 1);
+                    expect(reg(core, 21), (1 << (xlen.size - 1)) | 11);
+                    expect(reg(core, 24), 3);
+                    expect(reg(core, 22), isIn([0x10c, 0x110]));
+                  } else {
+                    expect(
+                      reg(core, 29),
+                      1,
+                      reason: 'CSR sequence did not finish',
+                    );
+                    expect(reg(core, 31), 0, reason: 'stale candidate trapped');
+                  }
                 },
               );
             },
