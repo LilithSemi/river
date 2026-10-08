@@ -131,7 +131,6 @@ Future<void> runProgram(
     alignAddress: (address) => address,
     onInvalidRead: (_, width) => LogicValue.filled(width, LogicValue.zero),
   );
-  storage.loadMemString(memoryImage(words));
   final ack = Logic();
   final data = Logic(width: xlen.size);
   attachAdversarialMemory(
@@ -155,7 +154,9 @@ Future<void> runProgram(
   unawaited(Simulator.run());
   try {
     await clk.nextNegedge;
+    await clk.nextNegedge;
     reset.inject(0);
+    storage.loadMemString(memoryImage(words));
     if (!delayed) {
       for (var i = 0; i < lines.length; i++) {
         lines[i].inject((pending >> bits[i]) & 1);
