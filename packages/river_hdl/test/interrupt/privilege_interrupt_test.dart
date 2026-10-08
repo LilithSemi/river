@@ -82,12 +82,15 @@ Map<int, int> program({
 }
 
 String memoryImage(Map<int, int> words) {
-  final out = StringBuffer();
-  for (final entry in words.entries) {
-    out.write('@${entry.key.toRadixString(16)}\n');
+  // One contiguous byte image packs both RV32 and RV64 memory words. Separate
+  // four-byte @address records would leave holes inside RV64 fetch beats.
+  final out = StringBuffer('@0\n');
+  final end = words.keys.reduce((a, b) => a > b ? a : b);
+  for (var address = 0; address <= end + 4; address += 4) {
+    final word = words[address] ?? 0x13;
     for (var byte = 0; byte < 4; byte++) {
       out.write(
-        '${((entry.value >> (8 * byte)) & 255).toRadixString(16).padLeft(2, '0')} ',
+        '${((word >> (8 * byte)) & 255).toRadixString(16).padLeft(2, '0')} ',
       );
     }
     out.writeln();
