@@ -323,6 +323,11 @@ abstract class ExecutionUnit extends Module {
   final int vlen;
   final bool hasSupervisor;
   final bool hasUser;
+  final bool enableMisalignedLoads;
+  Logic get misalignedLoad => output('misalignedLoad');
+  Logic get loadSize => output('loadSize');
+  late final Logic _misalignedLoadAllowed;
+  late final Logic? _loadFaultTval;
   // When true the mul family uses the shared multi-cycle IterativeMultiplier
   // (chunk multiply reused per cycle) instead of a single-cycle partial-product
   // tree. The area sign is config-dependent (measured both ways: iterative loses
@@ -601,6 +606,8 @@ abstract class ExecutionUnit extends Module {
     DataPortInterface? microcodeRead,
     this.hasSupervisor = false,
     this.hasUser = false,
+    this.enableMisalignedLoads = false,
+    Logic? loadFaultTval,
     this.useIterativeMul = true,
     required this.microcode,
     required this.mxlen,
@@ -662,6 +669,15 @@ abstract class ExecutionUnit extends Module {
       fetchAccessFault ?? Const(0),
     );
     _memAccessFault = addInput('memAccessFault', memAccessFault ?? Const(0));
+    _loadFaultTval = loadFaultTval == null
+        ? null
+        : addInput('loadFaultTval', loadFaultTval, width: mxlen.size);
+    addOutput('misalignedLoad');
+    addOutput('loadSize', width: 3);
+    if (!enableMisalignedLoads) {
+      misalignedLoad <= Const(0);
+      loadSize <= Const(2, width: 3);
+    }
     _fetchFaultTval = fetchFaultTval == null
         ? null
         : addInput('fetchFaultTval', fetchFaultTval, width: mxlen.size);
@@ -674,6 +690,32 @@ abstract class ExecutionUnit extends Module {
       instrIndex,
       width: microcode.opIndexWidth,
     );
+
+    const integerLoads = {
+      'lb',
+      'lbu',
+      'lh',
+      'lhu',
+      'lw',
+      'lwu',
+      'ld',
+      'c.lw',
+      'c.ld',
+      'c.lwsp',
+      'c.ldsp',
+      'c.lh',
+      'c.lhu',
+      'c.lbu',
+    };
+    Logic allowed = Const(0);
+    if (enableMisalignedLoads) {
+      for (final entry in microcode.execLookup.entries) {
+        if (integerLoads.contains(entry.value.mnemonic)) {
+          allowed |= instrIndex.eq(entry.key);
+        }
+      }
+    }
+    _misalignedLoadAllowed = allowed;
 
     instrTypeMap = Map.fromEntries(
       instrTypeMap.entries.map(
@@ -1317,6 +1359,7 @@ abstract class ExecutionUnit extends Module {
           mopStep < 0,
           done < 0,
           fpFlags < 0,
+          if (enableMisalignedLoads) ...[misalignedLoad < 0, loadSize < 2],
           output('trap') < 0,
           output('trapInterrupt') < 0,
           output('trapEpc') < currentPc,
@@ -1526,6 +1569,7 @@ abstract class ExecutionUnit extends Module {
                 this.csrWrite!.data < 0,
               ],
               fence < 0,
+              if (enableMisalignedLoads) ...[misalignedLoad < 0, loadSize < 2],
               interruptHold < 0,
               nextPc < currentPc,
               nextSp < currentSp,
@@ -1796,6 +1840,13 @@ abstract class ExecutionUnit extends Module {
     if (t == Trap.instructionPageFault && _fetchFaultTval != null) {
       tval = _fetchFaultTval;
     }
+    if (t == Trap.loadPageFault && _loadFaultTval != null) {
+      tval = mux(
+        misalignedLoad,
+        _loadFaultTval,
+        tval ?? Const(0, width: mxlen.size),
+      );
+    }
     return rawTrap(trapInterrupt, causeCode, tval, suffix);
   }
 
@@ -1836,6 +1887,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
     DataPortInterface microcodeRead, {
     super.hasSupervisor,
     super.hasUser,
+    super.enableMisalignedLoads,
+    super.loadFaultTval,
     required super.microcode,
     required super.mxlen,
     super.vlen = 128,
@@ -3394,10 +3447,25 @@ class DynamicExecutionUnit extends ExecutionUnit {
                           [
                             If(
                               ((opBase + imm) &
-                                      Const(size.bytes - 1, width: mxlen.size))
-                                  .neq(0),
+                                          Const(
+                                            size.bytes - 1,
+                                            width: mxlen.size,
+                                          ))
+                                      .neq(0) &
+                                  ~_misalignedLoadAllowed,
                               then: doTrap(Trap.misalignedLoad, opBase + imm),
                               orElse: [
+                                if (enableMisalignedLoads) ...[
+                                  misalignedLoad <
+                                      ((opBase + imm) &
+                                              Const(
+                                                size.bytes - 1,
+                                                width: mxlen.size,
+                                              ))
+                                          .neq(0),
+                                  loadSize <
+                                      Const(size.bytes.bitLength - 1, width: 3),
+                                ],
                                 memRead.en < 1,
                                 memRead.addr < (opBase + imm),
                               ],
@@ -4086,6 +4154,8 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.rs2Read,
     super.rdWrite, {
     super.hasSupervisor = false,
+    super.enableMisalignedLoads,
+    super.loadFaultTval,
     super.hasUser = false,
     required super.microcode,
     required super.mxlen,
@@ -5448,16 +5518,30 @@ class StaticExecutionUnit extends ExecutionUnit {
               final byteOff = addr & Const(busBytes - 1, width: mxlen.size);
               final shifted =
                   memRead.data >> (byteOff * Const(8, width: mxlen.size));
-              final raw = shifted.slice(mop.size.bits - 1, 0);
+              final raw = mux(
+                unaligned & _misalignedLoadAllowed,
+                memRead.data,
+                shifted,
+              ).slice(mop.size.bits - 1, 0);
 
               steps.add(
                 CaseItem(Const(i, width: maxLen.bitLength), [
                   If(
-                    unaligned,
+                    unaligned & ~_misalignedLoadAllowed,
                     then: doTrap(Trap.misalignedLoad, addr, '_${op.mnemonic}'),
                     orElse: [
+                      if (enableMisalignedLoads) ...[
+                        misalignedLoad < unaligned,
+                        loadSize <
+                            Const(mop.size.bytes.bitLength - 1, width: 3),
+                      ],
                       memRead.en < 1,
-                      memRead.addr < alignedAddr,
+                      memRead.addr <
+                          mux(
+                            unaligned & _misalignedLoadAllowed,
+                            addr,
+                            alignedAddr,
+                          ),
                       mopStep < mopStep + 1,
                     ],
                   ),
