@@ -824,6 +824,9 @@ abstract class ExecutionUnit extends Module {
     _fpRm = mux(instructionRm.eq(Const(7, width: 3)), frmIn, instructionRm);
     final fpUnitRm = _fpControlEnabled ? _fpRm : Const(0, width: 3);
     Logic fpInstruction = Const(0), roundedInstruction = Const(0);
+    // Lowest mode each operation needs. Harbor marks mret 3 and the supervisor
+    // ops 1, the same encoding currentMode uses.
+    Logic needsSupervisor = Const(0), needsMachine = Const(0);
     const roundedFunctions = {
       RiscVFpuFunct.fadd,
       RiscVFpuFunct.fsub,
@@ -858,6 +861,12 @@ abstract class ExecutionUnit extends Module {
         (mop) => mop is RiscVFpuOp && roundedFunctions.contains(mop.funct),
       )) {
         roundedInstruction = roundedInstruction | hit;
+      }
+      final level = entry.value.privilegeLevel;
+      if (level == PrivilegeMode.supervisor.id) {
+        needsSupervisor = needsSupervisor | hit;
+      } else if (level == PrivilegeMode.machine.id) {
+        needsMachine = needsMachine | hit;
       }
     }
     addOutput('done');
@@ -900,6 +909,19 @@ abstract class ExecutionUnit extends Module {
         mopStep.eq(0) &
         ((fpInstruction & ~fpEnabledIn) |
             (roundedInstruction & _fpRm.gt(Const(4, width: 3))));
+
+    // Trap an operation that needs more privilege than the current mode, so
+    // mret, sret and the supervisor fences do not run from U-mode.
+    final requiredPriv = mux(
+      needsMachine,
+      Const(PrivilegeMode.machine.id, width: 3),
+      mux(
+        needsSupervisor,
+        Const(PrivilegeMode.supervisor.id, width: 3),
+        Const(PrivilegeMode.user.id, width: 3),
+      ),
+    );
+    final privIllegal = mopStep.eq(0) & currentMode.lt(requiredPriv);
 
     final alu = Logic(name: 'aluState', width: mxlen.size);
     final rs1 = Logic(name: 'rs1State', width: mxlen.size);
@@ -1380,7 +1402,7 @@ abstract class ExecutionUnit extends Module {
                 ),
                 orElse: [
                   If(
-                    fetchFaultIn | fpIllegal,
+                    fetchFaultIn | fpIllegal | privIllegal,
                     then: [
                       If(
                         fetchFaultIn,
