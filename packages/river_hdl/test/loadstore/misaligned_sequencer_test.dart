@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:river/river.dart';
+import 'package:river_hdl/river_hdl.dart';
 import 'package:river_hdl/src/core/misaligned_load.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
@@ -81,6 +83,58 @@ class Rig {
 
 void main() {
   tearDown(Simulator.reset);
+  for (final kind in [
+    'overlap',
+    'host overflow overlap',
+    'negative',
+    'empty',
+    'beyond XLEN',
+  ]) {
+    test('reject invalid PMA: $kind', () {
+      final high = kind == 'host overflow overlap';
+      final xlen = high ? RiscVMxlen.rv64 : RiscVMxlen.rv32;
+      final regions = switch (kind) {
+        'overlap' => const [
+          HarborPmaRegion.memory(start: 0x1000, size: 4096),
+          HarborPmaRegion.io(start: 0x1800, size: 256),
+        ],
+        'host overflow overlap' => [
+          HarborPmaRegion.memory(start: 1 << 62, size: 1 << 62),
+          HarborPmaRegion.io(start: (1 << 62) + 4096, size: 256),
+        ],
+        'negative' => const [HarborPmaRegion.memory(start: -1, size: 4096)],
+        'empty' => const [HarborPmaRegion.memory(start: 0, size: 0)],
+        _ => const [HarborPmaRegion.memory(start: 0xfffffff0, size: 64)],
+      };
+      expect(
+        () => RiverCore(
+          RiverCoreConfig(
+            mxlen: xlen,
+            type: RiverCoreType.general,
+            extensions: [rv32i, if (high) rv64i],
+            interrupts: [],
+            mmu: HarborMmuConfig(
+              mxlen: xlen,
+              pagingModes: const [RiscVPagingMode.bare],
+              pmp: HarborPmpConfig.none,
+              pma: HarborPmaConfig(regions: regions),
+            ),
+            clock: const HarborClockConfig(
+              name: 'test',
+              rate: HarborFixedClockRate(100000000),
+            ),
+          ),
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message,
+            'message',
+            contains(kind.contains('overlap') ? 'Overlapping' : 'Invalid'),
+          ),
+        ),
+      );
+    });
+  }
   for (final width in [32, 64]) {
     for (final operation in [
       'cancel first',
