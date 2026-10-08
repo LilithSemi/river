@@ -300,7 +300,7 @@ void main() {
                 sie: true,
               ),
               pending: c.$2,
-              observe: (_, __, ___) {},
+              observe: (_, _, _) {},
               check: (core) {
                 expect(reg(core, 31), 1, reason: 'handler did not finish');
                 expect(reg(core, 24), c.$5);
@@ -323,7 +323,7 @@ void main() {
                 sie: true,
               ),
               pending: 1 << source,
-              observe: (_, __, ___) {},
+              observe: (_, _, _) {},
               check: (core) {
                 expect(reg(core, 30), 1);
                 expect(reg(core, 31), 0);
