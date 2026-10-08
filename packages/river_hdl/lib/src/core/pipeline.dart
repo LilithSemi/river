@@ -86,6 +86,8 @@ class RiverPipeline extends Module {
     bool useMixedDecoders = false,
     bool useMixedExecution = false,
     bool hasSupervisor = false,
+    bool enableMisalignedLoads = false,
+    Logic? loadFaultTval,
     bool hasUser = false,
     bool hasCompressed = false,
     required this.microcode,
@@ -362,6 +364,11 @@ class RiverPipeline extends Module {
       'ifetchAccessFault',
       ifetchAccessFault ?? Const(0),
     );
+    final loadFaultTvalIn = loadFaultTval == null
+        ? null
+        : addInput('loadFaultTval', loadFaultTval, width: mxlen.size);
+    addOutput('misalignedLoad');
+    addOutput('loadSize', width: 3);
     final memAccessFaultIn = addInput(
       'memAccessFault',
       memAccessFault ?? Const(0),
@@ -640,6 +647,8 @@ class RiverPipeline extends Module {
                   ? fetcher.output('fetch_fault_tval')
                   : null,
               memAccessFault: memAccessFaultIn,
+              enableMisalignedLoads: enableMisalignedLoads,
+              loadFaultTval: loadFaultTvalIn,
               frm: frmIn,
               fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
@@ -686,6 +695,8 @@ class RiverPipeline extends Module {
                   ? fetcher.output('fetch_fault_tval')
                   : null,
               memAccessFault: memAccessFaultIn,
+              enableMisalignedLoads: enableMisalignedLoads,
+              loadFaultTval: loadFaultTvalIn,
               frm: frmIn,
               fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
@@ -812,12 +823,16 @@ class RiverPipeline extends Module {
       // Combinational passthrough (NOT registered) so it tracks the direct
       // exec mem-port -> dport timing throughout the MMU walk.
       output('memGuest') <= exec.memGuest;
+      output('misalignedLoad') <= exec.misalignedLoad;
+      output('loadSize') <= exec.loadSize;
     } else {
       // =======================================================================
       // OoO dual-issue pipeline
       // =======================================================================
 
       fpFlags <= Const(0, width: 5);
+      output('misalignedLoad') <= Const(0);
+      output('loadSize') <= Const(2, width: 3);
       // Decoded field signals (combinational from decoder)
       final decoderFields = decoder0.fields;
       final decodedRd = (decoderFields['rd'] ?? Const(0, width: 5))

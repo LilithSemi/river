@@ -48,6 +48,9 @@ class RiverMmu extends Module {
     required this.mmuConfig,
     required this.busConfig,
     Logic? wbErr,
+    // Opt-in full-beat reads from the misaligned integer-load sequencer.
+    // Check the translated physical beat against explicit safe RAM PMAs.
+    Logic? restrictedRead,
     Logic? satpMode,
     Logic? satpRoot,
     // Hypervisor two-stage: when [virtIn]=1 and [gMode]!=0, the (VS-stage)
@@ -81,6 +84,13 @@ class RiverMmu extends Module {
     super.name = 'river_mmu',
   }) {
     final xlen = mmuConfig.mxlen.size;
+    final checkMisaligned = restrictedRead != null;
+    final restrictedIn = restrictedRead == null
+        ? Const(0)
+        : addInput('restrictedRead', restrictedRead);
+    final restrictedR = checkMisaligned
+        ? Logic(name: 'restrictedReadR')
+        : Const(0);
 
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
@@ -475,6 +485,69 @@ class RiverMmu extends Module {
     final ackLive = (cycR & wbAck & ~wbErr).named('ackLive');
     final errLive = (cycR & wbErr).named('errLive');
 
+    Logic blockedRead = Const(0);
+    Logic invalidLoadVa = Const(0);
+    if (checkMisaligned) {
+      if (mmuConfig.pmp.entries != 0 ||
+          mmuConfig.hasPageBasedMemoryTypes ||
+          hasTwoStage) {
+        throw ArgumentError(
+          'Restricted loads require non-H, no PMP and no PBMT',
+        );
+      }
+      final limit = BigInt.one << busConfig.addressWidth;
+      Logic permitted = Const(0);
+      for (var i = 0; i < mmuConfig.pma.regions.length; i++) {
+        final region = mmuConfig.pma.regions[i];
+        final start = BigInt.from(region.start);
+        final end = start + BigInt.from(region.size);
+        if (start < BigInt.zero || region.size <= 0 || end > limit) {
+          throw ArgumentError('Invalid physical PMA range');
+        }
+        // Use mathematical addresses: signed host-int overflow must not hide
+        // an overlap between a RAM permission and a device region.
+        for (var j = 0; j < i; j++) {
+          final other = mmuConfig.pma.regions[j];
+          final otherStart = BigInt.from(other.start);
+          final otherEnd = otherStart + BigInt.from(other.size);
+          if (start < otherEnd && otherStart < end) {
+            throw ArgumentError('Overlapping physical PMA regions');
+          }
+        }
+        if (region.memoryType != HarborPmaMemoryType.memory ||
+            !region.readable ||
+            !region.idempotent ||
+            !region.misalignedSupport ||
+            !region.accessWidths.contains(busConfig.dataWidth ~/ 8)) {
+          continue;
+        }
+        // The entire overfetched beat must be safe, not merely its first byte.
+        final last =
+            adrR.zeroExtend(busConfig.addressWidth + 1) +
+            Const(
+              busConfig.dataWidth ~/ 8 - 1,
+              width: busConfig.addressWidth + 1,
+            );
+        permitted |=
+            adrR.gte(Const(start, width: busConfig.addressWidth)) &
+            last.lt(Const(end, width: busConfig.addressWidth + 1));
+      }
+      blockedRead =
+          cycR &
+          restrictedR &
+          arbState.eq(1) &
+          ~weR &
+          ~permitted &
+          (hasPaging ? ~walking & ~adWrite : Const(1));
+      if (hasPaging && xlen == 64) {
+        for (final entry in [(8, 39), (9, 48), (10, 57)]) {
+          invalidLoadVa |=
+              satpMode!.eq(entry.$1) &
+              dportAddr.neq(dportAddr.getRange(0, entry.$2).signExtend(xlen));
+        }
+      }
+    }
+
     Sequential(clk, [
       If(
         reset,
@@ -511,6 +584,7 @@ class RiverMmu extends Module {
           adrR < 0,
           datMosiR < 0,
           selR < 0,
+          if (checkMisaligned) restrictedR < 0,
           walking < 0,
           walkArmed < 0,
           walkAddr < 0,
@@ -560,7 +634,7 @@ class RiverMmu extends Module {
             // A physical bus error terminates the ORIGINAL access, including
             // errors reading PTEs or writing A/D bits. Leave the page/guest
             // fault flags clear: done & !valid & !fault denotes an access fault.
-            Iff(busActive & errLive, [
+            Iff(busActive & (errLive | blockedRead), [
               cycR < 0,
               stbR < 0,
               busActive < 0,
@@ -930,7 +1004,24 @@ class RiverMmu extends Module {
 
             // Idle, arbitrate (dport > ifetch); pause one cycle after a
             // completion so the requester can update its address first.
+            if (checkMisaligned && hasPaging)
+              Iff(
+                ~busActive &
+                    ~justCompleted &
+                    dportEn &
+                    restrictedIn &
+                    dataPagingOn &
+                    invalidLoadVa,
+                [
+                  dpDoneR < 1,
+                  dpValidR < 0,
+                  dpFaultR < 1,
+                  justCompleted < 1,
+                  arbState < 0,
+                ],
+              ),
             Iff(~busActive & ~justCompleted & dportEn, [
+              if (checkMisaligned) restrictedR < restrictedIn,
               arbState < 1,
               busActive < 1,
               isFetchWalk < 0,
@@ -1175,8 +1266,10 @@ class RiverMmu extends Module {
     dportFault <= dpFaultR;
     ifetchFault <= ifFaultR;
     dportFaultGuest <= dpFaultGuestR;
-    wbCyc <= cycR;
-    wbStb <= stbR;
+    // A rejected data beat never reaches the external bus. Page-table traffic
+    // retains the existing translation path and fault handling.
+    wbCyc <= cycR & ~blockedRead;
+    wbStb <= stbR & ~blockedRead;
     wbWe <= weR;
     // Wishbone byte-lane convention at the bus boundary. The FSM tracks exact
     // byte addresses, lane-0 write data, and an unshifted size mask in selR; the

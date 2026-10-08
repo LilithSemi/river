@@ -6,6 +6,7 @@ import 'data_port.dart';
 
 import 'core/csr.dart';
 import 'core/mmu.dart';
+import 'core/misaligned_load.dart';
 import 'core/pipeline.dart';
 import 'inferred_rom.dart';
 
@@ -328,6 +329,60 @@ class RiverCore extends BridgeModule {
       config.mxlen.size,
       config.mxlen.size,
     );
+    // The current D-cache is virtually addressed before translation and has
+    // no physical PMA check on hits. Keep its existing alignment traps. Likewise
+    // do not advertise this path with unimplemented PMP/PBMT or H/OoO contexts.
+    // A platform opts in by describing safe, full-beat-readable RAM in its PMAs.
+    final enableMisalignedLoads =
+        config.l1cache == null &&
+        !config.hasHypervisor &&
+        config.executionMode != ExecutionMode.outOfOrder &&
+        config.mmu.pmp.entries == 0 &&
+        !config.mmu.hasPageBasedMemoryTypes &&
+        config.mmu.pagingModes.every(
+          (m) =>
+              m == RiscVPagingMode.bare ||
+              (config.mxlen == RiscVMxlen.rv64 && m == RiscVPagingMode.sv39),
+        ) &&
+        wbConfig.dataWidth == config.mxlen.size &&
+        wbConfig.addressWidth == config.mxlen.size &&
+        wbConfig.effectiveSelWidth == config.mxlen.size ~/ 8 &&
+        config.mmu.pma.regions.any(
+          (r) =>
+              r.memoryType == HarborPmaMemoryType.memory &&
+              r.readable &&
+              r.idempotent &&
+              r.misalignedSupport &&
+              r.accessWidths.contains(config.mxlen.size ~/ 8),
+        );
+    final loadMisaligned = Logic(name: 'loadMisaligned');
+    final loadSize = Logic(name: 'loadSize', width: 3);
+    final loadPageFault = Logic(name: 'loadPageFault');
+    final mmuExecRead = enableMisalignedLoads
+        ? DataPortInterface(config.mxlen.size, config.mxlen.size)
+        : pipeExecRead;
+    final loadUnit = enableMisalignedLoads
+        ? MisalignedLoad(
+            clk,
+            reset,
+            pipeExecRead.en,
+            pipeExecRead.addr,
+            loadSize,
+            loadMisaligned,
+            mmuExecRead.done,
+            mmuExecRead.valid,
+            mmuExecRead.data,
+            loadPageFault,
+          )
+        : null;
+    if (loadUnit != null) {
+      mmuExecRead.en <= loadUnit.readEnable;
+      mmuExecRead.addr <= loadUnit.readAddress;
+      pipeExecRead.done <= loadUnit.done;
+      pipeExecRead.valid <= loadUnit.valid;
+      pipeExecRead.data <= loadUnit.data;
+    }
+
     // Exec write: pipeline drives en/addr/data (with sized prefix), MMU responds done/valid
     final pipeExecWrite = DataPortInterface(
       config.mxlen.size + 7,
@@ -359,11 +414,11 @@ class RiverCore extends BridgeModule {
       ),
     );
 
-    final dportEn = mux(execWriteActive, Const(1), pipeExecRead.en);
+    final dportEn = mux(execWriteActive, Const(1), mmuExecRead.en);
     final dportAddr = mux(
       execWriteActive,
       pipeExecWrite.addr,
-      pipeExecRead.addr,
+      mmuExecRead.addr,
     );
     final dportWe = execWriteActive;
     final dportWdata = mux(
@@ -371,7 +426,17 @@ class RiverCore extends BridgeModule {
       writeValue.zeroExtend(config.mxlen.size),
       Const(0, width: config.mxlen.size),
     );
-    final dportSize = mux(execWriteActive, writeLog2Size, Const(2, width: 3));
+    final dportSize = mux(
+      execWriteActive,
+      writeLog2Size,
+      loadUnit == null
+          ? Const(2, width: 3)
+          : mux(
+              loadUnit.restricted,
+              Const((config.mxlen.size ~/ 8).bitLength - 1, width: 3),
+              Const(2, width: 3),
+            ),
+    );
 
     // Wishbone responses from the external bus
     final wbAckExt = Logic(name: 'wbAckExt');
@@ -563,6 +628,7 @@ class RiverCore extends BridgeModule {
       wbDatMisoExt,
       mmuConfig: config.mmu,
       busConfig: wbConfig,
+      restrictedRead: loadUnit?.restricted,
       wbErr: wbErrExt,
       satpMode: config.mmu.hasPaging ? satpModeWire : null,
       satpRoot: config.mmu.hasPaging ? satpRootWire : null,
@@ -664,9 +730,9 @@ class RiverCore extends BridgeModule {
           (dcache.respValid | dcache.respFault) & execWriteActive;
       pipeExecWrite.valid <= dcache.respValid & execWriteActive;
     } else {
-      pipeExecRead.done <= mmu.dportDone & ~execWriteActive;
-      pipeExecRead.valid <= mmu.dportValid & ~execWriteActive;
-      pipeExecRead.data <= mmu.dportRdata;
+      mmuExecRead.done <= mmu.dportDone & ~execWriteActive;
+      mmuExecRead.valid <= mmu.dportValid & ~execWriteActive;
+      mmuExecRead.data <= mmu.dportRdata;
 
       pipeExecWrite.done <= mmu.dportDone & execWriteActive;
       pipeExecWrite.valid <= mmu.dportValid & execWriteActive;
@@ -1517,6 +1583,8 @@ class RiverCore extends BridgeModule {
       interruptCause = interruptCauseReg.named('interruptCause');
     }
 
+    loadPageFault <= mmu.dportFault;
+
     // Pipeline.
     pipeline = RiverPipeline(
       clk,
@@ -1569,11 +1637,17 @@ class RiverCore extends BridgeModule {
       mstateen0Se0: csrs?.mstateen0Se0,
       hstateen0Se0: csrs?.hstateen0Se0,
       memFaultGuest: config.hasHypervisor ? mmu.dportFaultGuest : null,
+      enableMisalignedLoads: enableMisalignedLoads,
+      loadFaultTval: loadUnit?.faultAddress,
       memAccessFault: !handleAccessFaults
           ? null
           : (useDCache
                 ? dcache!.respFaultIsAccess
-                : mmu.dportDone & ~mmu.dportValid & ~mmu.dportFault),
+                : mux(
+                    loadMisaligned,
+                    loadUnit?.accessFault ?? Const(0),
+                    mmu.dportDone & ~mmu.dportValid & ~mmu.dportFault,
+                  )),
       ifetchAccessFault: !handleAccessFaults
           ? null
           : (useICache
@@ -1622,6 +1696,8 @@ class RiverCore extends BridgeModule {
     // machine at random.
     icFlush <= pipeline.fence;
     mmuTlbFlush <= pipeline.fence;
+    loadMisaligned <= pipeline.output('misalignedLoad');
+    loadSize <= pipeline.output('loadSize');
     if (useDCache) dFlush <= pipeline.fence;
 
     // An access is guest-translated when the core is virtualized OR the current
