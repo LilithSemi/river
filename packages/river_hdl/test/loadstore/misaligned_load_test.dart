@@ -20,17 +20,36 @@ int load(int rd, int rs, int offset, int funct) =>
     ((offset & 4095) << 20) | (rs << 15) | (funct << 12) | (rd << 7) | 3;
 int shift(int rd, int amount) =>
     (amount << 20) | (rd << 15) | (1 << 12) | (rd << 7) | 0x13;
-List<int> li(int rd, int value) => [
-  ((value + 2048) & 0xfffff000) | (rd << 7) | 0x37,
-  addi(rd, rd, value),
-];
+List<int> li(int rd, int value) {
+  if (value < 0x80000000) {
+    return [
+      ((value + 2048) & 0xfffff000) | (rd << 7) | 0x37,
+      addi(rd, rd, value),
+    ];
+  }
+  final chunks = <int>[];
+  while (value > 2047) {
+    chunks.add(value & 2047);
+    value >>= 11;
+  }
+  return [
+    addi(rd, 0, value),
+    for (final chunk in chunks.reversed) ...[
+      shift(rd, 11),
+      addi(rd, rd, chunk),
+    ],
+  ];
+}
+
 int byteAt(int address) => ((address * 37) ^ (address >> 4) ^ 0x95) & 255;
 BigInt reference(int address, int size, bool unsigned, int width) {
   var value = BigInt.zero;
-  for (var i = 0; i < size; i++)
+  for (var i = 0; i < size; i++) {
     value |= BigInt.from(byteAt(address + i)) << (8 * i);
-  if (!unsigned && ((value >> (size * 8 - 1)) & BigInt.one) != BigInt.zero)
+  }
+  if (!unsigned && ((value >> (size * 8 - 1)) & BigInt.one) != BigInt.zero) {
     value -= BigInt.one << (size * 8);
+  }
   return value.toUnsigned(width);
 }
 
@@ -52,16 +71,26 @@ Future<void> runLoad(
       scenario.startsWith('page') ||
       scenario.startsWith('pte') ||
       scenario == 'noncontiguous' ||
-      scenario == 'physical IO';
-  final crossingPage = paged;
-  final address = crossingPage ? virtualRam + 4096 - 2 : ram + offset;
+      scenario == 'physical IO' ||
+      scenario == 'supervisor';
+  final address = scenario == 'page noncanonical'
+      ? (1 << 38) + 2
+      : scenario == 'page canonical second'
+      ? (1 << 38) - 2
+      : paged
+      ? virtualRam + 4096 - 2
+      : ram + offset;
+  final virtualPage = address & ~4095;
   final actualOffset = address & (busBytes - 1);
   final split = actualOffset + bytes > busBytes;
   final regionDenied =
       scenario == 'IO' ||
       scenario == 'unknown' ||
       scenario == 'non-idempotent' ||
-      scenario == 'width';
+      scenario == 'width' ||
+      scenario == 'unreadable' ||
+      scenario == 'misalignment disabled' ||
+      scenario == 'partial first';
   final deniedSecond = scenario == 'physical IO';
   final config = RiverCoreConfig(
     resetVector: boot,
@@ -104,8 +133,14 @@ Future<void> runLoad(
                 const HarborPmaRegion.memory(start: 0x300000, size: 4096),
                 if (scenario != 'unknown')
                   HarborPmaRegion(
-                    start: ram,
-                    size: 4096,
+                    start: ram + (scenario == 'partial first' ? 1 : 0),
+                    size: scenario == 'partial first'
+                        ? 4095
+                        : scenario == 'partial second'
+                        ? busBytes + 1
+                        : 4096,
+                    readable: scenario != 'unreadable',
+                    misalignedSupport: scenario != 'misalignment disabled',
                     memoryType: scenario == 'IO'
                         ? HarborPmaMemoryType.io
                         : HarborPmaMemoryType.memory,
@@ -136,6 +171,14 @@ Future<void> runLoad(
       csrWrite(0x180, 15),
       ...li(16, (1 << 17) | (1 << 11)),
       csrWrite(0x300, 16),
+    ]);
+  }
+  if (scenario == 'supervisor') {
+    program.addAll([
+      (17 << 7) | 0x17,
+      addi(17, 17, 16),
+      csrWrite(0x341, 17),
+      0x30200073,
     ]);
   }
   if (scenario == 'fp') {
@@ -178,33 +221,60 @@ Future<void> runLoad(
       0x30200073,
     ]);
   } else {
-    handler.addAll([addi(19, 0, 1), 0x6f]);
+    handler.addAll([
+      ...li(12, 0x300000),
+      load(12, 12, 0, 2),
+      addi(19, 0, 1),
+      0x6f,
+    ]);
   }
   final image = <int, int>{};
   void put(int at, BigInt value, int size) {
-    for (var i = 0; i < size; i++)
+    for (var i = 0; i < size; i++) {
       image[at + i] = ((value >> (i * 8)) & BigInt.from(255)).toInt();
+    }
   }
 
-  for (var i = 0; i < program.length; i++)
+  for (var i = 0; i < program.length; i++) {
     put(boot + 4 * i, BigInt.from(program[i]), 4);
-  for (var i = 0; i < handler.length; i++)
+  }
+  for (var i = 0; i < handler.length; i++) {
     put(4 * i, BigInt.from(handler[i]), 4);
-  int physical(int va) => va < virtualRam + 4096
-      ? ram + va - virtualRam
-      : secondRam + va - virtualRam - 4096;
+  }
+  put(0x300000, BigInt.from(0x12345678), busBytes);
+  int physical(int va) => va < virtualPage + 4096
+      ? ram + va - virtualPage
+      : secondRam + va - virtualPage - 4096;
   if (paged) {
     final pteBytes = xlen.size ~/ 8;
     if (xlen == RiscVMxlen.rv64) {
-      put(root, BigInt.from(((0x41000 >> 12) << 10) | 1), pteBytes);
-      put(0x41000 + 3 * 8, BigInt.from(((leaf >> 12) << 10) | 1), pteBytes);
+      put(
+        root + ((virtualPage >> 30) & 511) * 8,
+        BigInt.from(((0x41000 >> 12) << 10) | 1),
+        pteBytes,
+      );
+      if (scenario == 'supervisor') {
+        put(0x41000, BigInt.from(((0x43000 >> 12) << 10) | 1), pteBytes);
+        put(
+          0x43000 + (boot >> 12) * 8,
+          BigInt.from(((boot >> 12) << 10) | 0xcb),
+          pteBytes,
+        );
+      }
+      put(
+        0x41000 + ((virtualPage >> 21) & 511) * 8,
+        BigInt.from(((leaf >> 12) << 10) | 1),
+        pteBytes,
+      );
     } else {
       put(root + 4, BigInt.from(((leaf >> 12) << 10) | 1), pteBytes);
     }
-    final leafIndex = (virtualRam >> 12) & (xlen.size == 64 ? 511 : 1023);
+    final leafIndex = (virtualPage >> 12) & (xlen.size == 64 ? 511 : 1023);
     put(
       leaf + leafIndex * pteBytes,
-      BigInt.from(((ram >> 12) << 10) | 0xc7),
+      scenario == 'page first'
+          ? BigInt.zero
+          : BigInt.from(((ram >> 12) << 10) | 0xc7),
       pteBytes,
     );
     put(
@@ -221,8 +291,9 @@ Future<void> runLoad(
       image[physical(address + i)] = byteAt(address + i);
     }
   } else {
-    for (var i = -busBytes; i < bytes + busBytes; i++)
+    for (var i = -busBytes; i < bytes + busBytes; i++) {
       image[address + i] = byteAt(address + i);
+    }
   }
   final firstAddress = (paged ? physical(address) : address) & ~(busBytes - 1);
   final secondAddress = paged ? secondRam : firstAddress + busBytes;
@@ -274,6 +345,17 @@ Future<void> runLoad(
       final active =
           core.output('dataBus_CYC').value.toBool() &&
           core.output('dataBus_STB').value.toBool();
+      final busAddress = core.output('dataBus_ADR').value.toInt();
+      if (!emulate &&
+          active &&
+          ((busAddress >= ram && busAddress < ram + 4096) ||
+              (busAddress >= secondRam && busAddress < secondRam + 4096))) {
+        expect(
+          reg(11),
+          0x55,
+          reason: 'destination changed before the read completed',
+        );
+      }
       if (responding) {
         ack.inject(0);
         err.inject(0);
@@ -290,8 +372,9 @@ Future<void> runLoad(
         if (--delay == 0) {
           final bad = requestAddress == errorAddress;
           var value = BigInt.zero;
-          for (var i = 0; i < busBytes; i++)
+          for (var i = 0; i < busBytes; i++) {
             value |= BigInt.from(image[requestAddress + i] ?? 0) << (8 * i);
+          }
           data.inject(LogicValue.ofBigInt(value, xlen.size));
           err.inject(bad ? 1 : 0);
           ack.inject(!bad || ackAndErr ? 1 : 0);
@@ -310,8 +393,9 @@ Future<void> runLoad(
         armed = true;
       }
       if (started < 0 &&
-          core.pipeline.input('currentPc').value.toInt() == loadPc)
+          core.pipeline.input('currentPc').value.toInt() == loadPc) {
         started = cycle;
+      }
       if (reg(18) == 0x66 || reg(19) == 1) {
         reached = true;
         finished = cycle;
@@ -350,7 +434,8 @@ Future<void> runLoad(
         deniedSecond ||
         scenario.startsWith('bus') ||
         scenario.startsWith('page') ||
-        scenario.startsWith('pte');
+        scenario.startsWith('pte') ||
+        scenario == 'partial second';
     if (emulate) {
       expect(reg(18), 0x66);
       expect(
@@ -383,13 +468,30 @@ Future<void> runLoad(
             : address,
       );
       expect(reg(11), 0x55);
+      expect(
+        reg(12),
+        0x12345678,
+        reason: 'a following aligned load did not recover',
+      );
       expect(reg(18), 0);
+      if (scenario == 'page noncanonical') {
+        expect(
+          transactions.where(
+            (t) => t.address >= root && t.address < root + 0x4000,
+          ),
+          isEmpty,
+        );
+      }
       if (scenario != 'bus second') {
         expect(dataReads.where((t) => t.address == secondAddress), isEmpty);
       }
       if (scenario == 'bus second') {
         expect(dataReads.length, 2);
-      } else if (fallback || regionDenied || scenario == 'bus first') {
+      } else if (fallback ||
+          regionDenied ||
+          scenario == 'bus first' ||
+          scenario == 'page first' ||
+          scenario == 'page noncanonical') {
         expect(dataReads.length, scenario == 'bus first' ? 1 : 0);
       } else {
         expect(dataReads.length, 1);
@@ -411,11 +513,12 @@ Future<void> runLoad(
           address: firstAddress,
           sel: (1 << busBytes) - 1,
         ));
-        if (split)
+        if (split) {
           expect(dataReads.last, (
             address: secondAddress,
             sel: (1 << busBytes) - 1,
           ));
+        }
       } else {
         // Preserve the existing executor/MMU convention, including its legacy
         // fixed read-size mask. This is an equivalence control, not a claim
@@ -453,12 +556,20 @@ void main() {
           'unknown',
           'non-idempotent',
           'width',
+          'unreadable',
+          'misalignment disabled',
+          'partial first',
+          'partial second',
           'bus first',
           'bus second',
           // Upstream's MMU does not currently elaborate Sv32; do not turn
           // that unrelated limitation into a misaligned-load implementation.
           if (xlen == RiscVMxlen.rv64) ...[
             'noncontiguous',
+            'supervisor',
+            'page first',
+            'page noncanonical',
+            'page canonical second',
             'page second',
             'page permission',
             'pte second',
@@ -474,7 +585,7 @@ void main() {
               () => runLoad(
                 xlen,
                 microcoded,
-                4,
+                scenario.startsWith('partial') ? 2 : 4,
                 false,
                 xlen.size ~/ 8 - 1,
                 scenario: scenario,
