@@ -271,6 +271,8 @@ void main() {
       );
       await rig.resetTap();
       await rig.scanIr(5, 0x11);
+      await rig.dmWrite(0x10, 1); // Activate before requesting other actions.
+      expect((await rig.dmRead(0x10)) & 1, 1);
 
       // Halt the hart.
       await rig.dmWrite(0x10, (1 << 31) | 1); // dmcontrol: haltreq | dmactive
