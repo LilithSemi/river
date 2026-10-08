@@ -103,6 +103,28 @@ class RiscVMstatusCsr extends CsrConfig {
                name: 'mxr',
                access: CsrFieldAccess.readWrite,
              ),
+           if (sup) ...[
+             // Let M-mode trap the supervisor operations it must virtualise:
+             // TVM the translation fences and satp, TSR sret, TW wfi.
+             CsrFieldConfig(
+               start: 20,
+               width: 1,
+               name: 'tvm',
+               access: CsrFieldAccess.readWrite,
+             ),
+             CsrFieldConfig(
+               start: 21,
+               width: 1,
+               name: 'tw',
+               access: CsrFieldAccess.readWrite,
+             ),
+             CsrFieldConfig(
+               start: 22,
+               width: 1,
+               name: 'tsr',
+               access: CsrFieldAccess.readWrite,
+             ),
+           ],
            if (hyp)
              CsrFieldConfig(
                start: 39,

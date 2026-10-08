@@ -1596,6 +1596,11 @@ class RiverCore extends BridgeModule {
       hasUser: config.hasUser,
       hasCompressed: config.extensions.any((e) => e.name == 'C'),
       frm: csrs?.frm,
+      // Undeclared mstatus bits read as X, so only take these where the
+      // supervisor fields exist.
+      tsr: csrs != null && config.hasSupervisor ? csrs.mstatus[22] : null,
+      tvm: csrs != null && config.hasSupervisor ? csrs.mstatus[20] : null,
+      tw: csrs != null && config.hasSupervisor ? csrs.mstatus[21] : null,
       fpEnabled: csrs?.hasFcsr == true
           ? csrs!.mstatus.slice(14, 13).or()
           : null,

@@ -625,6 +625,11 @@ abstract class ExecutionUnit extends Module {
     Logic? fetchFaultTval,
     Logic? memAccessFault,
     Logic? frm,
+    // mstatus trap-enable bits. These make an operation illegal in a mode its
+    // privilege level already allows, so they are separate from requiredPriv.
+    Logic? tsr,
+    Logic? tvm,
+    Logic? tw,
     Logic? fpEnabled,
     // Floating-point register ports. The FP register file belongs in the core
     // module next to the integer file, which is where the device target is
@@ -817,6 +822,9 @@ abstract class ExecutionUnit extends Module {
     addOutput('fpFlags', width: 5);
     _fpControlEnabled = frm != null;
     final frmIn = addInput('frm', frm ?? Const(0, width: 3), width: 3);
+    final tsrIn = addInput('tsr', tsr ?? Const(0));
+    final tvmIn = addInput('tvm', tvm ?? Const(0));
+    final twIn = addInput('tw', tw ?? Const(0));
     final fpEnabledIn = addInput('fpEnabled', fpEnabled ?? Const(1));
     final instructionRm = fields['funct3'] ?? Const(0, width: 3);
     _csrNoWrite =
@@ -827,6 +835,14 @@ abstract class ExecutionUnit extends Module {
     // Lowest mode each operation needs. Harbor marks mret 3 and the supervisor
     // ops 1, the same encoding currentMode uses.
     Logic needsSupervisor = Const(0), needsMachine = Const(0);
+    // Operations the mstatus trap bits single out by name.
+    const vmFences = {
+      'sfence.vma',
+      'sinval.vma',
+      'sfence.w.inval',
+      'sfence.inval.ir',
+    };
+    Logic isSret = Const(0), isVmFence = Const(0), isWfi = Const(0);
     const roundedFunctions = {
       RiscVFpuFunct.fadd,
       RiscVFpuFunct.fsub,
@@ -868,6 +884,10 @@ abstract class ExecutionUnit extends Module {
       } else if (level == PrivilegeMode.machine.id) {
         needsMachine = needsMachine | hit;
       }
+      final mnemonic = entry.value.mnemonic;
+      if (mnemonic == 'sret') isSret = isSret | hit;
+      if (mnemonic == 'wfi') isWfi = isWfi | hit;
+      if (vmFences.contains(mnemonic)) isVmFence = isVmFence | hit;
     }
     addOutput('done');
     addOutput('valid');
@@ -922,6 +942,16 @@ abstract class ExecutionUnit extends Module {
       ),
     );
     final privIllegal = mopStep.eq(0) & currentMode.lt(requiredPriv);
+
+    // TSR traps sret in S-mode, TVM the translation fences in S-mode, and TW
+    // wfi anywhere below machine mode.
+    final statusIllegal =
+        mopStep.eq(0) &
+        ((compareCurrentMode(PrivilegeMode.supervisor) &
+                ((isSret & tsrIn) | (isVmFence & tvmIn))) |
+            (isWfi &
+                twIn &
+                currentMode.lt(Const(PrivilegeMode.machine.id, width: 3))));
 
     final alu = Logic(name: 'aluState', width: mxlen.size);
     final rs1 = Logic(name: 'rs1State', width: mxlen.size);
@@ -1402,7 +1432,7 @@ abstract class ExecutionUnit extends Module {
                 ),
                 orElse: [
                   If(
-                    fetchFaultIn | fpIllegal | privIllegal,
+                    fetchFaultIn | fpIllegal | privIllegal | statusIllegal,
                     then: [
                       If(
                         fetchFaultIn,
@@ -1824,6 +1854,9 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.fetchFaultTval,
     super.memAccessFault,
     super.frm,
+    super.tsr,
+    super.tvm,
+    super.tw,
     super.fpEnabled,
     super.fpRs1Port,
     super.fpRs2Port,
@@ -4072,6 +4105,9 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.fetchFaultTval,
     super.memAccessFault,
     super.frm,
+    super.tsr,
+    super.tvm,
+    super.tw,
     super.fpEnabled,
     super.fpRs1Port,
     super.fpRs2Port,

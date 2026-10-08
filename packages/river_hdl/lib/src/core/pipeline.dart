@@ -129,6 +129,9 @@ class RiverPipeline extends Module {
     Logic? ifetchAccessFault,
     Logic? memAccessFault,
     Logic? frm,
+    Logic? tsr,
+    Logic? tvm,
+    Logic? tw,
     Logic? fpEnabled,
     DataPortInterface? rdWrite1,
     DataPortInterface? memFetchRead1,
@@ -381,6 +384,9 @@ class RiverPipeline extends Module {
     addOutput('trapTval', width: mxlen.size);
     addOutput('fpFlags', width: 5);
     final frmIn = frm == null ? null : addInput('frm', frm, width: 3);
+    final tsrIn = tsr == null ? null : addInput('tsr', tsr);
+    final tvmIn = tvm == null ? null : addInput('tvm', tvm);
+    final twIn = tw == null ? null : addInput('tw', tw);
     final fpEnabledIn = fpEnabled == null
         ? null
         : addInput('fpEnabled', fpEnabled);
@@ -641,6 +647,9 @@ class RiverPipeline extends Module {
                   : null,
               memAccessFault: memAccessFaultIn,
               frm: frmIn,
+              tsr: tsrIn,
+              tvm: tvmIn,
+              tw: twIn,
               fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
@@ -687,6 +696,9 @@ class RiverPipeline extends Module {
                   : null,
               memAccessFault: memAccessFaultIn,
               frm: frmIn,
+              tsr: tsrIn,
+              tvm: tvmIn,
+              tw: twIn,
               fpEnabled: fpEnabledIn,
               staticInstructions: staticInstructions,
               fpRs1Port: fpRs1Port,
