@@ -143,7 +143,8 @@ Future<void> main() async {
 
     // Halt.
     haltReq.inject(1);
-    for (var i = 0; i < 40; i++) {
+    // Allow the in-flight microcoded instruction to complete before halting.
+    for (var i = 0; i < 400; i++) {
       await clk.nextPosedge;
       if (core.output('debug_halted').value.toInt() == 1) break;
     }

@@ -120,6 +120,7 @@ class RiverCore extends BridgeModule {
     // the one stepped instruction commits (which re-enters Debug Mode, cause 4).
     Logic? stepping;
     Logic? haltReqIn;
+    Logic? boundaryHaltRequest;
     Logic? resumeReqIn;
     // Abstract-command register access (driven by the Debug Module while halted).
     Logic? dbgGprRead; // read a GPR onto the regfile read port
@@ -173,6 +174,21 @@ class RiverCore extends BridgeModule {
       haltReqIn = input('debug_halt_req');
       resumeReqIn = input('debug_resume_req');
       debugHalted = Logic(name: 'debugHalted');
+      if (boundaryDebug) {
+        final pending = Logic(name: 'boundaryHaltPending');
+        // Keep accepting one-cycle halt pulses while the current instruction
+        // drains. Clear on entry so an old request cannot halt a later resume.
+        Sequential(clk, [
+          If(
+            reset | debugHalted,
+            then: [pending < 0],
+            orElse: [
+              If(haltReqIn, then: [pending < 1]),
+            ],
+          ),
+        ]);
+        boundaryHaltRequest = haltReqIn | pending;
+      }
       debugDpc = Logic(name: 'debugDpc', width: config.mxlen.size);
       debugDcsr = Logic(name: 'debugDcsr', width: 32);
       if (userProbe) {
@@ -1856,7 +1872,9 @@ class RiverCore extends BridgeModule {
               // Debug Mode at the next PC (cause 4) and freeze the pipeline.
               if (withDebug)
                 If(
-                  boundaryDebug ? (stepping! | haltReqIn!) : stepping!,
+                  boundaryDebug
+                      ? (stepping! | boundaryHaltRequest!)
+                      : stepping!,
                   then: [
                     debugHalted! < 1,
                     pipelineEnable < 0,
@@ -1865,7 +1883,7 @@ class RiverCore extends BridgeModule {
                         (debugDcsr! & Const(0xFFFFFE3C, width: 32)) |
                             ((boundaryDebug
                                     ? mux(
-                                        haltReqIn!,
+                                        boundaryHaltRequest!,
                                         Const(3 << 6, width: 32),
                                         Const(4 << 6, width: 32),
                                       )
@@ -1993,7 +2011,8 @@ class RiverCore extends BridgeModule {
                   orElse: [
                     If(
                       boundaryDebug
-                          ? (haltReqIn! & (~pipelineEnable | interruptHold))
+                          ? (boundaryHaltRequest! &
+                                (~pipelineEnable | interruptHold))
                           : haltReqIn!,
                       then: [
                         debugHalted < 1,
