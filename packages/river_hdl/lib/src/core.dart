@@ -1433,16 +1433,61 @@ class RiverCore extends BridgeModule {
         ? null
         : addInput('prfSeedMode', prfSeedMode);
 
-    // Async interrupt take. Computes the highest-priority pending+enabled
-    // interrupt; the exec vectors it at an instruction boundary. M-interrupts
-    // (MSI/MTI/MEI = bits 3/7/11) are pending/enabled in mip/mie; S-interrupts
-    // (SSI/STI/SEI = 1/5/9) in the separate sip/sie (Weir writes sip.STIP for the
-    // SBI timer). Global enable per RISC-V: an M-interrupt is taken in S/U
-    // always and in M only if mstatus.MIE; an S-interrupt is taken in U always
-    // and in S only if sstatus.SIE, never in M. Priority MEI>MSI>MTI>SEI>SSI>STI.
+    // Select an asynchronous interrupt candidate. The executor accepts it at
+    // a clean instruction boundary and uses the ordinary trap-retirement path.
     Logic? interruptTake;
     Logic? interruptCause;
-    if (csrs != null) {
+    if (csrs != null &&
+        !config.hasHypervisor &&
+        config.executionMode != ExecutionMode.outOfOrder) {
+      // All sources share mip/mie (including hardware OR software SEIP).
+      // Source numbering does not determine the destination privilege.
+      final pending = (csrs.mip & csrs.mie).named('enabledInterrupts');
+      final delegated = config.hasSupervisor
+          ? csrs.mideleg
+          : Const(0, width: config.mxlen.size);
+      final isM = mode.eq(Const(PrivilegeMode.machine.id, width: 3));
+      final isS = mode.eq(Const(PrivilegeMode.supervisor.id, width: 3));
+      final isU = mode.eq(Const(PrivilegeMode.user.id, width: 3));
+      final mGlobal = ~isM | csrs.mstatus[3];
+      final sGlobal = (isS & csrs.mstatus[1]) | isU;
+      // Lowest priority first within each target. M-target interrupts must
+      // outrank S-target interrupts, even if the M source has a lower cause.
+      const order = [5, 1, 9, 7, 3, 11];
+      Logic take = Const(0);
+      Logic cause = Const(0, width: 6);
+      for (final supervisor in [true, false]) {
+        for (final bit in order) {
+          final eligible =
+              pending[bit] &
+              (supervisor
+                  ? delegated[bit] & sGlobal
+                  : ~delegated[bit] & mGlobal);
+          cause = mux(eligible, Const(bit, width: 6), cause);
+          take |= eligible;
+        }
+      }
+      // Keep the registered candidate. It is selection, not acceptance: exec
+      // accepts it only at a clean instruction boundary. Revalidate against
+      // current CSR/pending/privilege state, including priority, so a CSR write
+      // or xRET cannot deliver a stale candidate. An accepted trap completes
+      // through the existing exec/retirement path without further cancellation.
+      final candidateValid = Logic(name: 'interruptTakeReg');
+      final candidateCause = Logic(name: 'interruptCauseReg', width: 6);
+      Sequential(clk, [
+        If(
+          reset,
+          then: [candidateValid < 0, candidateCause < 0],
+          orElse: [candidateValid < take, candidateCause < cause],
+        ),
+      ]);
+      interruptTake = (candidateValid & take & candidateCause.eq(cause)).named(
+        'interruptTake',
+      );
+      interruptCause = candidateCause.named('interruptCause');
+    } else if (csrs != null) {
+      // Preserve the existing H/OoO delivery path; guest interrupt targeting
+      // and precise OoO acceptance require their own coordinated integration.
       final xlen = config.mxlen.size;
       final isM = mode.eq(Const(PrivilegeMode.machine.id, width: 3));
       final isS = mode.eq(Const(PrivilegeMode.supervisor.id, width: 3));
