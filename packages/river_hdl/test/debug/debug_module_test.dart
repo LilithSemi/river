@@ -199,6 +199,8 @@ void main() {
       await host.resetTap();
       await host.scanIr(5, 0x11);
 
+      await host.dmWrite(0x10, 1);
+      expect((await host.dmRead(0x10)) & 1, 1);
       // Write phase (sbreadonaddr off): set address, then write data0.
       await host.dmWrite(0x39, 0x40); // sbaddress0 = 0x40
       await host.dmWrite(0x3c, 0xCAFEBABE); // sbdata0 -> bus write

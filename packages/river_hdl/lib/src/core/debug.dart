@@ -6,9 +6,13 @@ import 'package:rohd/rohd.dart';
 ///
 /// The whole block lives in the system clock domain. `tck` is sampled and
 /// rising-edge detected, so one bitbang TCK pulse advances the TAP by exactly
-/// one step and there is no JTAG-to-core clock-domain crossing to reason about.
-/// This mirrors the emulator's software path (`SoftJtagDtm` + `SoftDebugModule`)
-/// bit for bit, so both report the same DMI behaviour to OpenOCD.
+/// one step. The integration must make those transitions observable by the
+/// system clock; this is not an asynchronous board-level JTAG bridge.
+///
+/// `directDmi` instead selects an exclusive synchronous register frontend.
+/// Address, direction and write data are sampled on each asserted request
+/// edge; read data is combinational before that edge. There is no ready/valid
+/// queue or runtime transport switching. Direct mode omits the JTAG ports.
 ///
 /// JTAG: IR width 5, IDCODE=0x01 (reset default), DTMCS=0x10, DMI=0x11,
 /// BYPASS=0x1F. DMI DR is `abits + 34` = 41 bits `{addr[6:0], data[31:0],
@@ -22,6 +26,14 @@ import 'package:rohd/rohd.dart';
 /// Memory inspection uses System Bus Access (SBA): the DM is a tiny bus master
 /// exposing a single-outstanding request/ack memory port (`sba_*`). The hart is
 /// untouched by SBA, so this works whether the core is halted or running.
+/// The backend must lower `sba_ack` after `sba_req` falls before another
+/// request can start. A ready-always backend can qualify ACK with the request.
+///
+/// Writing dmactive=0 stops admission and drains accepted abstract/SBA work
+/// before resetting DM state and reporting dmactive=0. The debugger must poll
+/// dmactive across both transitions. This does not reset the TAP/DTM. A backend
+/// that never completes prevents deactivation; no unsafe timeout drops its work.
+/// The module reset input is a platform reset and must also reset its backends.
 class RiverDebugModule extends Module {
   /// Machine xlen (32 or 64). Drives SBA data width and the abstract register
   /// data path.
@@ -178,6 +190,7 @@ class RiverDebugModule extends Module {
 
     // Debug Module registers.
     final dmactive = Logic(name: 'dmactive');
+    final deactivating = Logic(name: 'deactivating');
     final data0 = Logic(name: 'data0', width: 32);
     final data1 = Logic(name: 'data1', width: 32);
     final cmderr = Logic(name: 'cmderr', width: 3);
@@ -193,6 +206,7 @@ class RiverDebugModule extends Module {
     // SBA bus-master FSM.
     const sbIdle = 0;
     const sbReqState = 1;
+    const sbDrain = 2; // request low; wait for the old ACK to return low
     final sbState = Logic(name: 'sb_state', width: 2);
     final sbWeReg = Logic(name: 'sb_we_reg');
     final sbAddrReg = Logic(name: 'sb_addr_reg', width: xlen);
@@ -351,7 +365,8 @@ class RiverDebugModule extends Module {
     // Bus-master combinational outputs.
     output('sba_req') <= sbState.eq(sbReqState);
     // Busy while an abstract command or a system-bus access is mid-flight.
-    output('dm_busy') <= cmdPending | cmdActive | sbStart | ~sbState.eq(sbIdle);
+    output('dm_busy') <=
+        deactivating | cmdPending | cmdActive | sbStart | ~sbState.eq(sbIdle);
     output('sba_we') <= sbWeReg;
     output('sba_addr') <= sbAddrReg;
     output('sba_wdata') <= sbWdataReg;
@@ -362,6 +377,47 @@ class RiverDebugModule extends Module {
     output('reg_wdata') <= regWdataReg;
     output('halt_req') <= haltReqReg;
     output('ndmreset') <= ndmresetReg;
+
+    // DM reset is separate from the TAP/DTM reset. Deactivation completes
+    // only after the accepted work has drained; the spec permits dmactive
+    // to remain asserted while this transition is in progress.
+    List<Conditional> resetDm() => [
+      dmactive < 0,
+      deactivating < 0,
+      data0 < 0,
+      data1 < 0,
+      cmderr < 0,
+      sbaddress < 0,
+      sbdata0 < 0,
+      sbdata1 < 0,
+      sbAccessSize < Const(xlen == 64 ? 3 : 2, width: 3),
+      sbAutoincr < 0,
+      sbReadOnAddr < 0,
+      sbReadOnData < 0,
+      sbError < 0,
+      sbState < Const(sbIdle, width: 2),
+      sbWeReg < 0,
+      sbAddrReg < 0,
+      sbWdataReg < 0,
+      sbBusy < 0,
+      output('resume_req') < 0,
+      regReadReg < 0,
+      regWriteReg < 0,
+      regAddrReg < 0,
+      regWdataReg < 0,
+      cmdPending < 0,
+      cmdActive < 0,
+      cmdIs64 < 0,
+      cmdWrite < 0,
+      haltReqReg < 0,
+      resumeAck < 0,
+      resumePending < 0,
+      ndmresetReg < 0,
+      sbStart < 0,
+      sbStartWe < 0,
+      sbStartAddr < 0,
+      sbStartWdata < 0,
+    ];
 
     Sequential(clk, [
       If(
@@ -378,40 +434,7 @@ class RiverDebugModule extends Module {
             dmiAddr < Const(0, width: _abits),
             dmiStatus < Const(0, width: 2),
           ],
-          dmactive < Const(0),
-          data0 < Const(0, width: 32),
-          data1 < Const(0, width: 32),
-          cmderr < Const(0, width: 3),
-          sbaddress < Const(0, width: xlen),
-          sbdata0 < Const(0, width: 32),
-          sbdata1 < Const(0, width: 32),
-          sbAccessSize < Const(xlen == 64 ? 3 : 2, width: 3),
-          sbAutoincr < Const(0),
-          sbReadOnAddr < Const(0),
-          sbReadOnData < Const(0),
-          sbError < Const(0, width: 3),
-          sbState < Const(sbIdle, width: 2),
-          sbWeReg < Const(0),
-          sbAddrReg < Const(0, width: xlen),
-          sbWdataReg < Const(0, width: xlen),
-          sbBusy < Const(0),
-          output('resume_req') < Const(0),
-          regReadReg < Const(0),
-          regWriteReg < Const(0),
-          regAddrReg < Const(0, width: 16),
-          regWdataReg < Const(0, width: xlen),
-          cmdPending < Const(0),
-          cmdActive < Const(0),
-          cmdIs64 < Const(0),
-          cmdWrite < Const(0),
-          haltReqReg < Const(0),
-          resumeAck < 0,
-          resumePending < 0,
-          ndmresetReg < Const(0),
-          sbStart < Const(0),
-          sbStartWe < Const(0),
-          sbStartAddr < Const(0, width: xlen),
-          sbStartWdata < Const(0, width: xlen),
+          ...resetDm(),
         ],
         orElse: [
           if (!directDmi) tckPrev < tck,
@@ -524,29 +547,45 @@ class RiverDebugModule extends Module {
                           ),
                           // sbdata0 read with sbreadondata kicks another access.
                           If(
-                            scanAddr.eq(0x3c) & sbReadOnData,
+                            dmactive &
+                                ~deactivating &
+                                scanAddr.eq(0x3c) &
+                                sbReadOnData,
                             then: [sbStart < Const(1), sbStartWe < Const(0)],
                           ),
                         ],
                       ),
                       // Write.
                       If(
-                        scanOp.eq(2),
+                        scanOp.eq(2) &
+                            ~deactivating &
+                            (dmactive | scanAddr.eq(0x10)),
                         then: [
                           Case(scanAddr, [
                             CaseItem(Const(0x10, width: 7), [
-                              dmactive < scanData[0],
-                              ndmresetReg < scanData[1],
                               If(
-                                ~commandBusy,
+                                scanData[0],
+                                then: [dmactive < 1],
+                                orElse: [deactivating < dmactive],
+                              ),
+                              // Activation/deactivation writes may ignore the
+                              // other fields. Poll dmactive before using them.
+                              If(
+                                dmactive & scanData[0],
                                 then: [
-                                  haltReqReg < scanData[31],
+                                  ndmresetReg < scanData[1],
                                   If(
-                                    scanData[30] & ~scanData[31],
+                                    ~commandBusy,
                                     then: [
-                                      resumeAck < 0,
-                                      resumePending < hartHaltedIn,
-                                      output('resume_req') < hartHaltedIn,
+                                      haltReqReg < scanData[31],
+                                      If(
+                                        scanData[30] & ~scanData[31],
+                                        then: [
+                                          resumeAck < 0,
+                                          resumePending < hartHaltedIn,
+                                          output('resume_req') < hartHaltedIn,
+                                        ],
+                                      ),
                                     ],
                                   ),
                                 ],
@@ -679,8 +718,7 @@ class RiverDebugModule extends Module {
               If(
                 sbaAckIn,
                 then: [
-                  sbState < Const(sbIdle, width: 2),
-                  sbBusy < Const(0),
+                  sbState < Const(sbDrain, width: 2),
                   If(
                     ~sbWeReg,
                     then: [
@@ -695,6 +733,12 @@ class RiverDebugModule extends Module {
                     ],
                   ),
                 ],
+              ),
+            ]),
+            CaseItem(Const(sbDrain, width: 2), [
+              If(
+                ~sbaAckIn,
+                then: [sbState < Const(sbIdle, width: 2), sbBusy < 0],
               ),
             ]),
           ]),
@@ -742,6 +786,10 @@ class RiverDebugModule extends Module {
                 ],
               ),
             ],
+          ),
+          If(
+            deactivating & ~commandBusy & ~sbStart & sbState.eq(sbIdle),
+            then: resetDm(),
           ),
         ],
       ),
