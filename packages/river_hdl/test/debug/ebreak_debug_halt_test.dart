@@ -126,8 +126,11 @@ void main() {
       dHalt.inject(1);
       await clk.nextPosedge;
       dHalt.inject(0);
-      for (var i = 0; i < 4; i++) {
+      // A halt may finish the current ~80-cycle microcoded instruction.
+      // Bound the acknowledgement, not an unsafe four-cycle abort latency.
+      for (var i = 0; i < 400; i++) {
         await clk.nextPosedge;
+        if (halted.value.toInt() == 1) break;
       }
       expect(
         halted.value.toInt(),

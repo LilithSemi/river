@@ -44,6 +44,11 @@ class RiverDebugModule extends Module {
   /// JTAG data out to the debugger.
   Logic get tdo => output('tdo');
 
+  /// Direct DMI reads are combinational and sampled at the request edge.
+  /// Each asserted request clock is one transaction; there is no queued
+  /// transport response or backpressure. Abstract commands still use busy.
+  Logic get dmiRdata => output('dmi_rdata');
+
   // Core control (driven from dmcontrol; consumed in Phase 1+).
   Logic get haltReq => output('halt_req');
   Logic get resumeReq => output('resume_req');
@@ -80,16 +85,36 @@ class RiverDebugModule extends Module {
     Logic? sbaRdata,
     Logic? sbaAck,
     this.xlen = 64,
+    bool directDmi = false,
+    Logic? dmiRequest,
+    Logic? dmiWrite,
+    Logic? dmiAddress,
+    Logic? dmiWriteData,
     this.idcode = 0x10000001,
     this.irWidth = 5,
     super.name = 'river_debug',
   }) : super(definitionName: 'RiverDebugModule') {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
-    tck = addInput('tck', tck);
-    tms = addInput('tms', tms);
-    tdi = addInput('tdi', tdi);
-    trstN = addInput('trst_n', trstN);
+    // Transport ownership is fixed at elaboration; no runtime handover.
+    if (!directDmi) {
+      tck = addInput('tck', tck);
+      tms = addInput('tms', tms);
+      tdi = addInput('tdi', tdi);
+      trstN = addInput('trst_n', trstN);
+    } else {
+      if (dmiRequest == null ||
+          dmiWrite == null ||
+          dmiAddress == null ||
+          dmiWriteData == null) {
+        throw ArgumentError('Direct DMI requires all request signals');
+      }
+      dmiRequest = addInput('dmi_request', dmiRequest);
+      dmiWrite = addInput('dmi_write', dmiWrite);
+      dmiAddress = addInput('dmi_address', dmiAddress, width: 7);
+      dmiWriteData = addInput('dmi_wdata', dmiWriteData, width: 32);
+      addOutput('dmi_rdata', width: 32);
+    }
 
     final hartHaltedIn = hartHalted == null
         ? Const(0)
@@ -105,7 +130,7 @@ class RiverDebugModule extends Module {
         : addInput('sba_rdata', sbaRdata, width: xlen);
     final sbaAckIn = sbaAck == null ? Const(0) : addInput('sba_ack', sbaAck);
 
-    addOutput('tdo');
+    if (!directDmi) addOutput('tdo');
     addOutput('halt_req');
     addOutput('resume_req');
     addOutput('ndmreset');
@@ -184,6 +209,9 @@ class RiverDebugModule extends Module {
     final cmdIs64 = Logic(name: 'cmd_is64');
     final cmdWrite = Logic(name: 'cmd_write');
     final haltReqReg = Logic(name: 'halt_req_reg');
+    final commandBusy = cmdPending | cmdActive;
+    final resumeAck = Logic(name: 'resume_ack');
+    final resumePending = Logic(name: 'resume_pending');
     // dmcontrol.ndmreset (bit 1): holds the rest of the system (the hart) in
     // reset while set, leaving the Debug Module itself alive. The SoC reset tree
     // ORs this into the core reset; the DM is reset only by the external reset.
@@ -226,12 +254,14 @@ class RiverDebugModule extends Module {
     // while TCK is low (before the rising edge that shifts), which is exactly
     // how OpenOCD's remote_bitbang reads it. (A registered-on-rising-edge TDO
     // presents the bit one step late for that convention.)
-    output('tdo') <=
-        mux(
-          tapState.eq(sShIr),
-          irShift[0],
-          mux(tapState.eq(sShDr), dr[0], Const(0)),
-        );
+    if (!directDmi) {
+      output('tdo') <=
+          mux(
+            tapState.eq(sShIr),
+            irShift[0],
+            mux(tapState.eq(sShDr), dr[0], Const(0)),
+          );
+    }
 
     // dtmcs read word: version=1, abits=7, dmistat, idle hint.
     final dtmcsVal =
@@ -242,12 +272,23 @@ class RiverDebugModule extends Module {
     final dmstatusVal =
         Const(2, width: 32) |
         Const(1 << 7, width: 32) |
-        Const((1 << 17) | (1 << 16), width: 32) |
+        mux(
+          resumeAck,
+          Const((1 << 17) | (1 << 16), width: 32),
+          Const(0, width: 32),
+        ) |
         mux(
           hartHaltedIn,
           Const((1 << 9) | (1 << 8), width: 32),
           Const((1 << 11) | (1 << 10), width: 32),
         );
+
+    // An accepted DMI access can be waiting for the SBA FSM to consume it.
+    // Include this start slot in busy: direct DMI can poll on the next edge.
+    final sbStart = Logic(name: 'sb_start');
+    final sbStartWe = Logic(name: 'sb_start_we');
+    final sbStartAddr = Logic(name: 'sb_start_addr', width: xlen);
+    final sbStartWdata = Logic(name: 'sb_start_wdata', width: xlen);
 
     // sbcs read word: sbversion=1, sbaccess size, sbasize=xlen, busy, error,
     // the supported access-size flags.
@@ -255,7 +296,7 @@ class RiverDebugModule extends Module {
         Const(1 << 29, width: 32) |
         (sbAccessSize.zeroExtend(32) << 17) |
         Const(xlen << 5, width: 32) |
-        (sbBusy.zeroExtend(32) << 21) |
+        ((sbBusy | sbStart).zeroExtend(32) << 21) |
         (sbError.zeroExtend(32) << 12) |
         (sbAutoincr.zeroExtend(32) << 16) |
         (sbReadOnAddr.zeroExtend(32) << 20) |
@@ -263,7 +304,7 @@ class RiverDebugModule extends Module {
         Const(0xF, width: 32); // sbaccess 8/16/32/64 supported
 
     // DMI read value selected by the address shifted into dr.
-    final dmiReadAddr = dr.getRange(34, 41);
+    final dmiReadAddr = directDmi ? dmiAddress! : dr.getRange(34, 41);
     final dmiReadVal = Logic(name: 'dmi_read_val', width: 32);
     Combinational([
       dmiReadVal < Const(0, width: 32),
@@ -291,14 +332,26 @@ class RiverDebugModule extends Module {
     ]);
 
     // Fields of a DMI scan once shifted into dr.
-    final scanOp = dr.getRange(0, 2);
-    final scanData = dr.getRange(2, 34);
-    final scanAddr = dr.getRange(34, 41);
+    final scanOp = directDmi
+        ? mux(dmiWrite!, Const(2, width: 2), Const(1, width: 2))
+        : dr.getRange(0, 2);
+    final scanData = directDmi ? dmiWriteData! : dr.getRange(2, 34);
+    final scanAddr = dmiReadAddr;
+    if (directDmi) dmiRdata <= dmiReadVal;
+    List<Conditional> writeData(Logic target) => [
+      If(
+        commandBusy,
+        then: [
+          If(cmderr.eq(0), then: [cmderr < Const(1, width: 3)]),
+        ],
+        orElse: [target < scanData],
+      ),
+    ];
 
     // Bus-master combinational outputs.
     output('sba_req') <= sbState.eq(sbReqState);
     // Busy while an abstract command or a system-bus access is mid-flight.
-    output('dm_busy') <= cmdPending | cmdActive | ~sbState.eq(sbIdle);
+    output('dm_busy') <= cmdPending | cmdActive | sbStart | ~sbState.eq(sbIdle);
     output('sba_we') <= sbWeReg;
     output('sba_addr') <= sbAddrReg;
     output('sba_wdata') <= sbWdataReg;
@@ -310,25 +363,21 @@ class RiverDebugModule extends Module {
     output('halt_req') <= haltReqReg;
     output('ndmreset') <= ndmresetReg;
 
-    // A pulse that asks the SBA FSM to start an access this cycle.
-    final sbStart = Logic(name: 'sb_start');
-    final sbStartWe = Logic(name: 'sb_start_we');
-    final sbStartAddr = Logic(name: 'sb_start_addr', width: xlen);
-    final sbStartWdata = Logic(name: 'sb_start_wdata', width: xlen);
-
     Sequential(clk, [
       If(
         reset,
         then: [
-          tapState < Const(sTlr, width: 4),
-          irReg < Const(_irIdcode, width: irWidth),
-          irShift < Const(0, width: irWidth),
-          dr < Const(0, width: _dmiWidth),
-          drLen < Const(1, width: 7),
-          tckPrev < Const(0),
-          dmiData < Const(0, width: 32),
-          dmiAddr < Const(0, width: _abits),
-          dmiStatus < Const(0, width: 2),
+          if (!directDmi) ...[
+            tapState < Const(sTlr, width: 4),
+            irReg < Const(_irIdcode, width: irWidth),
+            irShift < Const(0, width: irWidth),
+            dr < Const(0, width: _dmiWidth),
+            drLen < Const(1, width: 7),
+            tckPrev < Const(0),
+            dmiData < Const(0, width: 32),
+            dmiAddr < Const(0, width: _abits),
+            dmiStatus < Const(0, width: 2),
+          ],
           dmactive < Const(0),
           data0 < Const(0, width: 32),
           data1 < Const(0, width: 32),
@@ -356,6 +405,8 @@ class RiverDebugModule extends Module {
           cmdIs64 < Const(0),
           cmdWrite < Const(0),
           haltReqReg < Const(0),
+          resumeAck < 0,
+          resumePending < 0,
           ndmresetReg < Const(0),
           sbStart < Const(0),
           sbStartWe < Const(0),
@@ -363,8 +414,14 @@ class RiverDebugModule extends Module {
           sbStartWdata < Const(0, width: xlen),
         ],
         orElse: [
-          tckPrev < tck,
+          if (!directDmi) tckPrev < tck,
           output('resume_req') < Const(0),
+          // Acknowledge completion, not request receipt; retain the result
+          // through a subsequent halt (including a quick single-step halt).
+          If(
+            resumePending & ~hartHaltedIn,
+            then: [resumeAck < 1, resumePending < 0],
+          ),
 
           // Defaults for the per-cycle start pulse (overridden in the tap step).
           sbStart < Const(0),
@@ -374,87 +431,97 @@ class RiverDebugModule extends Module {
 
           // ---- TAP step (one per rising TCK) ----
           If(
-            tckRise,
+            directDmi ? dmiRequest! : tckRise,
             then: [
-              // Shift the active register while in a shift state.
-              If(
-                tapState.eq(sShIr),
-                then: [
-                  irShift <
-                      ((tdi.zeroExtend(irWidth) <<
-                              Const(irWidth - 1, width: irWidth)) |
-                          (irShift >>> 1)),
-                ],
-              ),
-              If(
-                tapState.eq(sShDr),
-                then: [
-                  dr <
-                      ((tdi.zeroExtend(_dmiWidth) << (drLen - 1)) | (dr >>> 1)),
-                ],
-              ),
+              if (!directDmi) ...[
+                // Shift the active register while in a shift state.
+                If(
+                  tapState.eq(sShIr),
+                  then: [
+                    irShift <
+                        ((tdi.zeroExtend(irWidth) <<
+                                Const(irWidth - 1, width: irWidth)) |
+                            (irShift >>> 1)),
+                  ],
+                ),
+                If(
+                  tapState.eq(sShDr),
+                  then: [
+                    dr <
+                        ((tdi.zeroExtend(_dmiWidth) << (drLen - 1)) |
+                            (dr >>> 1)),
+                  ],
+                ),
 
-              // Entering-state actions, keyed on tapNext.
-              If(
-                tapNext.eq(sTlr),
-                then: [irReg < Const(_irIdcode, width: irWidth)],
-              ),
-              If(
-                tapNext.eq(sCapIr),
-                then: [irShift < Const(0x01, width: irWidth)],
-              ),
-              If(tapNext.eq(sUpdIr), then: [irReg < irShift]),
+                // Entering-state actions, keyed on tapNext.
+                If(
+                  tapNext.eq(sTlr),
+                  then: [irReg < Const(_irIdcode, width: irWidth)],
+                ),
+                If(
+                  tapNext.eq(sCapIr),
+                  then: [irShift < Const(0x01, width: irWidth)],
+                ),
+                If(tapNext.eq(sUpdIr), then: [irReg < irShift]),
 
-              // Capture-DR loads the DR per the current instruction.
+                // Capture-DR loads the DR per the current instruction.
+                If(
+                  tapNext.eq(sCapDr),
+                  then: [
+                    If(
+                      irReg.eq(_irIdcode),
+                      then: [
+                        dr < Const(idcode & 0xFFFFFFFF, width: _dmiWidth),
+                        drLen < Const(32, width: 7),
+                      ],
+                      orElse: [
+                        If(
+                          irReg.eq(_irDtmcs),
+                          then: [
+                            dr < dtmcsVal.zeroExtend(_dmiWidth),
+                            drLen < Const(32, width: 7),
+                          ],
+                          orElse: [
+                            If(
+                              irReg.eq(_irDmi),
+                              then: [
+                                dr < [dmiAddr, dmiData, dmiStatus].swizzle(),
+                                drLen < Const(_dmiWidth, width: 7),
+                              ],
+                              orElse: [
+                                dr < Const(0, width: _dmiWidth),
+                                drLen < Const(1, width: 7),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ],
+              // Both frontends execute the same single-edge DM transaction.
               If(
-                tapNext.eq(sCapDr),
+                directDmi ? Const(1) : tapNext.eq(sUpdDr),
                 then: [
                   If(
-                    irReg.eq(_irIdcode),
+                    directDmi ? Const(1) : irReg.eq(_irDmi),
                     then: [
-                      dr < Const(idcode & 0xFFFFFFFF, width: _dmiWidth),
-                      drLen < Const(32, width: 7),
-                    ],
-                    orElse: [
-                      If(
-                        irReg.eq(_irDtmcs),
-                        then: [
-                          dr < dtmcsVal.zeroExtend(_dmiWidth),
-                          drLen < Const(32, width: 7),
-                        ],
-                        orElse: [
-                          If(
-                            irReg.eq(_irDmi),
-                            then: [
-                              dr < [dmiAddr, dmiData, dmiStatus].swizzle(),
-                              drLen < Const(_dmiWidth, width: 7),
-                            ],
-                            orElse: [
-                              dr < Const(0, width: _dmiWidth),
-                              drLen < Const(1, width: 7),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-
-              // Update-DR performs the DMI transaction.
-              If(
-                tapNext.eq(sUpdDr),
-                then: [
-                  If(
-                    irReg.eq(_irDmi),
-                    then: [
-                      dmiAddr < scanAddr,
-                      dmiStatus < Const(0, width: 2),
+                      if (!directDmi) ...[
+                        dmiAddr < scanAddr,
+                        dmiStatus < Const(0, width: 2),
+                      ],
                       // Read.
                       If(
                         scanOp.eq(1),
                         then: [
-                          dmiData < dmiReadVal,
+                          if (!directDmi) dmiData < dmiReadVal,
+                          If(
+                            (scanAddr.eq(0x04) | scanAddr.eq(0x05)) &
+                                commandBusy &
+                                cmderr.eq(0),
+                            then: [cmderr < Const(1, width: 3)],
+                          ),
                           // sbdata0 read with sbreadondata kicks another access.
                           If(
                             scanAddr.eq(0x3c) & sbReadOnData,
@@ -470,37 +537,77 @@ class RiverDebugModule extends Module {
                             CaseItem(Const(0x10, width: 7), [
                               dmactive < scanData[0],
                               ndmresetReg < scanData[1],
-                              If(scanData[31], then: [haltReqReg < Const(1)]),
                               If(
-                                scanData[30],
+                                ~commandBusy,
                                 then: [
-                                  haltReqReg < Const(0),
-                                  output('resume_req') < Const(1),
-                                ],
-                              ),
-                            ]),
-                            CaseItem(Const(0x04, width: 7), [data0 < scanData]),
-                            CaseItem(Const(0x05, width: 7), [data1 < scanData]),
-                            CaseItem(Const(0x17, width: 7), [
-                              // Abstract command: only access-register (cmdtype 0).
-                              cmderr < Const(0, width: 3),
-                              If(
-                                scanData.getRange(24, 32).eq(0),
-                                then: [
+                                  haltReqReg < scanData[31],
                                   If(
-                                    scanData[17],
+                                    scanData[30] & ~scanData[31],
                                     then: [
-                                      // transfer=1: kick a register access.
-                                      cmdPending < Const(1),
-                                      cmdWrite < scanData[16],
-                                      cmdIs64 < scanData.getRange(20, 23).eq(3),
-                                      regAddrReg < scanData.getRange(0, 16),
+                                      resumeAck < 0,
+                                      resumePending < hartHaltedIn,
+                                      output('resume_req') < hartHaltedIn,
                                     ],
                                   ),
                                 ],
-                                orElse: [
-                                  cmderr <
-                                      Const(2, width: 3), // unsupported cmdtype
+                              ),
+                            ]),
+                            CaseItem(Const(0x04, width: 7), writeData(data0)),
+                            CaseItem(Const(0x05, width: 7), writeData(data1)),
+                            CaseItem(Const(0x16, width: 7), [
+                              If(
+                                ~commandBusy,
+                                then: [
+                                  cmderr < (cmderr & ~scanData.getRange(8, 11)),
+                                ],
+                              ),
+                            ]),
+                            CaseItem(Const(0x17, width: 7), [
+                              // A command cannot replace an in-flight request;
+                              // preserve the first error until explicit W1C.
+                              If(
+                                cmderr.eq(0),
+                                then: [
+                                  If(
+                                    commandBusy,
+                                    then: [cmderr < Const(1, width: 3)],
+                                    orElse: [
+                                      If(
+                                        scanData.getRange(24, 32).eq(0),
+                                        then: [
+                                          If(
+                                            scanData[17],
+                                            then: [
+                                              // The core lends its register port only while halted.
+                                              If(
+                                                hartHaltedIn,
+                                                then: [
+                                                  cmdPending < Const(1),
+                                                  cmdWrite < scanData[16],
+                                                  cmdIs64 <
+                                                      scanData
+                                                          .getRange(20, 23)
+                                                          .eq(3),
+                                                  regAddrReg <
+                                                      scanData.getRange(0, 16),
+                                                ],
+                                                orElse: [
+                                                  cmderr < Const(4, width: 3),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                        ],
+                                        orElse: [
+                                          cmderr <
+                                              Const(
+                                                2,
+                                                width: 3,
+                                              ), // unsupported cmdtype
+                                        ],
+                                      ),
+                                    ],
+                                  ),
                                 ],
                               ),
                             ]),
@@ -536,20 +643,21 @@ class RiverDebugModule extends Module {
                       ),
                     ],
                   ),
-                  // DTMCS dmireset/dmihardreset clears sticky status.
-                  If(
-                    irReg.eq(_irDtmcs),
-                    then: [
-                      If(
-                        scanData[16] | scanData[17],
-                        then: [dmiStatus < Const(0, width: 2)],
-                      ),
-                    ],
-                  ),
+                  // DTMCS affects only the JTAG transport, not the DM FSMs.
+                  if (!directDmi)
+                    If(
+                      irReg.eq(_irDtmcs),
+                      then: [
+                        If(
+                          scanData[16] | scanData[17],
+                          then: [dmiStatus < Const(0, width: 2)],
+                        ),
+                      ],
+                    ),
                 ],
               ),
 
-              tapState < tapNext,
+              if (!directDmi) tapState < tapNext,
             ],
           ),
 

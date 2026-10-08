@@ -7,7 +7,12 @@ import 'package:test/test.dart';
 int addi(int rd, int rs, int value) =>
     ((value & 4095) << 20) | (rs << 15) | (rd << 7) | 0x13;
 
-Future<void> exercise(RiscVMxlen xlen, bool microcoded, bool store) async {
+Future<void> exercise(
+  RiscVMxlen xlen,
+  bool microcoded,
+  bool store, {
+  bool pulse = false,
+}) async {
   const dataAddress = 0x200000;
   const accessPc = 8;
   final bytes = xlen.size ~/ 8;
@@ -20,8 +25,9 @@ Future<void> exercise(RiscVMxlen xlen, bool microcoded, bool store) async {
   ];
   final image = <int, int>{};
   for (var i = 0; i < program.length; i++) {
-    for (var j = 0; j < 4; j++)
+    for (var j = 0; j < 4; j++) {
       image[4 * i + j] = (program[i] >> (8 * j)) & 255;
+    }
   }
   final core = RiverCore(
     RiverCoreConfig(
@@ -88,8 +94,9 @@ Future<void> exercise(RiscVMxlen xlen, bool microcoded, bool store) async {
     } else {
       expect(core.output('dataBus_WE').value.toBool(), isFalse);
       var word = BigInt.zero;
-      for (var i = 0; i < bytes; i++)
+      for (var i = 0; i < bytes; i++) {
         word |= BigInt.from(image[address + i] ?? 0) << (8 * i);
+      }
       readData.inject(LogicValue.ofBigInt(word, xlen.size));
     }
     ack.inject(1);
@@ -113,19 +120,31 @@ Future<void> exercise(RiscVMxlen xlen, bool microcoded, bool store) async {
       () => active() && core.output('dataBus_ADR').value.toInt() == dataAddress,
     );
     halt.inject(1);
-    for (var i = 0; i < 20; i++) await tick();
+    if (pulse) {
+      await tick();
+      halt.inject(0);
+    }
+    for (var i = 0; i < 20; i++) {
+      await tick();
+    }
     releaseData = true;
     // Let the external side effect complete even if the hart halted prematurely.
-    for (var i = 0; i < 20; i++) await tick();
+    for (var i = 0; i < 20; i++) {
+      await tick();
+    }
     await until(halted);
     final savedPc = core.output('debug_dpc').value.toInt();
     final savedValue = reg(11);
     debugAddress.inject(0x100b);
     debugData.inject(0x99);
     debugWrite.inject(1);
-    for (var i = 0; i < 3; i++) await tick();
+    for (var i = 0; i < 3; i++) {
+      await tick();
+    }
     debugWrite.inject(0);
-    for (var i = 0; i < 5; i++) await tick();
+    for (var i = 0; i < 5; i++) {
+      await tick();
+    }
     expect(reg(11), 0x99, reason: 'debugger write must land while halted');
     halt.inject(0);
     resume.inject(1);
@@ -160,6 +179,10 @@ void main() {
         test(
           '${xlen.name} ${microcoded ? "microcoded" : "static"} ${store ? "store" : "MMIO read"} is not replayed across halt',
           () => exercise(xlen, microcoded, store),
+        );
+        test(
+          '${xlen.name} ${microcoded ? "microcoded" : "static"} ${store ? "store" : "MMIO read"} drains after a halt pulse',
+          () => exercise(xlen, microcoded, store, pulse: true),
         );
       }
     }
