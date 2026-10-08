@@ -180,6 +180,13 @@ Future<void> runProgram(
 int reg(RiverCore core, int number) =>
     core.regs.getData(LogicValue.ofInt(number, 5))!.toInt();
 
+Iterable<Module> descendants(Module module) sync* {
+  yield module;
+  for (final child in module.subModules) {
+    yield* descendants(child);
+  }
+}
+
 void main() {
   tearDown(Simulator.reset);
   for (final microcoded in [false, true]) {
@@ -243,7 +250,7 @@ void main() {
               program(
                 mode: c.$3,
                 enabled: pending,
-                pending: pending,
+                pending: c.$2 == 9 ? 0 : pending,
                 delegated: c.$4 ? pending : 0,
                 mie: c.$5,
                 sie: c.$6,
@@ -264,8 +271,194 @@ void main() {
             );
           }, timeout: const Timeout(Duration(minutes: 3)));
         }
+        // Target privilege wins before the source priority within that target.
+        for (final c in [
+          ('M SSI outranks S SEI', (1 << 1) | (1 << 9), 1 << 9, 1, 3),
+          ('M STI outranks S SSI', (1 << 5) | (1 << 1), 1 << 1, 5, 3),
+          ('M MEI outranks M MTI', (1 << 11) | (1 << 7), 0, 11, 3),
+          ('M SSI outranks M STI', (1 << 1) | (1 << 5), 0, 1, 3),
+          (
+            'S SEI outranks S SSI',
+            (1 << 9) | (1 << 1),
+            (1 << 9) | (1 << 1),
+            9,
+            1,
+          ),
+        ]) {
+          test(c.$1, () async {
+            await runProgram(
+              microcoded,
+              xlen,
+              program(
+                mode: 1,
+                enabled: c.$2,
+                pending: c.$2 & ~(1 << 9),
+                delegated: c.$3,
+                sie: true,
+              ),
+              pending: c.$2,
+              observe: (_, __, ___) {},
+              check: (core) {
+                expect(reg(core, 31), 1, reason: 'handler did not finish');
+                expect(reg(core, 24), c.$5);
+                expect(reg(core, 21), (1 << (xlen.size - 1)) | c.$4);
+                expect(reg(core, 22), isIn([0x100, 0x104]));
+              },
+            );
+          }, timeout: const Timeout(Duration(minutes: 3)));
+        }
+        for (final source in [1, 5, 7, 9, 11]) {
+          test('local enable masks source $source', () async {
+            await runProgram(
+              microcoded,
+              xlen,
+              program(
+                mode: 3,
+                enabled: 0,
+                pending: source == 9 ? 0 : 1 << source,
+                mie: true,
+                sie: true,
+              ),
+              pending: 1 << source,
+              observe: (_, __, ___) {},
+              check: (core) {
+                expect(reg(core, 30), 1);
+                expect(reg(core, 31), 0);
+                expect(reg(core, 24), 0);
+              },
+            );
+          }, timeout: const Timeout(Duration(minutes: 3)));
+        }
+        for (final change in ['mie', 'mstatus', 'mideleg', 'pending']) {
+          test(
+            'revalidate unaccepted candidate after $change changes',
+            () async {
+              final code = program(
+                mode: 3,
+                enabled: 1 << 7,
+                pending: 0,
+                mie: true,
+              );
+              final address = switch (change) {
+                'mie' => 0x304,
+                'mstatus' => 0x300,
+                'mideleg' => 0x303,
+                _ => 0x340, // scratch CSR supplies a multicycle boundary
+              };
+              code.addAll({
+                0x104: addi(5, change == 'mideleg' ? 1 << 7 : 0),
+                0x108: csr(address, 5, 1, 0),
+                0x10c: addi(29, 1),
+                0x110: 0x0000006f,
+              });
+              ExecutionUnit? exec;
+              RiscVCsrFile? csrs;
+              Logic? step;
+              var armed = false;
+              var candidateSeen = false;
+              var changed = false;
+              var checked = false;
+              await runProgram(
+                microcoded,
+                xlen,
+                code,
+                pending: 0,
+                delayed: true,
+                observe: (core, lines, cycle) {
+                  exec ??= descendants(
+                    core.pipeline,
+                  ).whereType<ExecutionUnit>().single;
+                  csrs ??= descendants(core).whereType<RiscVCsrFile>().single;
+                  step ??= exec!.internalSignals.singleWhere(
+                    (s) => s.name == 'mopStep',
+                  );
+                  final take = core.pipeline.input('interruptTake');
+                  if (!armed &&
+                      exec!.currentPc.value.toInt() == 0x108 &&
+                      exec!.input('enable').value.toBool() &&
+                      step!.value.toInt() != 0 &&
+                      exec!.csrRead!.en.value.toBool() &&
+                      exec!.csrRead!.addr.value.toInt() == address) {
+                    lines[1].inject(1);
+                    armed = true;
+                  }
+                  if (armed && take.value.toBool()) {
+                    candidateSeen = true;
+                    if (change == 'pending' && !changed) {
+                      lines[1].inject(0);
+                      changed = true;
+                    }
+                  }
+                  final invalid =
+                      armed &&
+                      switch (change) {
+                        'mie' => csrs!.mie.value[7] == LogicValue.zero,
+                        'mstatus' => csrs!.mstatus.value[3] == LogicValue.zero,
+                        'mideleg' => csrs!.mideleg.value[7] == LogicValue.one,
+                        _ => changed && csrs!.mip.value[7] == LogicValue.zero,
+                      };
+                  if (invalid) {
+                    // This checks the candidate interface, before acceptance;
+                    // it does not demand cancellation of an already taken trap.
+                    expect(
+                      take.value.toBool(),
+                      isFalse,
+                      reason: '$change changed but candidate remains eligible',
+                    );
+                    checked = true;
+                  }
+                },
+                check: (core) {
+                  expect(armed, isTrue);
+                  expect(
+                    candidateSeen,
+                    isTrue,
+                    reason: 'no registered candidate exercised',
+                  );
+                  expect(
+                    checked,
+                    isTrue,
+                    reason: 'no eligibility change exercised',
+                  );
+                  expect(
+                    reg(core, 29),
+                    1,
+                    reason: 'CSR sequence did not finish',
+                  );
+                  expect(reg(core, 31), 0, reason: 'stale candidate trapped');
+                },
+              );
+            },
+            timeout: const Timeout(Duration(minutes: 3)),
+          );
+        }
+        test('accepted interrupt completes after pending deasserts', () async {
+          var deasserted = false;
+          await runProgram(
+            microcoded,
+            xlen,
+            program(mode: 3, enabled: 1 << 7, pending: 0, mie: true),
+            pending: 1 << 7,
+            observe: (core, lines, cycle) {
+              if (core.pipeline.trap.value.toBool() &&
+                  core.pipeline.trapInterrupt.value.toBool()) {
+                lines[1].inject(0);
+                deasserted = true;
+              }
+            },
+            check: (core) {
+              expect(deasserted, isTrue);
+              expect(reg(core, 31), 1);
+              expect(reg(core, 24), 3);
+              expect(reg(core, 21), (1 << (xlen.size - 1)) | 7);
+            },
+          );
+        }, timeout: const Timeout(Duration(minutes: 3)));
+        // WFI may legally be a NOP (both current executors use that option).
+        // Check forward progress without fabricating a globally masked trap;
+        // do not require sleeping, or introduce blocking solely for this test.
         for (final source in [3, 7, 11, 9]) {
-          test('WFI wakes for source $source with globals off', () async {
+          test('WFI progresses for source $source with globals off', () async {
             var sent = false;
             var parkedCycles = 0;
             await runProgram(
