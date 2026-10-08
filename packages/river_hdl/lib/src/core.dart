@@ -67,6 +67,14 @@ class RiverCore extends BridgeModule {
     int? resetPrivilege,
     super.name = 'river_core',
   }) : super('RiverCore') {
+    // Lockstep scalar debug entry drains the current instruction rather than
+    // cancelling externally visible memory operations. H/OoO and speculative
+    // execution retain their existing debug path.
+    final boundaryDebug =
+        withDebug &&
+        !config.speculativeFetch &&
+        config.executionMode == ExecutionMode.inOrder &&
+        !config.hasHypervisor;
     final wbConfig =
         busConfig ??
         WishboneConfig(
@@ -1929,15 +1937,29 @@ class RiverCore extends BridgeModule {
               // Debug Mode at the next PC (cause 4) and freeze the pipeline.
               if (withDebug)
                 If(
-                  stepping!,
+                  boundaryDebug ? (stepping! | haltReqIn!) : stepping!,
                   then: [
                     debugHalted! < 1,
                     pipelineEnable < 0,
                     debugDpc! < committedNextPc,
                     debugDcsr! <
                         (debugDcsr! & Const(0xFFFFFE3C, width: 32)) |
-                            (Const(4 << 6, width: 32) | dcsrPrv),
+                            ((boundaryDebug
+                                    ? mux(
+                                        haltReqIn!,
+                                        Const(3 << 6, width: 32),
+                                        Const(4 << 6, width: 32),
+                                      )
+                                    : Const(4 << 6, width: 32)) |
+                                (boundaryDebug
+                                    ? mux(
+                                        pipeline.isReturn,
+                                        retMode,
+                                        pipeline.nextMode,
+                                      ).getRange(0, 2).zeroExtend(32)
+                                    : dcsrPrv)),
                     stepping! < Const(0),
+                    if (boundaryDebug) interruptHold < 0,
                   ],
                 ),
             ],
@@ -2038,7 +2060,9 @@ class RiverCore extends BridgeModule {
                       ),
                     ],
                     If(
-                      resumeReqIn!,
+                      boundaryDebug
+                          ? (resumeReqIn! & ~haltReqIn!)
+                          : resumeReqIn!,
                       then: [
                         debugHalted < 0,
                         pc < debugDpc,
@@ -2049,9 +2073,12 @@ class RiverCore extends BridgeModule {
                   ],
                   orElse: [
                     If(
-                      haltReqIn!,
+                      boundaryDebug
+                          ? (haltReqIn! & (~pipelineEnable | interruptHold))
+                          : haltReqIn!,
                       then: [
                         debugHalted < 1,
+                        if (boundaryDebug) interruptHold < 0,
                         pipelineEnable < 0,
                         debugDpc < pc,
                         // Halt cause = 3 (haltreq); keep the other dcsr bits.
