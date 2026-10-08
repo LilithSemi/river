@@ -1254,6 +1254,17 @@ class RiscVCsrFile extends Module {
   late final int _sieSipMask;
   late final int _uieUipMask;
 
+  // TVM makes an S-mode satp access illegal, the same way it blocks the
+  // address-translation fences. M-mode is never blocked.
+  Logic _satpOk(Logic addr12) {
+    if (!hasSupervisor) return Const(1);
+    final isSatp = addr12.eq(Const(CsrAddress.satp.address, width: 12));
+    final blocked =
+        _statusRead(_mstatusRaw)[20] &
+        mode.eq(Const(PrivilegeMode.supervisor.id, width: 3));
+    return ~(isSatp & blocked);
+  }
+
   Logic _privOk(Logic addr12) {
     final privBits = addr12.getRange(8, 10);
 
@@ -1528,6 +1539,7 @@ class RiscVCsrFile extends Module {
         (~rdFp | fpEnabled) &
         (_addrExists(rdAddr12) | isTimeRd) &
         _privOk(rdAddr12) &
+        _satpOk(rdAddr12) &
         _counterReadOk(rdAddr12) &
         _stateenOk(rdAddr12);
     // _isFrontdoorWritable is a strict subset of _addrExists (same register
@@ -1537,6 +1549,7 @@ class RiscVCsrFile extends Module {
     final wrLegal =
         (~wrFp | fpEnabled) &
         _privOk(wrAddr12) &
+        _satpOk(wrAddr12) &
         _stateenOk(wrAddr12) &
         _isFrontdoorWritable(wrAddr12);
 

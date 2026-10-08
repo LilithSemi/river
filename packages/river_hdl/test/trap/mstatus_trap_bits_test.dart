@@ -42,6 +42,7 @@ const jalPastHandler = 0x0200006F; // jal x0, +0x20, from 0x48 to 0x68
 const jalLoop = 0x0000006F;
 const nop = 0x00000013;
 const ranSentinel = 0x7B;
+const csrrSatp = 0x180024F3; // csrr x9, satp
 
 const mstatusCsr = 0x300;
 const mepcCsr = 0x341;
@@ -95,14 +96,21 @@ String program(int victim, int? trapBit) => words([
 void main() {
   tearDown(() async => Simulator.reset());
 
-  const cases = {
+  // Victim, and the mstatus bit that must reject it in S-mode.
+  const traps = {
     'sret under TSR': (victim: sret, bit: 22),
     'sfence.vma under TVM': (victim: sfenceVma, bit: 20),
     'wfi under TW': (victim: wfi, bit: 21),
+    'satp read under TVM': (victim: csrrSatp, bit: 20),
   };
 
+  // The same victims with the trap bit clear. Each is legal in S-mode and must
+  // run, which is what separates a real reject from a blanket one. River treats
+  // wfi as a nop hint, so it retires rather than waiting.
+  const controls = {'sfence.vma': sfenceVma, 'wfi': wfi, 'satp read': csrrSatp};
+
   for (final mode in [MicrocodeMode.none, MicrocodeMode.full]) {
-    for (final entry in cases.entries) {
+    for (final entry in traps.entries) {
       test(
         'S-mode ${entry.key} traps illegal (${mode.name})',
         timeout: const Timeout(Duration(minutes: 10)),
@@ -117,18 +125,18 @@ void main() {
       );
     }
 
-    // Control: with TVM clear the fence is legal in S-mode, so it must run and
-    // reach the sentinel without entering the handler.
-    test(
-      'S-mode sfence.vma runs with TVM clear (${mode.name})',
-      timeout: const Timeout(Duration(minutes: 10)),
-      () => coreTest(
-        '@0\n${program(sfenceVma, null)}\n',
-        {Register.x8: ranSentinel, Register.x5: 0},
-        config(mode),
-        nextPc: 0x68,
-        maxCycles: 4000,
-      ),
-    );
+    for (final entry in controls.entries) {
+      test(
+        'S-mode ${entry.key} runs with its trap bit clear (${mode.name})',
+        timeout: const Timeout(Duration(minutes: 10)),
+        () => coreTest(
+          '@0\n${program(entry.value, null)}\n',
+          {Register.x8: ranSentinel, Register.x5: 0},
+          config(mode),
+          nextPc: 0x68,
+          maxCycles: 4000,
+        ),
+      );
+    }
   }
 }
