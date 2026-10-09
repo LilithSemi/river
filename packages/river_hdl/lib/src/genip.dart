@@ -1202,6 +1202,9 @@ class RiverGenIpConfig {
     addressWidth: mxlen.size,
     dataWidth: mxlen.size,
     selWidth: mxlen.size ~/ 8,
+    // The core raises an access fault from ERR, so the fabric must carry it.
+    // Without ERR the fabric reports a bus error as an ordinary ACK.
+    useErr: true,
   );
 
   /// The resolved Harbor board, when `--board` names one.
