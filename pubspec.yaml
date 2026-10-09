@@ -17,7 +17,7 @@ dependency_overrides:
     git:
       url: https://git.lilithsemi.com/LilithSemi/harbor
       path: packages/harbor
-      ref: 132acd022fde59fab1751edd9a77ec0564945168
+      ref: ef4ec03a24c3b7d55fc5ee8841a7f8403b9ee095
 
 dev_dependencies:
   coverage: ^1.15.0

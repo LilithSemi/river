@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
-// river.dart re-exports harbor (UsbEp0Engine, UsbDfuRamSink, Wishbone*,
+// river.dart re-exports harbor (HarborUsbCore, HarborUsbDfu, UsbDfuRamSink,
+// UsbDfuSinkInterface, HarborCdcSync, HarborCdcHandshake, Wishbone*,
 // BusSlavePort, HarborDeviceTreeNode(Provider), BusAddressRange, etc.).
 import 'package:river/river.dart';
 
@@ -234,31 +235,40 @@ class RiverDfuStatus extends BridgeModule with HarborDeviceTreeNodeProvider {
   );
 }
 
-/// The USB DFU subsystem: EP0 enumeration engine + RAM-sink writeback master +
-/// line tristate pads, so the SoC sees one bus MASTER and a few pads.
+/// The USB DFU subsystem: ch9 core + DFU class device + RAM-sink writeback
+/// master + line tristate pads, so the SoC sees one bus master and a few
+/// pads.
 ///
-/// Dual clock domain: `usb_clk`/`usb_reset` is the raw 48 MHz osc (already the
-/// SoC `clk`; runs [UsbEp0Engine] and the USB side of [UsbDfuRamSink]).
-/// `bus_clk`/`bus_reset` is the 12 MHz core/bus domain (the sink's Wishbone
-/// master + CDC FIFO bus side). The FIFO inside the sink bridges the two.
+/// Dual clock domain. `usb_clk`/`usb_reset` is the raw 48 MHz osc (already
+/// the SoC `clk`). It runs [HarborUsbCore], [HarborUsbDfu] and the USB side
+/// of [UsbDfuRamSink]. `bus_clk`/`bus_reset` is the 12 MHz core/bus domain
+/// (the sink's Wishbone master and CDC FIFO bus side). The FIFO inside the
+/// sink bridges the two.
 ///
-/// Exposed: PROVIDER Wishbone `bus` (RAM-sink master); `usb_dp`/`usb_dm` inOut
-/// pads (PHY dp_out/dm_out + oe tristate, pad fed back to the PHY); `usb_pullup`
-/// (D+ enable, gated by `usb_enable`); status outputs image_ready/entry_addr/
-/// bytes_written and a `usb_enable` input for the [RiverDfuStatus] slave.
+/// Exposed ports: a provider Wishbone `bus` (the RAM sink's master), the
+/// `usb_dp`/`usb_dm` inOut pads (core dp_out/dm_out + oe tristate, pad fed
+/// back to the core), `usb_pullup` (D+ enable, gated by `usb_enable`), the
+/// status outputs image_ready/entry_addr/bytes_written, and a `usb_enable`
+/// input for the [RiverDfuStatus] slave.
 class RiverDfuSubsystem extends BridgeModule {
   final int loadBase;
+
+  /// Size of the writable region starting at [loadBase] the sink will
+  /// accept bytes into (the target SRAM region's size).
+  final int regionBytes;
   final int busAddressWidth;
   final int busDataWidth;
 
   RiverDfuSubsystem({
     this.loadBase = 0x80000000,
+    required this.regionBytes,
     this.busAddressWidth = 32,
     this.busDataWidth = 32,
     String? name,
   }) : super('RiverDfuSubsystem', name: name ?? 'usb_dfu') {
-    // Bus-domain clock/reset (12 MHz). Named clk/reset so addMaster auto-wires
-    // them from the bus domain; the 48 MHz usb_clk/usb_reset are wired manually.
+    // Bus-domain clock/reset (12 MHz). Named clk/reset so addMaster
+    // auto-wires them from the bus domain. The 48 MHz usb_clk/usb_reset are
+    // wired manually.
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('usb_clk', PortDirection.input);
@@ -280,19 +290,32 @@ class RiverDfuSubsystem extends BridgeModule {
     final busClk = input('clk');
     final busReset = input('reset');
 
-    // EP0 enumeration engine (48 MHz USB domain).
-    final engine = UsbEp0Engine(name: 'ep0');
-    addSubModule(engine);
-    engine.input('clk').srcConnection! <= usbClk;
-    engine.input('reset').srcConnection! <= usbReset;
+    // ch9 core + DFU class device (48 MHz USB domain). No flash sink is
+    // ever wired up, so the descriptor set only advertises alt 0 (RAM): a
+    // host can then never select the alt setting nothing would service.
+    final core = HarborUsbCore(
+      descriptors: HarborUsbDfu.dfuDescriptors(includeFlashAlt: false),
+      name: 'usb_core',
+    );
+    addSubModule(core);
+    core.input('clk').srcConnection! <= usbClk;
+    core.input('reset').srcConnection! <= usbReset;
+
+    final dfu = HarborUsbDfu(name: 'usb_dfu');
+    addSubModule(dfu);
+    dfu.input('clk').srcConnection! <= usbClk;
+    dfu.input('reset').srcConnection! <= usbReset;
+    connectInterfaces(core.interface('func'), dfu.interface('usb'));
 
     // RAM writeback sink (dual domain, Wishbone master).
     final ramSink = UsbDfuRamSink(
       loadBase: loadBase,
+      regionBytes: regionBytes,
       busAddressWidth: busAddressWidth,
       busDataWidth: busDataWidth,
-      // Depth-8 is plenty: sink_ready back-pressure means the engine never
-      // outruns the bus drain, so a deep FIFO buys nothing but local cells.
+      // Depth-8 is plenty: the sink's own ready back-pressure means the
+      // device never outruns the bus drain, so a deep FIFO buys nothing but
+      // local cells.
       fifoDepth: 8,
       name: 'ram_sink',
     );
@@ -301,15 +324,7 @@ class RiverDfuSubsystem extends BridgeModule {
     ramSink.input('usb_reset').srcConnection! <= usbReset;
     ramSink.input('bus_clk').srcConnection! <= busClk;
     ramSink.input('bus_reset').srcConnection! <= busReset;
-
-    // engine <-> ramSink sink stream (USB domain).
-    ramSink.input('sink_data').srcConnection! <= engine.output('sink_data');
-    ramSink.input('sink_valid').srcConnection! <= engine.output('sink_valid');
-    ramSink.input('dnload_done').srcConnection! <= engine.output('dnload_done');
-    ramSink.input('image_target').srcConnection! <=
-        engine.output('image_target');
-    ramSink.input('alt_setting').srcConnection! <= engine.output('alt_setting');
-    engine.input('sink_ready').srcConnection! <= ramSink.output('sink_ready');
+    connectInterfaces(dfu.interface('sink'), ramSink.interface('dfu'));
 
     // Status outputs (bus domain) to the slave.
     output('image_ready') <= ramSink.output('image_ready');
@@ -317,50 +332,456 @@ class RiverDfuSubsystem extends BridgeModule {
     output('bytes_written') <= ramSink.output('bytes_written');
 
     // USB line tristate pads: drive when oe is high, else high-Z, and feed the
-    // pad value back into the PHY's dp/dm inputs.
+    // pad value back into the core's dp/dm inputs.
     final dpPad = inOut('usb_dp');
     final dmPad = inOut('usb_dm');
-    final oe = engine.output('oe');
-    final dpDrive = TriStateBuffer(engine.output('dp_out'), enable: oe);
-    final dmDrive = TriStateBuffer(engine.output('dm_out'), enable: oe);
+    final oe = core.output('oe');
+    final dpDrive = TriStateBuffer(core.output('dp_out'), enable: oe);
+    final dmDrive = TriStateBuffer(core.output('dm_out'), enable: oe);
     dpPad <= dpDrive.out;
     dmPad <= dmDrive.out;
-    engine.input('dp').srcConnection! <= dpPad;
-    engine.input('dm').srcConnection! <= dmPad;
+    core.input('dp').srcConnection! <= dpPad;
+    core.input('dm').srcConnection! <= dmPad;
 
     // Pull-up enable, gated by the CPU-written usb_enable so the device only
     // connects once the maskrom has armed DFU mode.
-    output('usb_pullup') <= engine.output('usb_pullup') & input('usb_enable');
+    output('usb_pullup') <= core.output('usb_pullup') & input('usb_enable');
 
     // Expose the RAM-sink Wishbone master as this subsystem's `bus`.
     pullUpInterface(ramSink.interface('bus'), newIntfName: 'bus');
   }
 }
 
+/// Implements [UsbDfuSinkInterface]'s consumer side for the lean software
+/// path: a single-entry CDC toggle handshake moves each byte, and the end
+/// marker, into the bus domain for [RiverDfuSubsystemSw]'s register file.
+///
+/// Public so a test can drive `dfu` directly, the way Harbor's own sink
+/// tests drive [UsbDfuRamSink].
+///
+/// Reset boundary: usbReset/busReset are independent, and either can pulse
+/// alone. Only the bus side ever forces anything: it watches a synced copy
+/// of usbReset and, for a few cycles after that (or its own reset) clears,
+/// treats it like `clear` below. Forcing the USB side's producerToggle
+/// instead would round-trip it through its own reset value, which the bus
+/// domain cannot tell apart from a real byte landing.
+class RiverDfuSwSink extends BridgeModule {
+  RiverDfuSwSink({String? name})
+    : super('RiverDfuSwSink', name: name ?? 'usb_dfu_sw_sink') {
+    createPort('usb_clk', PortDirection.input);
+    createPort('usb_reset', PortDirection.input);
+    createPort('bus_clk', PortDirection.input);
+    createPort('bus_reset', PortDirection.input);
+    // Bus-domain W1P: the CPU has read the current byte (or the dnload_done
+    // status) and releases the next one.
+    createPort('advance', PortDirection.input);
+
+    final dfuRef = addInterface(
+      UsbDfuSinkInterface(),
+      name: 'dfu',
+      role: PairRole.consumer,
+    );
+    final dfu = dfuRef.internalInterface!;
+
+    // Bus-domain register-file taps, read by RiverDfuSubsystemSw.
+    addOutput('rx_data', width: 8);
+    addOutput('rx_valid');
+    addOutput('dnload_done');
+    addOutput('bytes_count', width: 32);
+    // Sticky: the device issued `clear` (CLRSTATUS, ABORT, a fresh
+    // download, or a seen usb-only reset). W1C via `clear_ack` below.
+    addOutput('cleared');
+    createPort('clear_ack', PortDirection.input);
+
+    final usbClk = input('usb_clk');
+    final usbReset = input('usb_reset');
+    final busClk = input('bus_clk');
+    final busReset = input('bus_reset');
+    final advance = input('advance');
+    final clearAck = input('clear_ack');
+
+    // consumerToggle (bus domain): flips each time the CPU acks a byte.
+    final consumerToggle = Logic(name: 'consumer_toggle');
+
+    // Synchronize the consumer toggle into the USB domain so the device
+    // knows its last byte was consumed and may release the next.
+    final consSyncUsb = HarborCdcSync(stages: 2, name: 'cons_sync');
+    addSubModule(consSyncUsb);
+    consSyncUsb.input('async_in').srcConnection! <= consumerToggle;
+    consSyncUsb.input('dst_clk').srcConnection! <= usbClk;
+    consSyncUsb.input('dst_reset').srcConnection! <= usbReset;
+    final consumerInUsb = consSyncUsb.output('sync_out');
+
+    // USB-domain producer side: latch the byte (or the end marker) and flip
+    // the producer toggle. ready: the device may push the next byte/marker
+    // only once the prior one has been consumed, i.e. producer and
+    // (synchronized) consumer toggles match. This is the depth-1
+    // back-pressure that replaces a deep FIFO.
+    final producerToggle = Logic(name: 'producer_toggle');
+    final byteHold = Logic(name: 'byte_hold', width: 8);
+    final endHold = Logic(name: 'end_hold');
+    // xfer_end has no backpressure of its own: the device drives it off the
+    // zero-length DNLOAD's SETUP, not gated on ready the way a data byte
+    // is. Latch it if ready is still low from an earlier unacked byte, and
+    // hand it over the moment ready returns.
+    final endPendingUsb = Logic(name: 'end_pending_usb_q');
+
+    // Reset-boundary recovery, bus side only. See the class comment.
+    final usbResetBusSync = HarborCdcSync(name: 'usb_reset_bus_sync');
+    addSubModule(usbResetBusSync);
+    usbResetBusSync.input('async_in').srcConnection! <= usbReset;
+    usbResetBusSync.input('dst_clk').srcConnection! <= busClk;
+    usbResetBusSync.input('dst_reset').srcConnection! <= busReset;
+    final usbResetSeenBus = usbResetBusSync.output('sync_out');
+    final busRecoverCount = Logic(name: 'bus_recover_count_q', width: 2);
+    final busRecovering = Logic(name: 'bus_recovering_q');
+    Sequential(busClk, [
+      If(
+        busReset | usbResetSeenBus,
+        then: [busRecoverCount < Const(0, width: 2), busRecovering < Const(1)],
+        orElse: [
+          If(
+            busRecovering & busRecoverCount.lt(Const(3, width: 2)),
+            then: [busRecoverCount < busRecoverCount + Const(1, width: 2)],
+            orElse: [busRecovering < Const(0)],
+          ),
+        ],
+      ),
+    ]);
+
+    // Whether busReset has been seen anywhere in the current recovery
+    // episode: a power-on or bus-only reset, not a usb-only reset seen
+    // at runtime. `cleared` (below) only latches for the latter; a plain
+    // reset must read back 0, not look like an aborted download. Spans
+    // the raw trigger AND busRecovering's own settle tail: busRecovering
+    // itself (a register) still reads stale on the episode's first
+    // cycle, and resetting this the instant the raw signals clear would
+    // drop it a few cycles before busRecovering (and the `cleared` check
+    // below) are actually done with it.
+    final recoveryActive = (busRecovering | busReset | usbResetSeenBus)
+        .named('recovery_active');
+    final recoveryJointWithBusReset = Logic(
+      name: 'recovery_joint_with_bus_reset_q',
+    );
+    Sequential(busClk, [
+      If(
+        recoveryActive,
+        then: [
+          If(busReset, then: [recoveryJointWithBusReset < Const(1)]),
+        ],
+        orElse: [recoveryJointWithBusReset < Const(0)],
+      ),
+    ]);
+
+    // Sync busRecovering back into the USB domain and hold `ready` low
+    // while it is set. Both toggles can briefly read as "matched" right
+    // after a reset purely because they reset to the same fixed value,
+    // not because the bus side has actually converged yet. Without this,
+    // the device could see that transient match, push a byte, and have it
+    // lost while the bus side is still forcing prodSeen to track the
+    // producer in lockstep (see the busClk Sequential below).
+    final busRecoveringUsbSync = HarborCdcSync(name: 'bus_recovering_usb_sync');
+    addSubModule(busRecoveringUsbSync);
+    busRecoveringUsbSync.input('async_in').srcConnection! <= busRecovering;
+    busRecoveringUsbSync.input('dst_clk').srcConnection! <= usbClk;
+    busRecoveringUsbSync.input('dst_reset').srcConnection! <= usbReset;
+    final busRecoveringSeenUsb = busRecoveringUsbSync.output('sync_out');
+    final sinkReady =
+        (producerToggle.eq(consumerInUsb) & ~busRecoveringSeenUsb).named(
+          'sw_sink_ready',
+        );
+
+    // clear: a fresh image or CLRSTATUS/ABORT. Crossed the same way as a
+    // byte. The bus domain drops whatever it was holding and forces
+    // consumerToggle to match the current producer toggle (below), so
+    // ready (producer == consumer) comes back high immediately instead of
+    // staying wedged on a byte or end marker this clear just discarded.
+    final clearToggleUsb = Logic(name: 'clear_toggle_usb_q');
+    Sequential(usbClk, [
+      If(
+        usbReset,
+        then: [clearToggleUsb < Const(0)],
+        orElse: [
+          If(dfu.clear, then: [clearToggleUsb < ~clearToggleUsb]),
+        ],
+      ),
+    ]);
+    final clearSync = HarborCdcSync(name: 'clear_sync');
+    addSubModule(clearSync);
+    clearSync.input('async_in').srcConnection! <= clearToggleUsb;
+    clearSync.input('dst_clk').srcConnection! <= busClk;
+    clearSync.input('dst_reset').srcConnection! <= busReset;
+    final clearTogglePrevBus = Logic(name: 'clear_toggle_prev_bus_q');
+    Sequential(busClk, [
+      If(
+        busReset,
+        then: [clearTogglePrevBus < Const(0)],
+        orElse: [clearTogglePrevBus < clearSync.output('sync_out')],
+      ),
+    ]);
+    final clearPulseBus = (clearSync.output('sync_out') ^ clearTogglePrevBus)
+        .named('clear_pulse_bus');
+
+    Sequential(usbClk, [
+      If(
+        usbReset,
+        then: [
+          producerToggle < Const(0),
+          byteHold < Const(0, width: 8),
+          endHold < Const(0),
+          endPendingUsb < Const(0),
+        ],
+        orElse: [
+          If(dfu.end & ~sinkReady, then: [endPendingUsb < Const(1)]),
+          // Capture a byte, or a pending or fresh end marker, only once
+          // ready is high.
+          If(
+            sinkReady & (dfu.valid | dfu.end | endPendingUsb),
+            then: [
+              byteHold < dfu.data,
+              endHold < dfu.end | endPendingUsb,
+              producerToggle < ~producerToggle,
+              endPendingUsb < Const(0),
+            ],
+          ),
+          // `clear` can land while an end marker is still latched here. A
+          // USB bus reset snaps the device straight to dfuIDLE without
+          // ever touching this sink, and a DNLOAD from there raises
+          // `clear`. An unexpected request during manifest also reaches
+          // dfuERROR, and CLRSTATUS from there raises `clear` too. Either
+          // way, drop the stale latch or it lands in the next image.
+          If(dfu.clear, then: [endPendingUsb < Const(0)]),
+        ],
+      ),
+    ]);
+
+    dfu.ready <= sinkReady;
+    dfu.error <= Const(0, width: 4);
+
+    // Synchronize the producer toggle into the bus domain.
+    final prodSyncBus = HarborCdcSync(stages: 2, name: 'prod_sync');
+    addSubModule(prodSyncBus);
+    prodSyncBus.input('async_in').srcConnection! <= producerToggle;
+    prodSyncBus.input('dst_clk').srcConnection! <= busClk;
+    prodSyncBus.input('dst_reset').srcConnection! <= busReset;
+    final producerInBus = prodSyncBus.output('sync_out');
+
+    // Bus-domain capture + register-file state.
+    final rxData = Logic(name: 'rx_data_reg', width: 8);
+    final rxValid = Logic(name: 'rx_valid_reg');
+    final dnloadDoneSticky = Logic(name: 'dnload_done_sticky');
+    final bytesCount = Logic(name: 'bytes_count_reg', width: 32);
+    // True from the cycle the end marker is captured until the CPU's next
+    // advance. Tells that advance to ack `dfu.done` too, not just a normal
+    // byte.
+    final pendingIsEnd = Logic(name: 'pending_is_end');
+    // Last seen producer toggle (bus domain) to detect a fresh byte edge.
+    final prodSeen = Logic(name: 'prod_seen');
+    final doneAckToggleBus = Logic(name: 'done_ack_toggle_bus_q');
+    final clearAckToggleBus = Logic(name: 'clear_ack_toggle_bus_q');
+    final clearedSticky = Logic(name: 'cleared_sticky');
+
+    // done/clearDone cross as toggles, instantiated here (ahead of the
+    // reset branch below that reads their own synced echo back) so a
+    // bus-only reset can re-arm each from what the (unreset) USB side
+    // already observes, instead of a bare 0.
+    final doneAckSync = HarborCdcSync(name: 'done_ack_sync');
+    addSubModule(doneAckSync);
+    doneAckSync.input('async_in').srcConnection! <= doneAckToggleBus;
+    doneAckSync.input('dst_clk').srcConnection! <= usbClk;
+    doneAckSync.input('dst_reset').srcConnection! <= usbReset;
+
+    final clearAckSync = HarborCdcSync(name: 'clear_ack_sync');
+    addSubModule(clearAckSync);
+    clearAckSync.input('async_in').srcConnection! <= clearAckToggleBus;
+    clearAckSync.input('dst_clk').srcConnection! <= usbClk;
+    clearAckSync.input('dst_reset').srcConnection! <= usbReset;
+
+    // A new byte is present when the synchronized producer toggle differs
+    // from what we last captured.
+    final newByte = producerInBus.neq(prodSeen).named('sw_new_byte');
+
+    Sequential(busClk, [
+      If(
+        busReset,
+        then: [
+          consumerToggle < Const(0),
+          rxData < Const(0, width: 8),
+          rxValid < Const(0),
+          dnloadDoneSticky < Const(0),
+          bytesCount < Const(0, width: 32),
+          pendingIsEnd < Const(0),
+          prodSeen < Const(0),
+          // Re-arm from the already-synced echo, not a bare 0. The
+          // (unreset) USB side holds the matching "previous" sample for
+          // each, and seeding anything else would look like a phantom
+          // done/clearDone the moment the sync catches up. A real clear
+          // in flight at this exact instant is still dropped either way,
+          // same as UsbDfuRamSink's documented bus_reset/clear policy.
+          // HarborUsbDfu's own clear watchdog recovers it.
+          doneAckToggleBus < doneAckSync.output('sync_out'),
+          clearAckToggleBus < clearAckSync.output('sync_out'),
+          clearedSticky < Const(0),
+        ],
+        orElse: [
+          If(
+            busRecovering,
+            then: [
+              // A seen usb-only reset is treated like `clear`: drop
+              // whatever byte/end marker was pending. `cleared` only
+              // latches when busReset was never part of this episode, a
+              // genuine usb-only reset seen at runtime, not a plain
+              // power-on or bus-only reset (recoveryJointWithBusReset).
+              rxValid < Const(0),
+              pendingIsEnd < Const(0),
+              bytesCount < Const(0, width: 32),
+              dnloadDoneSticky < Const(0),
+              prodSeen < producerInBus,
+              consumerToggle < producerInBus,
+              If(
+                ~recoveryJointWithBusReset,
+                then: [clearedSticky < Const(1)],
+              ),
+            ],
+            orElse: [
+              If(
+                clearPulseBus,
+                then: [
+                  rxValid < Const(0),
+                  pendingIsEnd < Const(0),
+                  bytesCount < Const(0, width: 32),
+                  dnloadDoneSticky < Const(0),
+                  prodSeen < producerInBus,
+                  consumerToggle < producerInBus,
+                  clearAckToggleBus < ~clearAckToggleBus,
+                  clearedSticky < Const(1),
+                ],
+                orElse: [
+                  // Capture a freshly-crossed byte into RXDATA, set rx_valid.
+                  If(
+                    newByte,
+                    then: [
+                      rxData < byteHold,
+                      prodSeen < producerInBus,
+                      rxValid < Const(1),
+                      bytesCount < bytesCount + Const(1, width: 32),
+                      If(
+                        endHold,
+                        then: [
+                          dnloadDoneSticky < Const(1),
+                          pendingIsEnd < Const(1),
+                        ],
+                      ),
+                    ],
+                  ),
+                  // advance: ack the current byte, and the end marker too
+                  // if that is what was waiting. Gated on rxValid: with
+                  // nothing held, an advance (a stray one, or one that
+                  // lands just after a clear already released it) would
+                  // otherwise flip the toggle for no byte at all.
+                  If(
+                    advance & rxValid,
+                    then: [
+                      consumerToggle < ~consumerToggle,
+                      rxValid < Const(0),
+                      If(
+                        pendingIsEnd,
+                        then: [
+                          pendingIsEnd < Const(0),
+                          doneAckToggleBus < ~doneAckToggleBus,
+                        ],
+                      ),
+                    ],
+                  ),
+                  If(clearAck, then: [clearedSticky < Const(0)]),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ]);
+
+    // done: bus -> USB, pulses once the maskrom's advance has acked the end
+    // marker.
+    final doneAckTogglePrevUsb = Logic(name: 'done_ack_toggle_prev_usb_q');
+    Sequential(usbClk, [
+      If(
+        usbReset,
+        then: [doneAckTogglePrevUsb < Const(0)],
+        orElse: [doneAckTogglePrevUsb < doneAckSync.output('sync_out')],
+      ),
+    ]);
+    final doneUsbPulse = (doneAckSync.output('sync_out') ^ doneAckTogglePrevUsb)
+        .named('sw_done_usb_pulse');
+    dfu.done <= doneUsbPulse;
+
+    // busy: raised the instant the end marker is seen, held until the
+    // maskrom's advance drains it through to `done`, or dropped by
+    // `clear` so it can never wedge high with no `done` ever due.
+    final busyUsb = Logic(name: 'busy_usb_q');
+    Sequential(usbClk, [
+      If(
+        usbReset,
+        then: [busyUsb < Const(0)],
+        orElse: [
+          If(dfu.end, then: [busyUsb < Const(1)]),
+          If(doneUsbPulse | dfu.clear, then: [busyUsb < Const(0)]),
+        ],
+      ),
+    ]);
+    dfu.busy <= busyUsb;
+
+    // clearDone: bus -> USB, the mirror of clear. Tells the device it is
+    // safe to resume the byte stream for the image that follows.
+    final clearAckTogglePrevUsb = Logic(name: 'clear_ack_toggle_prev_usb_q');
+    Sequential(usbClk, [
+      If(
+        usbReset,
+        then: [clearAckTogglePrevUsb < Const(0)],
+        orElse: [clearAckTogglePrevUsb < clearAckSync.output('sync_out')],
+      ),
+    ]);
+    dfu.clearDone <=
+        (clearAckSync.output('sync_out') ^ clearAckTogglePrevUsb).named(
+          'sw_clear_ack_usb_pulse',
+        );
+
+    output('rx_data') <= rxData;
+    output('rx_valid') <= rxValid;
+    output('dnload_done') <= dnloadDoneSticky;
+    output('bytes_count') <= bytesCount;
+    output('cleared') <= clearedSticky;
+  }
+}
+
 /// The lean, software-driven USB DFU subsystem (CAR target): the cheap
 /// alternative to [RiverDfuSubsystem] for the LFE5U-25F. Drops the whole
 /// hardware RAM-sink tier (no [UsbDfuRamSink], no [HarborCdcFifo], no
-/// [RiverWishboneArbiter], no second bus master); this block is a single MMIO
-/// SLAVE and the River core is the only bus participant. Keeps the PHY (inside
-/// [UsbEp0Engine]) and a small register file with a one-byte receive handshake.
+/// [RiverWishboneArbiter], no second bus master). Keeps the ch9 core + DFU
+/// device and a small register file fed by [RiverDfuSwSink].
 ///
-/// The maskrom drives the download in software: poll STATUS for a captured byte,
-/// read RXDATA, store into Cache-as-RAM (via the rcache CSRs), ack to release the
-/// next byte. No SRAM region; the DFU target is CAR.
+/// There is no maskrom boot path for this mode: software running later on
+/// the CPU (not the maskrom) polls STATUS, reads RXDATA, and writes
+/// CONTROL.advance to release the next byte, storing each one wherever it
+/// chooses (Cache-as-RAM, a buffer, ...). No SRAM region is needed here.
 ///
-/// Byte path / CDC: engine `sink_valid`/`sink_data` are 48 MHz USB domain, the
-/// bus is 12 MHz. A single-entry two-phase handshake crosses each byte: a USB
-/// `producer toggle` flips per byte, the bus domain syncs it ([HarborCdcSync])
-/// and on an edge captures RXDATA + sets sticky `rx_valid`; the CPU's CONTROL
-/// `advance` write flips a `consumer toggle` synced back so `sink_ready` re-arms.
-/// sink_ready == (producer == consumer) is the depth-1 back-pressure, so no deep
-/// FIFO is needed.
+/// `dfu_state` crosses through a [HarborCdcHandshake] (a plain double-flop
+/// sync can tear across a multi-bit transition). `configured` crosses
+/// through a plain [HarborCdcSync] (one bit cannot tear).
 ///
 /// Word-mapped registers (word offsets within [baseAddress]):
 ///   0x00 STATUS  (R)  bit0 = rx_valid, bit1 = dnload_done, bit2 = configured,
-///                     bits[7:4] = dfu_state, rest reserved 0.
+///                     bit3 = cleared (sticky: the device issued `clear` on
+///                     CLRSTATUS, ABORT, a fresh download, or a seen
+///                     usb-only reset, W1C via CONTROL bit2), bits[7:4] =
+///                     dfu_state. Software must still advance the end
+///                     marker (bit1). The host's GETSTATUS keeps reporting
+///                     dfuMANIFEST/busy until it does.
 ///   0x04 CONTROL (R/W) bit0 = usb_enable (pull-up/connect), bit1 = advance
-///                     (W1P: ack current byte, release next). usb_enable reads back.
+///                     (W1P: ack current byte, release next), bit2 =
+///                     clear_ack (W1C: clears STATUS bit3). usb_enable
+///                     reads back, the other bits do not.
 ///   0x08 RXDATA  (R)  bits[7:0] = captured download byte.
 ///   0x0C BYTES   (R)  running count of bytes captured (debug).
 class RiverDfuSubsystemSw extends BridgeModule
@@ -401,123 +822,58 @@ class RiverDfuSubsystemSw extends BridgeModule
       dataWidth: busDataWidth,
     );
 
-    // EP0 enumeration engine + PHY (48 MHz USB domain).
-    final engine = UsbEp0Engine(name: 'ep0');
-    addSubModule(engine);
-    engine.input('clk').srcConnection! <= usbClk;
-    engine.input('reset').srcConnection! <= usbReset;
+    // ch9 core + DFU class device (48 MHz USB domain). No flash sink is
+    // ever wired up, so the descriptor set only advertises alt 0 (RAM).
+    final core = HarborUsbCore(
+      descriptors: HarborUsbDfu.dfuDescriptors(includeFlashAlt: false),
+      name: 'usb_core',
+    );
+    addSubModule(core);
+    core.input('clk').srcConnection! <= usbClk;
+    core.input('reset').srcConnection! <= usbReset;
 
-    final sinkData = engine.output('sink_data'); // [7:0], USB domain
-    final sinkValid = engine.output('sink_valid'); // pulse, USB domain
-    final dnloadDoneUsb = engine.output('dnload_done'); // pulse, USB domain
+    final dfu = HarborUsbDfu(name: 'usb_dfu');
+    addSubModule(dfu);
+    dfu.input('clk').srcConnection! <= usbClk;
+    dfu.input('reset').srcConnection! <= usbReset;
+    connectInterfaces(core.interface('func'), dfu.interface('usb'));
 
-    // Bus-domain control regs first (so the consumer toggle exists).
+    // The lean sink: a depth-1 CDC handshake straight into the register file
+    // below, no RAM/flash write path.
+    final sink = RiverDfuSwSink(name: 'sink');
+    addSubModule(sink);
+    sink.input('usb_clk').srcConnection! <= usbClk;
+    sink.input('usb_reset').srcConnection! <= usbReset;
+    sink.input('bus_clk').srcConnection! <= busClk;
+    sink.input('bus_reset').srcConnection! <= busReset;
+    connectInterfaces(dfu.interface('sink'), sink.interface('dfu'));
+
+    // Bus-domain control regs.
     final usbEnableReg = Logic(name: 'usb_enable_reg');
     final advancePulse = Logic(name: 'advance_pulse'); // bus-domain W1P decode
-    // consumerToggle (bus domain): flips each time the CPU acks a byte.
-    final consumerToggle = Logic(name: 'consumer_toggle');
-
-    // Synchronize the consumer toggle into the USB domain so the engine knows
-    // its last byte was consumed and it may release the next.
-    final consSyncUsb = HarborCdcSync(stages: 2, name: 'cons_sync');
-    addSubModule(consSyncUsb);
-    consSyncUsb.input('async_in').srcConnection! <= consumerToggle;
-    consSyncUsb.input('dst_clk').srcConnection! <= usbClk;
-    consSyncUsb.input('dst_reset').srcConnection! <= usbReset;
-    final consumerInUsb = consSyncUsb.output('sync_out');
-
-    // USB-domain producer side: latch byte + flip producer toggle.
-    final producerToggle = Logic(name: 'producer_toggle');
-    final byteHold = Logic(name: 'byte_hold', width: 8);
-    final doneHold = Logic(name: 'done_hold');
-    // sink_ready: the engine may push the next byte/marker only once the prior
-    // one has been consumed, i.e. producer and (synchronized) consumer toggles
-    // match. This is the depth-1 back-pressure that replaces the deep FIFO.
-    final sinkReady = producerToggle.eq(consumerInUsb).named('sink_ready');
-
-    Sequential(usbClk, [
-      If(
-        usbReset,
-        then: [
-          producerToggle < Const(0),
-          byteHold < Const(0, width: 8),
-          doneHold < Const(0),
-        ],
-        orElse: [
-          // Capture a byte (or the done marker) only when the engine actually
-          // strobes AND we are allowed to advance (sink_ready high).
-          If(
-            sinkReady & (sinkValid | dnloadDoneUsb),
-            then: [
-              byteHold < sinkData,
-              doneHold < dnloadDoneUsb,
-              producerToggle < ~producerToggle,
-            ],
-          ),
-        ],
-      ),
-    ]);
-
-    // Drive the engine's back-pressure input.
-    engine.input('sink_ready').srcConnection! <= sinkReady;
-
-    // Synchronize the producer toggle into the bus domain.
-    final prodSyncBus = HarborCdcSync(stages: 2, name: 'prod_sync');
-    addSubModule(prodSyncBus);
-    prodSyncBus.input('async_in').srcConnection! <= producerToggle;
-    prodSyncBus.input('dst_clk').srcConnection! <= busClk;
-    prodSyncBus.input('dst_reset').srcConnection! <= busReset;
-    final producerInBus = prodSyncBus.output('sync_out');
-
-    // Bus-domain capture + register file.
-    final rxData = Logic(name: 'rx_data_reg', width: 8);
-    final rxValid = Logic(name: 'rx_valid_reg');
-    final dnloadDoneSticky = Logic(name: 'dnload_done_sticky');
-    final bytesCount = Logic(name: 'bytes_count', width: 32);
+    final clearAckPulse = Logic(name: 'clear_ack_pulse'); // bus-domain W1C
     final ackReg = Logic(name: 'sw_ack');
-    // Last seen producer toggle (bus domain) to detect a fresh byte edge.
-    final prodSeen = Logic(name: 'prod_seen');
 
     final stb = bus.stb;
     final we = bus.we;
     final wordSel = bus.addr.getRange(2, 4); // bits [3:2] -> 0..3
-
-    // A new byte is present when the synchronized producer toggle differs from
-    // what we last captured.
-    final newByte = producerInBus.neq(prodSeen).named('new_byte');
 
     Sequential(busClk, [
       If(
         busReset,
         then: [
           usbEnableReg < Const(0),
-          consumerToggle < Const(0),
-          rxData < Const(0, width: 8),
-          rxValid < Const(0),
-          dnloadDoneSticky < Const(0),
-          bytesCount < Const(0, width: 32),
           ackReg < Const(0),
-          prodSeen < Const(0),
           advancePulse < Const(0),
+          clearAckPulse < Const(0),
         ],
         orElse: [
           // Single-cycle registered ACK.
           ackReg < (stb & ~ackReg),
 
-          // Capture a freshly-crossed byte into RXDATA, set rx_valid.
-          If(
-            newByte,
-            then: [
-              rxData < byteHold,
-              prodSeen < producerInBus,
-              rxValid < Const(1),
-              If(doneHold, then: [dnloadDoneSticky < Const(1)]),
-              bytesCount < bytesCount + Const(1, width: 32),
-            ],
-          ),
-
           // Register writes (CONTROL at word offset 1).
           advancePulse < Const(0),
+          clearAckPulse < Const(0),
           If(
             stb & we & ~ackReg & wordSel.eq(Const(1, width: 2)),
             then: [
@@ -525,29 +881,71 @@ class RiverDfuSubsystemSw extends BridgeModule
               // advance (bit1, write-1-pulse): ack the current byte.
               If(
                 bus.dataIn.getRange(1, 2).eq(Const(1, width: 1)),
-                then: [
-                  consumerToggle < ~consumerToggle,
-                  rxValid < Const(0),
-                  advancePulse < Const(1),
-                ],
+                then: [advancePulse < Const(1)],
+              ),
+              // clear_ack (bit2, write-1-clear): clear STATUS bit3.
+              If(
+                bus.dataIn.getRange(2, 3).eq(Const(1, width: 1)),
+                then: [clearAckPulse < Const(1)],
               ),
             ],
           ),
         ],
       ),
     ]);
+    sink.input('advance').srcConnection! <= advancePulse;
+    sink.input('clear_ack').srcConnection! <= clearAckPulse;
 
     bus.ack <= ackReg;
 
-    // Read mux.
-    final dfuState = engine.output('dfu_state'); // [3:0], USB domain (slow)
-    final configured = engine.output('configured');
-    // configured/dfu_state are slow status; sampling them directly across the
-    // domain is acceptable for polling (they change at human/USB-transfer rate).
-    final statusWord = [
+    // configured: a 1-bit level, so a plain double-flop sync cannot tear.
+    final configuredSync = HarborCdcSync(name: 'configured_sync');
+    addSubModule(configuredSync);
+    configuredSync.input('async_in').srcConnection! <= core.output('configured');
+    configuredSync.input('dst_clk').srcConnection! <= busClk;
+    configuredSync.input('dst_reset').srcConnection! <= busReset;
+    final configured = configuredSync.output('sync_out');
+
+    // dfu_state: 4 bits, crossed through a req/ack handshake instead of a
+    // plain sync so the bus domain only ever sees a value the USB domain
+    // latched whole, never a mix of old and new bits from mid-transition.
+    // dst_data is the handshake's own source-domain register read back
+    // raw, so it can keep moving the instant the next transfer is
+    // accepted. Latch it into a bus-domain register on dst_valid instead
+    // of reading it combinationally.
+    final dfuStateXing = HarborCdcHandshake(dataWidth: 4, name: 'dfu_state_xing');
+    addSubModule(dfuStateXing);
+    dfuStateXing.input('src_clk').srcConnection! <= usbClk;
+    dfuStateXing.input('src_reset').srcConnection! <= usbReset;
+    dfuStateXing.input('src_data').srcConnection! <= dfu.output('dfu_state');
+    dfuStateXing.input('src_valid').srcConnection! <= Const(1);
+    dfuStateXing.input('dst_clk').srcConnection! <= busClk;
+    dfuStateXing.input('dst_reset').srcConnection! <= busReset;
+    dfuStateXing.input('dst_ready').srcConnection! <= Const(1);
+    final dfuStateReg = Logic(name: 'dfu_state_reg', width: 4);
+    Sequential(busClk, [
+      If(
+        busReset,
+        then: [dfuStateReg < Const(0, width: 4)],
+        orElse: [
+          If(
+            dfuStateXing.output('dst_valid'),
+            then: [dfuStateReg < dfuStateXing.output('dst_data')],
+          ),
+        ],
+      ),
+    ]);
+    final dfuState = dfuStateReg;
+
+    final rxValid = sink.output('rx_valid');
+    final dnloadDoneSticky = sink.output('dnload_done');
+    final clearedSticky = sink.output('cleared');
+    final rxData = sink.output('rx_data');
+    final bytesCount = sink.output('bytes_count');
+    final statusWord = <Logic>[
       Const(0, width: busDataWidth - 8),
       dfuState, // [7:4]
-      Const(0), // [3] reserved
+      clearedSticky, // [3]
       configured, // [2]
       dnloadDoneSticky, // [1]
       rxValid, // [0]
@@ -572,16 +970,16 @@ class RiverDfuSubsystemSw extends BridgeModule
     // USB line tristate pads.
     final dpPad = inOut('usb_dp');
     final dmPad = inOut('usb_dm');
-    final oe = engine.output('oe');
-    final dpDrive = TriStateBuffer(engine.output('dp_out'), enable: oe);
-    final dmDrive = TriStateBuffer(engine.output('dm_out'), enable: oe);
+    final oe = core.output('oe');
+    final dpDrive = TriStateBuffer(core.output('dp_out'), enable: oe);
+    final dmDrive = TriStateBuffer(core.output('dm_out'), enable: oe);
     dpPad <= dpDrive.out;
     dmPad <= dmDrive.out;
-    engine.input('dp').srcConnection! <= dpPad;
-    engine.input('dm').srcConnection! <= dmPad;
+    core.input('dp').srcConnection! <= dpPad;
+    core.input('dm').srcConnection! <= dmPad;
 
     // Pull-up enable, gated by the CPU-written usb_enable.
-    output('usb_pullup') <= engine.output('usb_pullup') & usbEnableReg;
+    output('usb_pullup') <= core.output('usb_pullup') & usbEnableReg;
   }
 
   @override

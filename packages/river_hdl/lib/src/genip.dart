@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:rohd/rohd.dart' show Logic, Sequential, Const;
+import 'package:rohd/rohd.dart' show Logic, Const;
 import 'package:river/river.dart';
 import 'package:river_adl/river_adl.dart' as adl;
 import 'package:river_maskrom/river_maskrom.dart';
@@ -2275,6 +2275,7 @@ class RiverGenIpConfig {
     // (auto-wired via addMaster). The 48 MHz USB side is wired manually.
     final dfu = RiverDfuSubsystem(
       loadBase: ram.address,
+      regionBytes: ram.size,
       busAddressWidth: busConfig.addressWidth,
       busDataWidth: busConfig.dataWidth,
     );
@@ -2519,9 +2520,13 @@ class RiverGenIpConfig {
     WishboneConfig busConfig,
   ) async {
     final firstMem = memories.isNotEmpty ? memories.first : null;
-    // When USB DFU is integrated, the maskrom arms USB, waits for the host to
-    // download an image into SRAM, then jumps to the reported entry address.
-    final dfuConfig = usbDfu
+    // Hardware-mode USB DFU only: the maskrom arms USB, waits for the host
+    // to download an image into SRAM, then jumps to the reported entry
+    // address. RiverDfuConfig's addresses are RiverDfuStatus's registers,
+    // which only the hardware subsystem instantiates. Software mode has no
+    // maskrom boot path of its own: RiverDfuSubsystemSw is for firmware
+    // that runs later and reads its register file directly.
+    final dfuConfig = (usbDfu && usbDfuMode == UsbDfuMode.hardware)
         ? RiverDfuConfig(
             controlAddr: dfuControlAddr,
             statusAddr: dfuStatusAddr,
