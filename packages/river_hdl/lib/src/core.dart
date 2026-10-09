@@ -329,9 +329,31 @@ class RiverCore extends BridgeModule {
       config.mxlen.size,
       config.mxlen.size,
     );
-    // The current D-cache is virtually addressed before translation and has
-    // no physical PMA check on hits. Keep its existing alignment traps. Likewise
-    // do not advertise this path with unimplemented PMP/PBMT or H/OoO contexts.
+    final l1 = config.l1cache;
+    // Keep unsupported execution/translation profiles on the legacy path.
+    // Scalar Sv39 checks translation and permission before physical cache hits.
+    final physicalCaches =
+        l1 != null &&
+        !dualDispatch &&
+        l1.d.lineSize <= 4096 &&
+        (l1.i == null || l1.i!.lineSize <= 4096) &&
+        config.mmu.hasPaging &&
+        !config.hasHypervisor &&
+        !config.speculativeFetch &&
+        config.executionMode == ExecutionMode.inOrder &&
+        config.mmu.pmp.entries == 0 &&
+        !config.mmu.hasPageBasedMemoryTypes &&
+        config.mmu.pagingModes.every(
+          (m) =>
+              m == RiscVPagingMode.bare ||
+              (config.mxlen == RiscVMxlen.rv64 && m == RiscVPagingMode.sv39),
+        ) &&
+        wbConfig.dataWidth == config.mxlen.size &&
+        wbConfig.addressWidth == config.mxlen.size &&
+        wbConfig.effectiveSelWidth == config.mxlen.size ~/ 8;
+
+    // Cached misaligned loads remain disabled, including on the physical path.
+    // Do not advertise this path with unimplemented PMP/PBMT or H/OoO contexts.
     // A platform opts in by describing safe, full-beat-readable RAM in its PMAs.
     final enableMisalignedLoads =
         config.l1cache == null &&
@@ -430,7 +452,7 @@ class RiverCore extends BridgeModule {
       execWriteActive,
       writeLog2Size,
       loadUnit == null
-          ? Const(2, width: 3)
+          ? (physicalCaches ? loadSize : Const(2, width: 3))
           : mux(
               loadUnit.restricted,
               Const((config.mxlen.size ~/ 8).bitLength - 1, width: 3),
@@ -471,6 +493,7 @@ class RiverCore extends BridgeModule {
         ? mux(grantP1Now, pipeFetchRead1!.addr, pipeFetchRead.addr)
         : pipeFetchRead.addr;
 
+    // Legacy L1 wiring (for profiles not using physical caches below).
     // Optional L1 instruction cache between the fetch unit(s) and the MMU ifetch
     // port. Hits in one cycle; misses fill a line from the MMU (its miss port
     // drives the MMU ifetch instead of the arbiter). Dual-dispatch serves both
@@ -479,32 +502,10 @@ class RiverCore extends BridgeModule {
     // fills one paced word at a time, so the PHY only sees single reads it
     // captures correctly, never a back-to-back burst. The D-cache extends the
     // same pacing to data loads.
-    final l1 = config.l1cache;
-    // Keep unsupported execution/translation profiles on the legacy path.
-    // Scalar Sv39 checks translation and permission before physical cache hits.
-    final physicalCaches =
-        l1 != null &&
-        !dualDispatch &&
-        l1.d.lineSize <= 4096 &&
-        (l1.i == null || l1.i!.lineSize <= 4096) &&
-        config.mmu.hasPaging &&
-        !config.hasHypervisor &&
-        !config.speculativeFetch &&
-        config.executionMode == ExecutionMode.inOrder &&
-        config.mmu.pmp.entries == 0 &&
-        !config.mmu.hasPageBasedMemoryTypes &&
-        config.mmu.pagingModes.every(
-          (m) =>
-              m == RiscVPagingMode.bare ||
-              (config.mxlen == RiscVMxlen.rv64 && m == RiscVPagingMode.sv39),
-        ) &&
-        wbConfig.dataWidth == config.mxlen.size &&
-        wbConfig.addressWidth == config.mxlen.size &&
-        wbConfig.effectiveSelWidth == config.mxlen.size ~/ 8;
     final useICache = l1?.i != null && !physicalCaches;
     final useDCache = l1 != null && !physicalCaches;
 
-    // Permission context for the L1 tags. Both caches are in FRONT of the MMU,
+    // Permission context for legacy L1 tags. Those caches are in FRONT of the MMU,
     // so a HIT never reaches the MMU and no permission check runs on it. Without
     // this tag a line filled by one privilege mode stayed usable by a mode the
     // page table forbids: user code read a supervisor-only page out of the
@@ -1712,6 +1713,7 @@ class RiverCore extends BridgeModule {
       hstateen0Se0: csrs?.hstateen0Se0,
       memFaultGuest: config.hasHypervisor ? mmu.dportFaultGuest : null,
       enableMisalignedLoads: enableMisalignedLoads,
+      exactMemoryReads: physicalCaches,
       loadFaultTval: loadUnit?.faultAddress,
       memAccessFault: !handleAccessFaults
           ? null
@@ -1752,7 +1754,7 @@ class RiverCore extends BridgeModule {
       staticInstructions: staticInstructions,
     );
 
-    // Both L1 caches sit in FRONT of the MMU, so they are indexed and tagged by
+    // Legacy L1 caches sit in FRONT of the MMU, so they are indexed and tagged by
     // VIRTUAL address. Every event that can re-point a virtual address at
     // different memory must drop their contents: fence.i, sfence.vma, AND a satp
     // write. The exec unit pulses `fence` for all three (see the WriteCsr steps,
@@ -1768,6 +1770,8 @@ class RiverCore extends BridgeModule {
     // a process fetched another process's instructions. On creek this could not
     // show (bare mode, VA == PA, one address space); under Sv39 it corrupted the
     // machine at random.
+    // Physical L1s use the same flush signal conservatively. Translation and
+    // permission checks still precede every physical-cache lookup.
     icFlush <= pipeline.fence;
     mmuTlbFlush <= pipeline.fence;
     loadMisaligned <= pipeline.output('misalignedLoad');
