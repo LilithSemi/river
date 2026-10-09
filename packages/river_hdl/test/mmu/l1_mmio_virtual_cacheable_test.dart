@@ -8,7 +8,7 @@ import 'package:test/test.dart';
 
 /// Is a device register still uncached once paging is on?
 ///
-/// The L1 D-cache decides cacheability with
+/// The legacy front-of-MMU L1 D-cache decided cacheability with
 /// `cacheableOf(a) => a.gte(cacheableBase)` (harbor l1_cache.dart), and `a` is
 /// `req_addr`, the address the pipeline presents. The cache sits in FRONT of
 /// the MMU, so with paging on that address is a VIRTUAL one. `cacheableBase` is
@@ -44,6 +44,16 @@ void main() {
       pmp: HarborPmpConfig.none,
       hasSupervisorUserMemory: true,
       hasMakeExecutableReadable: true,
+      pma: const HarborPmaConfig(
+        regions: [
+          HarborPmaRegion.memory(start: 0, size: 0x20000),
+          HarborPmaRegion.io(
+            start: 0x10000000,
+            size: 0x1000,
+            accessWidths: [8],
+          ),
+        ],
+      ),
     ),
     clock: const HarborClockConfig(
       name: 'sysclk',
@@ -211,21 +221,7 @@ void main() {
   test(
     'a device mapped at a kernel virtual address is read every time',
     timeout: const Timeout(Duration(minutes: 45)),
-    // KNOWN FAILURE, kept as the record of it. The run reads the device ONCE
-    // for two loads.
-    //
-    // The fix is not in the cache. The cache is in front of the MMU, so it
-    // cannot know the physical address and cannot decide cacheability from it.
-    // The core must tell it: either give HarborL1DCache a `req_cacheable`
-    // input that the MMU drives from the TRANSLATED address, or move the
-    // D-cache behind the MMU. Until then `cacheableBase` only works with
-    // paging off, which is why creek (bare mode, VA == PA) never showed this.
-    //
-    // Remove the skip with the fix.
-    skip:
-        'the D-cache reads cacheability off the VIRTUAL address, so every '
-        'Sv39 kernel mapping of a device looks cacheable. Needs a physical '
-        'cacheability signal from the MMU, which is a core change.',
+    // Physical placement must keep both architectural reads uncached.
     () async {
       // Supervisor code at VA 0:
       //
