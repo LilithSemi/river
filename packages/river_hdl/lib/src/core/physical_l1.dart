@@ -4,6 +4,10 @@ import 'package:rohd/rohd.dart';
 /// Serialized physical-memory stage. Translation and permission checks happen
 /// upstream. Walks bypass allocation; walker writes invalidate D-cache copies
 /// of page tables (including hardware A/D updates).
+///
+/// Hold request metadata until a response. PMAs gate line allocation, not the
+/// architectural permission/fault policy for bypassed requests. Reset must
+/// reset the external bus backend as well; flush preserves accepted bus work.
 class RiverPhysicalL1 extends Module {
   RiverPhysicalL1(
     Logic clk,
