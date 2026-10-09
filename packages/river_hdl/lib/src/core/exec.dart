@@ -324,6 +324,9 @@ abstract class ExecutionUnit extends Module {
   final bool hasSupervisor;
   final bool hasUser;
   final bool enableMisalignedLoads;
+  // Byte-addressed, sized reads with lane-zero responses from the MMU.
+  // Legacy front-of-MMU caches retain their existing read convention.
+  final bool exactMemoryReads;
   Logic get misalignedLoad => output('misalignedLoad');
   Logic get loadSize => output('loadSize');
   late final Logic _misalignedLoadAllowed;
@@ -607,6 +610,7 @@ abstract class ExecutionUnit extends Module {
     this.hasSupervisor = false,
     this.hasUser = false,
     this.enableMisalignedLoads = false,
+    this.exactMemoryReads = false,
     Logic? loadFaultTval,
     this.useIterativeMul = true,
     required this.microcode,
@@ -676,6 +680,8 @@ abstract class ExecutionUnit extends Module {
     addOutput('loadSize', width: 3);
     if (!enableMisalignedLoads) {
       misalignedLoad <= Const(0);
+    }
+    if (!enableMisalignedLoads && !exactMemoryReads) {
       loadSize <= Const(2, width: 3);
     }
     _fetchFaultTval = fetchFaultTval == null
@@ -1359,7 +1365,8 @@ abstract class ExecutionUnit extends Module {
           mopStep < 0,
           done < 0,
           fpFlags < 0,
-          if (enableMisalignedLoads) ...[misalignedLoad < 0, loadSize < 2],
+          if (enableMisalignedLoads) misalignedLoad < 0,
+          if (enableMisalignedLoads || exactMemoryReads) loadSize < 2,
           output('trap') < 0,
           output('trapInterrupt') < 0,
           output('trapEpc') < currentPc,
@@ -1569,7 +1576,8 @@ abstract class ExecutionUnit extends Module {
                 this.csrWrite!.data < 0,
               ],
               fence < 0,
-              if (enableMisalignedLoads) ...[misalignedLoad < 0, loadSize < 2],
+              if (enableMisalignedLoads) misalignedLoad < 0,
+              if (enableMisalignedLoads || exactMemoryReads) loadSize < 2,
               interruptHold < 0,
               nextPc < currentPc,
               nextSp < currentSp,
@@ -1888,6 +1896,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.hasSupervisor,
     super.hasUser,
     super.enableMisalignedLoads,
+    super.exactMemoryReads,
     super.loadFaultTval,
     required super.microcode,
     required super.mxlen,
@@ -3455,7 +3464,7 @@ class DynamicExecutionUnit extends ExecutionUnit {
                                   ~_misalignedLoadAllowed,
                               then: doTrap(Trap.misalignedLoad, opBase + imm),
                               orElse: [
-                                if (enableMisalignedLoads) ...[
+                                if (enableMisalignedLoads)
                                   misalignedLoad <
                                       ((opBase + imm) &
                                               Const(
@@ -3463,9 +3472,9 @@ class DynamicExecutionUnit extends ExecutionUnit {
                                                 width: mxlen.size,
                                               ))
                                           .neq(0),
+                                if (enableMisalignedLoads || exactMemoryReads)
                                   loadSize <
                                       Const(size.bytes.bitLength - 1, width: 3),
-                                ],
                                 memRead.en < 1,
                                 memRead.addr < (opBase + imm),
                               ],
@@ -3521,7 +3530,16 @@ class DynamicExecutionUnit extends ExecutionUnit {
                                         ))
                                     .neq(0),
                                 then: doTrap(Trap.misalignedLoad, opBase),
-                                orElse: [memRead.en < 1, memRead.addr < opBase],
+                                orElse: [
+                                  if (exactMemoryReads)
+                                    loadSize <
+                                        Const(
+                                          size.bytes.bitLength - 1,
+                                          width: 3,
+                                        ),
+                                  memRead.en < 1,
+                                  memRead.addr < opBase,
+                                ],
                               ),
                             ],
                           ),
@@ -3626,7 +3644,16 @@ class DynamicExecutionUnit extends ExecutionUnit {
                                         ))
                                     .neq(0),
                                 then: doTrap(Trap.misalignedStore, opBase),
-                                orElse: [memRead.en < 1, memRead.addr < opBase],
+                                orElse: [
+                                  if (exactMemoryReads)
+                                    loadSize <
+                                        Const(
+                                          size.bytes.bitLength - 1,
+                                          width: 3,
+                                        ),
+                                  memRead.en < 1,
+                                  memRead.addr < opBase,
+                                ],
                               ),
                             ],
                           ),
@@ -4155,6 +4182,7 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.rdWrite, {
     super.hasSupervisor = false,
     super.enableMisalignedLoads,
+    super.exactMemoryReads,
     super.loadFaultTval,
     super.hasUser = false,
     required super.microcode,
@@ -4489,6 +4517,8 @@ class StaticExecutionUnit extends ExecutionUnit {
             steps.add(
               CaseItem(Const(3, width: maxLen.bitLength), [
                 memRead.addr < regBaseL,
+                if (exactMemoryReads)
+                  loadSize < Const(chunkBytes.bitLength - 1, width: 3),
                 memRead.en < 1,
                 mopStep < mopStep + 1,
               ]),
@@ -4501,6 +4531,8 @@ class StaticExecutionUnit extends ExecutionUnit {
                     rs1 < memRead.data, // chunk 0
                     memRead.addr <
                         (regBaseL + Const(chunkBytes, width: mxlen.size)),
+                    if (exactMemoryReads)
+                      loadSize < Const(chunkBytes.bitLength - 1, width: 3),
                     memRead.en < 1, // chunk 1
                     mopStep < mopStep + 1,
                   ],
@@ -5518,11 +5550,15 @@ class StaticExecutionUnit extends ExecutionUnit {
               final byteOff = addr & Const(busBytes - 1, width: mxlen.size);
               final shifted =
                   memRead.data >> (byteOff * Const(8, width: mxlen.size));
-              final raw = mux(
-                unaligned & _misalignedLoadAllowed,
-                memRead.data,
-                shifted,
-              ).slice(mop.size.bits - 1, 0);
+              final raw =
+                  (exactMemoryReads
+                          ? memRead.data
+                          : mux(
+                              unaligned & _misalignedLoadAllowed,
+                              memRead.data,
+                              shifted,
+                            ))
+                      .slice(mop.size.bits - 1, 0);
 
               steps.add(
                 CaseItem(Const(i, width: maxLen.bitLength), [
@@ -5530,18 +5566,19 @@ class StaticExecutionUnit extends ExecutionUnit {
                     unaligned & ~_misalignedLoadAllowed,
                     then: doTrap(Trap.misalignedLoad, addr, '_${op.mnemonic}'),
                     orElse: [
-                      if (enableMisalignedLoads) ...[
-                        misalignedLoad < unaligned,
+                      if (enableMisalignedLoads) misalignedLoad < unaligned,
+                      if (enableMisalignedLoads || exactMemoryReads)
                         loadSize <
                             Const(mop.size.bytes.bitLength - 1, width: 3),
-                      ],
                       memRead.en < 1,
                       memRead.addr <
-                          mux(
-                            unaligned & _misalignedLoadAllowed,
-                            addr,
-                            alignedAddr,
-                          ),
+                          (exactMemoryReads
+                              ? addr
+                              : mux(
+                                  unaligned & _misalignedLoadAllowed,
+                                  addr,
+                                  alignedAddr,
+                                )),
                       mopStep < mopStep + 1,
                     ],
                   ),
@@ -5806,6 +5843,9 @@ class StaticExecutionUnit extends ExecutionUnit {
                     unaligned,
                     then: doTrap(Trap.misalignedStore, addr, '_${op.mnemonic}'),
                     orElse: [
+                      if (exactMemoryReads)
+                        loadSize <
+                            Const(mop.size.bytes.bitLength - 1, width: 3),
                       memRead.en < 1,
                       memRead.addr < addr,
                       // cas needs rd's VALUE as the compare operand: read it
@@ -5925,6 +5965,9 @@ class StaticExecutionUnit extends ExecutionUnit {
                     unaligned,
                     then: doTrap(Trap.misalignedLoad, addr, '_${op.mnemonic}'),
                     orElse: [
+                      if (exactMemoryReads)
+                        loadSize <
+                            Const(mop.size.bytes.bitLength - 1, width: 3),
                       memRead.en < 1,
                       memRead.addr < addr,
                       mopStep < mopStep + 1,
