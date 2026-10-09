@@ -4397,9 +4397,22 @@ class StaticExecutionUnit extends ExecutionUnit {
           // rs1==x0 is special: with rd!=x0 it sets vl=VLMAX; with rd==x0 it
           // keeps the current vl (vtype still updates). The micro-op loop
           // below is skipped for vsetvli.
+          // The three vset forms differ only in where AVL and vtype come
+          // from, so one handler serves them: vsetvli takes AVL from x[rs1]
+          // and vtype from the immediate, vsetivli takes AVL from the rs1
+          // field as a value, and vsetvl takes vtype from x[rs2].
           final isVsetvli = op.mnemonic == 'vsetvli';
-          final isVle = op.mnemonic == 'vle32.v';
-          final isVse = op.mnemonic == 'vse32.v';
+          final isVsetivli = op.mnemonic == 'vsetivli';
+          final isVsetvl = op.mnemonic == 'vsetvl';
+          final isVset = isVsetvli || isVsetivli || isVsetvl;
+          // Unit-stride load/store moves the whole VLEN-wide vreg in XLEN
+          // chunks, so the element width does not change the transfer and all
+          // four widths share one handler. (Tail handling for vl < VLMAX is
+          // still the separate vl/tail polish, as for vle32.)
+          const vLoads = {'vle8.v', 'vle16.v', 'vle32.v', 'vle64.v'};
+          const vStores = {'vse8.v', 'vse16.v', 'vse32.v', 'vse64.v'};
+          final isVle = vLoads.contains(op.mnemonic);
+          final isVse = vStores.contains(op.mnemonic);
           // OPIVV/OPIVX/OPIVI integer arithmetic. One handler serves each
           // funct3 group and reads the runtime funct6 to pick the operation,
           // so every mnemonic in the group routes here. The second operand is
@@ -4421,12 +4434,13 @@ class StaticExecutionUnit extends ExecutionUnit {
           final isVArithVI = vArithVI.contains(op.mnemonic);
           final isVArith = isVArithVV || isVArithVX || isVArithVI;
           final isVFloat = vFloatVV.contains(op.mnemonic);
-          final isVecHandled =
-              isVsetvli || isVle || isVse || isVArith || isVFloat;
-          if (isVsetvli) {
+          final isVecHandled = isVset || isVle || isVse || isVArith || isVFloat;
+          if (isVset) {
             final vtypei = fields['zimm_rs2']!;
-            final vsew = vtypei.slice(5, 3);
-            final vlmul = vtypei.slice(2, 0);
+            // vsetvl reads vtype from x[rs2]; the others take the immediate.
+            final vtypeSrc = isVsetvl ? rs2Read.data : vtypei;
+            final vsew = vtypeSrc.slice(5, 3);
+            final vlmul = vtypeSrc.slice(2, 0);
             final avlIdx = fields['rs1_uimm']!.slice(4, 0);
             final rdIdx = fields['rd']!.slice(4, 0);
             final shiftAmt = Const(3, width: 6) + vsew.zeroExtend(6);
@@ -4437,29 +4451,46 @@ class StaticExecutionUnit extends ExecutionUnit {
             final vlmaxFrac =
                 base >> (Const(8, width: 6) - vlmul.zeroExtend(6));
             final vlmax = mux(vlmul[2], vlmaxFrac, vlmaxInt);
-            final rs1IsX0 = avlIdx.eq(Const(0, width: 5));
+            // vsetivli's rs1 field is the AVL itself, so the x0 rules that
+            // reinterpret a register operand do not apply to it.
+            final avlVal = isVsetivli
+                ? avlIdx.zeroExtend(mxlen.size)
+                : rs1Read.data;
+            final rs1IsX0 = isVsetivli
+                ? Const(0)
+                : avlIdx.eq(Const(0, width: 5));
             final rdIsX0 = rdIdx.eq(Const(0, width: 5));
-            final minAvl = mux(rs1Read.data.lt(vlmax), rs1Read.data, vlmax);
+            final minAvl = mux(avlVal.lt(vlmax), avlVal, vlmax);
             // rs1!=x0: min(x[rs1], VLMAX). rs1=x0: VLMAX, or keep vl if rd=x0.
             final vl = mux(rs1IsX0, mux(rdIsX0, _vl!, vlmax), minAvl);
+            // Only the low 8 bits of vtype are architectural state here.
+            final vtypeCommit = vtypeSrc
+                .getRange(0, 8)
+                .zeroExtend(_vtype!.width);
+            var cfgReady = rs1Read.done & rs1Read.valid;
+            if (isVsetvl) cfgReady = cfgReady & rs2Read.done & rs2Read.valid;
             steps.add(
               CaseItem(Const(1, width: maxLen.bitLength), [
                 rs1Read.addr < avlIdx,
                 rs1Read.en < 1,
+                if (isVsetvl) ...[
+                  rs2Read.addr < vtypei.slice(4, 0),
+                  rs2Read.en < 1,
+                ],
                 mopStep < mopStep + 1,
               ]),
             );
             steps.add(
               CaseItem(Const(2, width: maxLen.bitLength), [
                 If(
-                  rs1Read.done & rs1Read.valid,
+                  cfgReady,
                   then: [
                     mirrorSp(rdIdx, vl),
                     rdWrite.addr < rdIdx,
                     rdWrite.data < vl,
                     rdWrite.en < rdIdx.neq(Const(0, width: 5)),
                     // Commit vector config state for subsequent ops.
-                    _vtype! < vtypei,
+                    _vtype! < vtypeCommit,
                     _vl! < vl,
                     // nextPc holds into the auto-done step (steps.length+1).
                     nextPc < (currentPc + Const(4, width: mxlen.size)),
