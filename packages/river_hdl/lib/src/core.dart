@@ -480,8 +480,26 @@ class RiverCore extends BridgeModule {
     // captures correctly, never a back-to-back burst. The D-cache extends the
     // same pacing to data loads.
     final l1 = config.l1cache;
-    final useICache = l1?.i != null;
-    final useDCache = l1 != null;
+    // Keep unsupported execution/translation profiles on the legacy path.
+    // Scalar Sv39 checks translation and permission before physical cache hits.
+    final physicalCaches =
+        l1 != null &&
+        config.mmu.hasPaging &&
+        !config.hasHypervisor &&
+        !config.speculativeFetch &&
+        config.executionMode == ExecutionMode.inOrder &&
+        config.mmu.pmp.entries == 0 &&
+        !config.mmu.hasPageBasedMemoryTypes &&
+        config.mmu.pagingModes.every(
+          (m) =>
+              m == RiscVPagingMode.bare ||
+              (config.mxlen == RiscVMxlen.rv64 && m == RiscVPagingMode.sv39),
+        ) &&
+        wbConfig.dataWidth == config.mxlen.size &&
+        wbConfig.addressWidth == config.mxlen.size &&
+        wbConfig.effectiveSelWidth == config.mxlen.size ~/ 8;
+    final useICache = l1?.i != null && !physicalCaches;
+    final useDCache = l1 != null && !physicalCaches;
 
     // Permission context for the L1 tags. Both caches are in FRONT of the MMU,
     // so a HIT never reaches the MMU and no permission check runs on it. Without
@@ -649,6 +667,9 @@ class RiverCore extends BridgeModule {
       translateFetch: config.mmu.hasPaging,
       tlbFlush: config.mmu.hasPaging ? mmuTlbFlush : null,
       dtlbFlushOnPrivChange: config.mmu.hasPaging ? dtlbFlushOnPriv : null,
+      physicalL1: physicalCaches ? l1 : null,
+      cacheTarget: target,
+      cacheFlush: physicalCaches ? icFlush : null,
       userProbe: userProbe,
     );
 

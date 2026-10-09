@@ -1,5 +1,6 @@
 import 'package:river/river.dart';
 import 'package:rohd/rohd.dart';
+import 'physical_l1.dart';
 
 /// River MMU with Wishbone bus master downstream.
 ///
@@ -81,6 +82,10 @@ class RiverMmu extends Module {
     // privilege-mode change (satp changes already flush). Closes the data-TLB
     // residue channel across context switches for paranoid configs.
     Logic? dtlbFlushOnPrivChange,
+    // Optional post-translation caches; explicit PMAs govern line allocation.
+    HarborL1CacheConfig? physicalL1,
+    HarborDeviceTarget? cacheTarget,
+    Logic? cacheFlush,
     super.name = 'river_mmu',
   }) {
     final xlen = mmuConfig.mxlen.size;
@@ -108,6 +113,32 @@ class RiverMmu extends Module {
       wbDatMiso,
       width: busConfig.dataWidth,
     );
+
+    final externalAck = wbAck;
+    final externalErr = wbErr;
+    final externalData = wbDatMiso;
+    if (physicalL1 != null) {
+      if (busConfig.dataWidth != xlen ||
+          busConfig.addressWidth != xlen ||
+          busConfig.effectiveSelWidth != xlen ~/ 8 ||
+          mmuConfig.pmp.entries != 0 ||
+          mmuConfig.hasPageBasedMemoryTypes ||
+          virtIn != null ||
+          gMode != null ||
+          gRoot != null ||
+          !mmuConfig.pagingModes.every(
+            (m) =>
+                m == RiscVPagingMode.bare ||
+                (xlen == 64 && m == RiscVPagingMode.sv39),
+          )) {
+        throw ArgumentError(
+          'Physical L1 requires scalar Bare/Sv39, XLEN bus, no PMP/PBMT/H',
+        );
+      }
+      wbAck = Logic(name: 'physicalAck');
+      wbErr = Logic(name: 'physicalError');
+      wbDatMiso = Logic(name: 'physicalData', width: xlen);
+    }
 
     // satp.MODE (0=bare, 8=Sv39, 9=Sv48) and root PPN. When wired and MODE!=0,
     // data accesses are translated by walking the page table over the bus.
@@ -1266,24 +1297,62 @@ class RiverMmu extends Module {
     dportFault <= dpFaultR;
     ifetchFault <= ifFaultR;
     dportFaultGuest <= dpFaultGuestR;
-    // A rejected data beat never reaches the external bus. Page-table traffic
-    // retains the existing translation path and fault handling.
-    wbCyc <= cycR & ~blockedRead;
-    wbStb <= stbR & ~blockedRead;
-    wbWe <= weR;
-    // Wishbone byte-lane convention at the bus boundary. The FSM tracks exact
-    // byte addresses, lane-0 write data, and an unshifted size mask in selR; the
-    // bus carries a word-aligned address with the byte position in SEL and the
-    // data shifted into its lane. Walk accesses are word-aligned with fullSel,
-    // so this is the identity for them.
-    final laneBits = (busConfig.effectiveSelWidth - 1).bitLength;
-    final busLane = adrR.getRange(0, laneBits).named('busLane');
-    wbAdr <=
-        [
-          adrR.getRange(laneBits, busConfig.addressWidth),
-          Const(0, width: laneBits),
-        ].swizzle();
-    wbDatMosi <= datMosiR << [busLane, Const(0, width: 3)].swizzle();
-    wbSel <= selR << busLane;
+    if (physicalL1 != null) {
+      final physical = RiverPhysicalL1(
+        clk,
+        reset,
+        cycR & stbR & ~blockedRead,
+        adrR,
+        weR,
+        datMosiR,
+        mux(
+          selR.eq(1),
+          Const(0, width: 3),
+          mux(
+            selR.eq(3),
+            Const(1, width: 3),
+            mux(selR.eq(15), Const(2, width: 3), Const(3, width: 3)),
+          ),
+        ),
+        arbState.eq(2),
+        walking | adWrite,
+        cacheFlush == null ? Const(0) : addInput('cache_flush', cacheFlush),
+        externalAck,
+        externalErr,
+        externalData,
+        config: physicalL1,
+        pma: mmuConfig.pma,
+        target: cacheTarget,
+      );
+      wbAck <= physical.output('response_ack');
+      wbErr <= physical.output('response_error');
+      wbDatMiso <= physical.output('response_data');
+      wbCyc <= physical.output('cyc');
+      wbStb <= physical.output('cyc');
+      wbWe <= physical.output('we');
+      wbAdr <= physical.output('addr');
+      wbDatMosi <= physical.output('data');
+      wbSel <= physical.output('sel');
+    } else {
+      // A rejected data beat never reaches the external bus. Page-table traffic
+      // retains the existing translation path and fault handling.
+      wbCyc <= cycR & ~blockedRead;
+      wbStb <= stbR & ~blockedRead;
+      wbWe <= weR;
+      // Wishbone byte-lane convention at the bus boundary. The FSM tracks exact
+      // byte addresses, lane-0 write data, and an unshifted size mask in selR; the
+      // bus carries a word-aligned address with the byte position in SEL and the
+      // data shifted into its lane. Walk accesses are word-aligned with fullSel,
+      // so this is the identity for them.
+      final laneBits = (busConfig.effectiveSelWidth - 1).bitLength;
+      final busLane = adrR.getRange(0, laneBits).named('busLane');
+      wbAdr <=
+          [
+            adrR.getRange(laneBits, busConfig.addressWidth),
+            Const(0, width: laneBits),
+          ].swizzle();
+      wbDatMosi <= datMosiR << [busLane, Const(0, width: 3)].swizzle();
+      wbSel <= selR << busLane;
+    }
   }
 }
