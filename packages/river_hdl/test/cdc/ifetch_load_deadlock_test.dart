@@ -108,6 +108,7 @@ void main() {
     bridge.input('s_dat_w').srcConnection! <= ds.output('m_dat_w');
     bridge.input('s_sel').srcConnection! <= ds.output('m_sel');
     ds.input('m_ack').srcConnection! <= bridge.output('s_ack');
+    ds.input('m_err').srcConnection! <= Const(0);
     ds.input('m_dat_r').srcConnection! <= bridge.output('s_dat_r');
 
     // Fast-side 32-bit memory holding the program.

@@ -108,9 +108,9 @@ Future<void> interconnectTest(
         dataWidth: dataWidth,
       );
       final tl = TileLinkInterface(tlConfig);
-      WishboneToTileLinkBridge(coreWb, tl);
+      WishboneToTileLinkBridge(coreWb, tl, clk: clk, reset: reset);
       final memWb = WishboneInterface(wbConfig);
-      TileLinkToWishboneBridge(tl, memWb);
+      TileLinkToWishboneBridge(tl, memWb, clk: clk, reset: reset);
       wishboneMemorySlave(memWb, clk, reset, storage, dataWidth, addrWidth);
     case Interconnect.axi4:
       // core WB -> AXI4 -> AXI4 memory slave.
@@ -129,7 +129,7 @@ Future<void> interconnectTest(
         wuserWidth: 0,
         buserWidth: 0,
       );
-      WishboneToAxi4Bridge(coreWb, axiRead, axiWrite);
+      WishboneToAxi4Bridge(coreWb, axiRead, axiWrite, clk: clk, reset: reset);
       _axi4MemorySlave(
         axiRead,
         axiWrite,

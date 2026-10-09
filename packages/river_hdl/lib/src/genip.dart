@@ -2376,6 +2376,10 @@ class RiverGenIpConfig {
     // Decoder: route the merged master to every peripheral slave.
     final decoder = WishboneDecoder(busConfig, mappings);
     soc.addSubModule(decoder);
+    // The decoder registers its bus-error and timeout state, so it needs the
+    // clock. Leaving these unconnected compiles but never clocks that logic.
+    decoder.input('clk').srcConnection! <= clk;
+    decoder.input('reset').srcConnection! <= reset;
     connectInterfaces(arbiter.interface('slave'), decoder.interface('master'));
     for (var i = 0; i < peripherals.length; i++) {
       connectInterfaces(
