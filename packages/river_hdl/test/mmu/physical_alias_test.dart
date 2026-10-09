@@ -56,12 +56,14 @@ void main() {
             0x06600913, // completion marker
             0x0000006f,
           ];
-          for (var i = 0; i < program.length; i++)
+          for (var i = 0; i < program.length; i++) {
             put(4 * i, BigInt.from(program[i]), 4);
+          }
           put(0x10010, BigInt.from((0x11 << 10) | 1), 8);
           put(0x11000, BigInt.from((0x12 << 10) | 1), 8);
-          for (final pte in [0x12000, 0x12008])
+          for (final pte in [0x12000, 0x12008]) {
             put(pte, BigInt.from(((pa >> 12) << 10) | 0xc7), 8);
+          }
           put(pa, BigInt.from(0x11111111), 8);
           put(0x13010, BigInt.from((0x14 << 10) | 1), 8);
           put(0x14000, BigInt.from((0x15 << 10) | 1), 8);
@@ -123,26 +125,30 @@ void main() {
               return;
             }
             if (!core.output('dataBus_CYC').value.toBool() ||
-                !core.output('dataBus_STB').value.toBool())
+                !core.output('dataBus_STB').value.toBool()) {
               return;
+            }
             final a = core.output('dataBus_ADR').value.toInt();
             final lanes = core.output('dataBus_SEL').value.toInt();
             if (core.output('dataBus_WE').value.toBool()) {
               final value = core.output('dataBus_DAT_MOSI').value.toBigInt();
               for (var i = 0; i < 8; i++) {
-                if ((lanes & (1 << i)) != 0)
+                if ((lanes & (1 << i)) != 0) {
                   image[a + i] = ((value >> (8 * i)) & BigInt.from(255))
                       .toInt();
+                }
               }
               if (a == pa) stores++;
             } else {
               var value = BigInt.zero;
               for (var i = 0; i < 8; i++) {
-                if ((lanes & (1 << i)) != 0)
+                if ((lanes & (1 << i)) != 0) {
                   value |= BigInt.from(image[a + i] ?? 0) << (8 * i);
+                }
               }
-              if (device && a >= pa && a < pa + 0x1000)
+              if (device && a >= pa && a < pa + 0x1000) {
                 deviceReads.add((a, lanes));
+              }
               if (a == pa) {
                 dataReads++;
                 if (device) value = BigInt.from(0x11111111 * dataReads);
@@ -161,7 +167,9 @@ void main() {
             await tick();
             reset.inject(0);
 
-            for (var i = 0; i < 4000 && reg(18) != 0x66; i++) await tick();
+            for (var i = 0; i < 4000 && reg(18) != 0x66; i++) {
+              await tick();
+            }
             expect(
               reg(18),
               0x66,
@@ -175,19 +183,21 @@ void main() {
             expect(reg(10), 0x11111111);
             if (!device) expect(reg(12), 0x11111111);
             expect(stores, remap || device ? 0 : 1);
-            if (remap)
+            if (remap) {
               expect(
                 (reg(14) >> 44) & 0xffff,
                 1,
                 reason: 'the new ASID is implemented and retained',
               );
-            if (device)
+            }
+            if (device) {
               expect(
                 deviceReads,
                 [(pa, 15), (pa, 15)],
                 reason:
                     'exactly two requested device reads, no cache refill traffic',
               );
+            }
             expect(
               reg(11),
               0x22222222,
