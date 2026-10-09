@@ -1,6 +1,5 @@
 import 'package:harbor/harbor.dart';
 
-import 'fp_extra.dart';
 
 /// RISC-V application-processor profile extension sets (RVA22 / RVA23).
 ///
@@ -21,9 +20,9 @@ final List<RiscVExtension> kRva22U64Extensions = [
   rvA,
   rvF,
   rvD,
-  rvFExtra, // fsgnj/fmin/fmax/fclass/fmv.x.w/fmv.w.x (not in Harbor's rvF)
-  rvDExtra, // fsgnj/fmin/fmax/fclass/fmv.x.d/fmv.d.x (not in Harbor's rvD)
   rvC,
+  // c.fld/c.fsd/c.fldsp/c.fsdsp, which belong to C only with D present.
+  rvZcd,
   rvZicsr,
   rvZifencei,
   rvZicntr,

@@ -22,8 +22,6 @@ void main() {
           rvPriv,
           rvF,
           rvD,
-          rvFExtra,
-          rvDExtra,
         ],
         interrupts: [],
         microcodeMode: microcoded ? MicrocodeMode.full : MicrocodeMode.none,

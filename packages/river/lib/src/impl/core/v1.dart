@@ -1,6 +1,5 @@
 import 'package:harbor/harbor.dart';
 import '../../river_base.dart';
-import '../../fp_extra.dart';
 
 /// V1 core tier definitions.
 ///
@@ -114,8 +113,6 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
            rvA,
            rvF,
            rvD,
-           rvFExtra,
-           rvDExtra,
            // c.fld/c.fsd/c.fldsp/c.fsdsp. They belong to C only when D is
            // present, so they are a separate extension (see rvZcd).
            rvZcd,
@@ -165,8 +162,6 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
            rvPriv,
            rvF,
            rvD,
-           rvFExtra,
-           rvDExtra,
            // c.fld/c.fsd/c.fldsp/c.fsdsp (see rvZcd).
            rvZcd,
            rvZba,

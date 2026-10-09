@@ -22,10 +22,8 @@ void main() {
   );
 
   RiscVOperation? decode(int instr) {
-    final opcode = instr & 0x3;
-    final funct3 = (instr >> 13) & 0x7;
     for (final ext in config.extensions) {
-      final op = ext.findOperation(opcode, funct3: funct3, instruction: instr);
+      final op = ext.findOperation(instr, mxlen: config.mxlen);
       if (op != null) return op;
     }
     return null;
@@ -119,11 +117,7 @@ void main() {
     );
     RiscVOperation? decodeSmall(int instr) {
       for (final ext in small.extensions) {
-        final op = ext.findOperation(
-          instr & 0x3,
-          funct3: (instr >> 13) & 0x7,
-          instruction: instr,
-        );
+        final op = ext.findOperation(instr, mxlen: small.mxlen);
         if (op != null) return op;
       }
       return null;

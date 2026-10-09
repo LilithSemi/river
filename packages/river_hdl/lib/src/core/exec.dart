@@ -4302,18 +4302,27 @@ class StaticExecutionUnit extends ExecutionUnit {
           final isVsetvli = op.mnemonic == 'vsetvli';
           final isVle = op.mnemonic == 'vle32.v';
           final isVse = op.mnemonic == 'vse32.v';
-          // OPIVV/OPIVX/OPIVI integer arithmetic. The decoder collides all
-          // ops within a funct3 group, so these mnemonics are the collided
-          // entries (.vv/.vx/.vi); the actual op is the runtime funct6, and
-          // the second operand is a vreg (.vv) / scalar broadcast (.vx) /
-          // immediate broadcast (.vi).
-          final isVArithVV = op.mnemonic == 'vadd.vv';
-          final isVArithVX = op.mnemonic == 'vadd.vx';
-          final isVArithVI = op.mnemonic == 'vadd.vi';
+          // OPIVV/OPIVX/OPIVI integer arithmetic. One handler serves each
+          // funct3 group and reads the runtime funct6 to pick the operation,
+          // so every mnemonic in the group routes here. The second operand is
+          // a vreg (.vv) / scalar broadcast (.vx) / immediate broadcast (.vi).
+          const vArithVV = {
+            'vadd.vv',
+            'vsub.vv',
+            'vand.vv',
+            'vor.vv',
+            'vxor.vv',
+          };
+          const vArithVX = {'vadd.vx', 'vsub.vx'};
+          const vArithVI = {'vadd.vi'};
+          // vfadd and vfmul share the OPFVV handler, which selects on the
+          // runtime funct6 (add=0x00, mul=0x24).
+          const vFloatVV = {'vfadd.vv', 'vfmul.vv'};
+          final isVArithVV = vArithVV.contains(op.mnemonic);
+          final isVArithVX = vArithVX.contains(op.mnemonic);
+          final isVArithVI = vArithVI.contains(op.mnemonic);
           final isVArith = isVArithVV || isVArithVX || isVArithVI;
-          // OPFVV FP arithmetic collides like the integer ops; vfadd/vfmul
-          // are distinguished by the runtime funct6 (add=0x00, mul=0x24).
-          final isVFloat = op.mnemonic == 'vfadd.vv';
+          final isVFloat = vFloatVV.contains(op.mnemonic);
           final isVecHandled =
               isVsetvli || isVle || isVse || isVArith || isVFloat;
           if (isVsetvli) {
@@ -5121,6 +5130,21 @@ class StaticExecutionUnit extends ExecutionUnit {
                           readField(mop.a) <<
                               (readField(mop.b) &
                                   Const(mxlen.size - 1, width: mxlen.size)),
+                        // Zba: shift the zero-extended low word, so the
+                        // high bits of rs1 do not reach the result.
+                        RiscVAluFunct.slliUw =>
+                          readField(
+                                mop.a,
+                              ).slice(31, 0).zeroExtend(mxlen.size) <<
+                              (readField(mop.b) &
+                                  Const(mxlen.size - 1, width: mxlen.size)),
+                        // Zbc is in no River profile, so this cannot elaborate.
+                        // Fail loudly instead of building a wrong product.
+                        RiscVAluFunct.clmul ||
+                        RiscVAluFunct.clmulh ||
+                        RiscVAluFunct.clmulr => throw UnimplementedError(
+                          'Zbc ${mop.funct.name} is not implemented',
+                        ),
                         RiscVAluFunct.srl =>
                           readField(mop.a) >>>
                               (readField(mop.b) &

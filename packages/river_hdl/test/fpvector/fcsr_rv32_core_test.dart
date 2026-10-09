@@ -13,7 +13,7 @@ void main() {
           rate: HarborFixedClockRate(10000),
         ),
         mxlen: RiscVMxlen.rv32,
-        extensions: [rv32i, rvZicsr, rvPriv, rvF, rvFExtra],
+        extensions: [rv32i, rvZicsr, rvPriv, rvF],
         interrupts: [],
         microcodeMode: microcoded ? MicrocodeMode.full : MicrocodeMode.none,
         mmu: HarborMmuConfig(

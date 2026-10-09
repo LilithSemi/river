@@ -45,8 +45,6 @@ void main() {
       rvA,
       rvF,
       rvD,
-      rvFExtra,
-      rvDExtra,
       rvPriv,
       rv64i,
       rv32i,

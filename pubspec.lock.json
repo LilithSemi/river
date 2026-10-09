@@ -154,8 +154,8 @@
       "dependency": "direct overridden",
       "description": {
         "path": "packages/harbor",
-        "ref": "69dac4e74eb450688f06704a4ffb8e24ff3264c7",
-        "resolved-ref": "69dac4e74eb450688f06704a4ffb8e24ff3264c7",
+        "ref": "71969e1df9e4271836a275b0247522b8b8a6d8de",
+        "resolved-ref": "71969e1df9e4271836a275b0247522b8b8a6d8de",
         "url": "https://git.lilithsemi.com/LilithSemi/harbor"
       },
       "source": "git",

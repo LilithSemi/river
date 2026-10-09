@@ -31,8 +31,6 @@ void main() {
         rvPriv,
         rvF,
         rvD,
-        rvFExtra,
-        rvDExtra,
       ],
       interrupts: [],
       mmu: HarborMmuConfig(

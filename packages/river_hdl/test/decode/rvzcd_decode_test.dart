@@ -34,10 +34,8 @@ void main() {
   const zcdMnemonics = {'c.fld', 'c.fsd', 'c.fldsp', 'c.fsdsp'};
 
   String? decode(List<RiscVExtension> exts, int instr) {
-    final opcode = instr & 0x3;
-    final funct3 = (instr >> 13) & 0x7;
     for (final ext in exts) {
-      final op = ext.findOperation(opcode, funct3: funct3, instruction: instr);
+      final op = ext.findOperation(instr, mxlen: config.mxlen);
       if (op != null) return op.mnemonic;
     }
     return null;

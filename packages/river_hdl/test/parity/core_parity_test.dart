@@ -66,15 +66,12 @@ void main() {
       rate: HarborFixedClockRate(48000000),
     ),
     mxlen: RiscVMxlen.rv64,
-    // rvFExtra/rvDExtra add fmin/fmax/fsgnj*/fclass/fmv (not in Harbor's base F/D).
     extensions: [
       rv64i,
       rv32i,
       rvM,
       rvF,
       rvD,
-      rvFExtra,
-      rvDExtra,
       rvZicsr,
       rvZifencei,
     ],

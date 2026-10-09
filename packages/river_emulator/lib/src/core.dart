@@ -700,6 +700,16 @@ class RiverCore implements CsrContext {
         final a = state.readField(mop.a);
         final b = state.readField(mop.b);
         switch (mop.funct) {
+          // Zba: shift the zero-extended low word.
+          case RiscVAluFunct.slliUw:
+            state.alu = (a & 0xFFFFFFFF) << (b & (config.mxlen.size - 1));
+          // Zbc is in no River profile.
+          case RiscVAluFunct.clmul:
+          case RiscVAluFunct.clmulh:
+          case RiscVAluFunct.clmulr:
+            throw UnimplementedError(
+              'Zbc ${mop.funct.name} is not implemented',
+            );
           case RiscVAluFunct.add:
             state.alu = a + b;
           case RiscVAluFunct.sub:
@@ -1661,6 +1671,22 @@ class RiverCore implements CsrContext {
 
         int result;
         switch (mop.funct) {
+          // Zfa and Zfhmin arrived in Harbor with real functs. River has no
+          // datapath for them yet, so refuse rather than return a wrong value.
+          case RiscVFpuFunct.fcvtSH:
+          case RiscVFpuFunct.fcvtHS:
+          case RiscVFpuFunct.fli:
+          case RiscVFpuFunct.fminm:
+          case RiscVFpuFunct.fmaxm:
+          case RiscVFpuFunct.fround:
+          case RiscVFpuFunct.froundnx:
+          case RiscVFpuFunct.fleq:
+          case RiscVFpuFunct.fltq:
+          case RiscVFpuFunct.fcvtmodWD:
+          case RiscVFpuFunct.fcvtDH:
+          case RiscVFpuFunct.fcvtHD:
+          case RiscVFpuFunct.fmvXH:
+            throw UnimplementedError('${mop.funct.name} is not implemented');
           case RiscVFpuFunct.fadd:
             result = mop.doublePrecision ? fromF64(a + b) : fromF32(a + b);
           // Fused multiply-add: rd = +-(a*b) +- c. The product a*b is a Dart
@@ -2542,22 +2568,9 @@ class RiverCore implements CsrContext {
       if (vec != null) return vec;
     }
 
-    RiscVOperation? op;
-    if ((instr & 0x3) != 0x3) {
-      final opcode = instr & 0x3;
-      final funct3 = (instr >> 13) & 0x7;
-      for (final ext in config.extensions) {
-        op = ext.findOperation(
-          opcode,
-          funct3: funct3,
-          instruction: instr,
-          mxlen: config.mxlen,
-        );
-        if (op != null) break;
-      }
-    } else {
-      op = config.isa.findOperation(instr);
-    }
+    // One decode path now: findOperation matches the whole word, compressed
+    // included.
+    final RiscVOperation? op = config.isa.findOperation(instr);
 
     if (op != null) {
       final ir = DecodedInstruction.decode(instr, op);
@@ -2624,21 +2637,7 @@ class RiverCore implements CsrContext {
   Future<void> _handleDecode(PipelineContext ctx) async {
     final instr = ctx.instruction!;
 
-    if ((instr & 0x3) != 0x3) {
-      final opcode = instr & 0x3;
-      final funct3 = (instr >> 13) & 0x7;
-      for (final ext in config.extensions) {
-        ctx.op = ext.findOperation(
-          opcode,
-          funct3: funct3,
-          instruction: instr,
-          mxlen: config.mxlen,
-        );
-        if (ctx.op != null) break;
-      }
-    } else {
-      ctx.op = config.isa.findOperation(instr);
-    }
+    ctx.op = config.isa.findOperation(instr);
 
     if (ctx.op != null) {
       final ir = DecodedInstruction.decode(instr, ctx.op!);

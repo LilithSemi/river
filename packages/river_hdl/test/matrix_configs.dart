@@ -33,9 +33,9 @@ final Map<String, List<RiscVExtension>> categoryExtensions = {
   // BOTH rv32 and rv64 (task #71 coerced the FP read/write ports, the result
   // switch, and the roundSatFpToInt W/L mux to the mxlen width). Double stays
   // its own rv64-only 'd' category.
-  'fd': [rvF, rvFExtra],
+  'fd': [rvF],
   // Double-precision (rv64 only - see generator gate). rv64+D elaborates fine.
-  'd': [rvF, rvD, rvFExtra, rvDExtra],
+  'd': [rvF, rvD],
   'v': [rvV], // vector (VLEN defaults to 128 in RiverCoreConfig)
 };
 

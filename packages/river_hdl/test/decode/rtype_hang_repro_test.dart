@@ -24,8 +24,6 @@ RiverCoreConfig cfg(int lanes) => RiverCoreConfig(
     rvA,
     rvF,
     rvD,
-    rvFExtra,
-    rvDExtra,
     rvPriv,
     rv64i,
     rv32i,
