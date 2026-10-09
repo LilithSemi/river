@@ -508,6 +508,9 @@ class RiverCore extends BridgeModule {
     // Scalar Sv39 checks translation and permission before physical cache hits.
     final physicalCaches =
         l1 != null &&
+        !dualDispatch &&
+        l1.d.lineSize <= 4096 &&
+        (l1.i == null || l1.i!.lineSize <= 4096) &&
         config.mmu.hasPaging &&
         !config.hasHypervisor &&
         !config.speculativeFetch &&
