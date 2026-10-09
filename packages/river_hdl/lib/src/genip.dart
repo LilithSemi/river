@@ -1156,6 +1156,41 @@ class RiverGenIpConfig {
     }
   }
 
+  /// Physical memory attributes, derived from the device map rather than any
+  /// flag: the SoC already knows which regions are memory-backed and which are
+  /// MMIO. The physical L1 path allocates ONLY inside explicit readable,
+  /// idempotent RAM and bypasses unknown regions, so a platform describing no
+  /// PMAs would silently bypass its caches.
+  ///
+  /// Flash is readable and executable but not writable, so a D-cache can read
+  /// and XIP out of it without allocating a writable line over it.
+  /// Pseudo-devices are deliberately absent: `flash-firmware` names an offset
+  /// INSIDE a flash region, so emitting a window for it would overlap.
+  HarborPmaConfig buildPmaConfig() {
+    final regions = <HarborPmaRegion>[
+      for (final m in memories)
+        if (m.type == 'flash')
+          HarborPmaRegion(start: m.address, size: m.size, writable: false)
+        else
+          HarborPmaRegion.memory(start: m.address, size: m.size),
+      for (final d in mmioDevices)
+        HarborPmaRegion.io(
+          start: d.address,
+          size: d.effectiveSize,
+          // An XLEN-matched bus can present any width at a peripheral.
+          accessWidths: mxlen == RiscVMxlen.rv64
+              ? const [1, 2, 4, 8]
+              : const [1, 2, 4],
+        ),
+    ]..sort((a, b) => a.start.compareTo(b.start));
+    final pma = HarborPmaConfig(regions: regions);
+    final errors = pma.validate();
+    if (errors.isNotEmpty) {
+      throw ArgumentError('Overlapping PMA regions: ${errors.join("; ")}');
+    }
+    return pma;
+  }
+
   RiverCoreConfig buildCoreConfig(
     HarborClockConfig clock,
     String coreModel, {
@@ -1173,6 +1208,7 @@ class RiverGenIpConfig {
           : const [RiscVPagingMode.bare],
       tlbLevels: const [],
       pmp: HarborPmpConfig.none,
+      pma: buildPmaConfig(),
       hasSupervisorUserMemory: pagingOn,
       hasMakeExecutableReadable: pagingOn,
     );
