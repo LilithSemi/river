@@ -5541,9 +5541,9 @@ class StaticExecutionUnit extends ExecutionUnit {
               final unaligned =
                   (addr & Const(mop.size.bytes - 1, width: mxlen.size)).neq(0);
 
-              // Sub-word loads: the memory returns the aligned bus-word, so
-              // select the addressed lane by shifting right by the byte
-              // offset before slicing (lb/lbu/lh/lhu and Zcb c.lbu/lhu/lh).
+              // Legacy reads return the aligned bus-word and select a lane
+              // here. Physical-cache reads send the exact byte address/size;
+              // their MMU response is already normalized to lane zero.
               final busBytes = mxlen.size ~/ 8;
               final alignedAddr =
                   addr & ~Const(busBytes - 1, width: mxlen.size);
