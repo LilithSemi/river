@@ -880,6 +880,7 @@ abstract class ExecutionUnit extends Module {
     _fpRm = mux(instructionRm.eq(Const(7, width: 3)), frmIn, instructionRm);
     final fpUnitRm = _fpControlEnabled ? _fpRm : Const(0, width: 3);
     Logic fpInstruction = Const(0), roundedInstruction = Const(0);
+    Logic fpUnimplemented = Const(0);
     // Lowest mode each operation needs. Harbor marks mret 3 and the supervisor
     // ops 1, the same encoding currentMode uses.
     Logic needsSupervisor = Const(0), needsMachine = Const(0);
@@ -891,6 +892,36 @@ abstract class ExecutionUnit extends Module {
       'sfence.inval.ir',
     };
     Logic isSret = Const(0), isVmFence = Const(0), isWfi = Const(0);
+    // Every FPU funct River has a datapath for. Anything else must raise an
+    // illegal instruction: without this an op Harbor defines but River cannot
+    // execute wedges the sequencer instead of trapping, which reads as a hang.
+    const implementedFpFuncts = {
+      RiscVFpuFunct.fadd,
+      RiscVFpuFunct.fsub,
+      RiscVFpuFunct.fmul,
+      RiscVFpuFunct.fdiv,
+      RiscVFpuFunct.fsqrt,
+      RiscVFpuFunct.fmadd,
+      RiscVFpuFunct.fmsub,
+      RiscVFpuFunct.fnmsub,
+      RiscVFpuFunct.fnmadd,
+      RiscVFpuFunct.fcvtSD,
+      RiscVFpuFunct.fcvtDS,
+      RiscVFpuFunct.fcvtWS,
+      RiscVFpuFunct.fcvtWD,
+      RiscVFpuFunct.fcvtSW,
+      RiscVFpuFunct.fcvtDW,
+      RiscVFpuFunct.feq,
+      RiscVFpuFunct.flt,
+      RiscVFpuFunct.fle,
+      RiscVFpuFunct.fsgnj,
+      RiscVFpuFunct.fsgnjn,
+      RiscVFpuFunct.fsgnjx,
+      RiscVFpuFunct.fmin,
+      RiscVFpuFunct.fmax,
+      RiscVFpuFunct.fclass,
+      RiscVFpuFunct.fmv,
+    };
     const roundedFunctions = {
       RiscVFpuFunct.fadd,
       RiscVFpuFunct.fsub,
@@ -925,6 +956,11 @@ abstract class ExecutionUnit extends Module {
         (mop) => mop is RiscVFpuOp && roundedFunctions.contains(mop.funct),
       )) {
         roundedInstruction = roundedInstruction | hit;
+      }
+      if (entry.value.indexedMicrocode.values.any(
+        (mop) => mop is RiscVFpuOp && !implementedFpFuncts.contains(mop.funct),
+      )) {
+        fpUnimplemented = fpUnimplemented | hit;
       }
       final level = entry.value.privilegeLevel;
       if (level == PrivilegeMode.supervisor.id) {
@@ -972,11 +1008,14 @@ abstract class ExecutionUnit extends Module {
         .fold(0, (a, b) => a > b ? a : b);
 
     final mopStep = Logic(name: 'mopStep', width: maxLen.bitLength);
+    // An op with no datapath is illegal whatever the FP control state, so this
+    // term is outside the _fpControlEnabled gate.
     final fpIllegal =
-        Const(_fpControlEnabled ? 1 : 0) &
-        mopStep.eq(0) &
-        ((fpInstruction & ~fpEnabledIn) |
-            (roundedInstruction & _fpRm.gt(Const(4, width: 3))));
+        (mopStep.eq(0) & fpUnimplemented) |
+        (Const(_fpControlEnabled ? 1 : 0) &
+            mopStep.eq(0) &
+            ((fpInstruction & ~fpEnabledIn) |
+                (roundedInstruction & _fpRm.gt(Const(4, width: 3)))));
 
     // Trap an operation that needs more privilege than the current mode, so
     // mret, sret and the supervisor fences do not run from U-mode.
