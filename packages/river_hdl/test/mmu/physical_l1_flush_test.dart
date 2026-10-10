@@ -6,7 +6,7 @@ import 'package:test/test.dart';
 
 void main() => physicalFlushTests();
 
-void physicalFlushTests({int dSize = 64}) {
+void physicalFlushTests({int dSize = 64, HarborL1CacheConfig? config}) {
   tearDown(Simulator.reset);
   for (final width in [32, 64]) {
     test(
@@ -29,9 +29,11 @@ void physicalFlushTests({int dSize = 64}) {
           ack,
           Const(0),
           Const(0, width: width),
-          config: HarborL1CacheConfig.unified(
-            HarborL1dCacheConfig(size: dSize, ways: 1, lineSize: 16),
-          ),
+          config:
+              config ??
+              HarborL1CacheConfig.unified(
+                HarborL1dCacheConfig(size: dSize, ways: 1, lineSize: 16),
+              ),
           pma: const HarborPmaConfig(
             regions: [HarborPmaRegion.memory(start: 0x100, size: 0x100)],
           ),

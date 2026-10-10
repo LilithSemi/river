@@ -7,7 +7,9 @@ import '../core_harness.dart';
 /// L1 instruction cache integration: the core fetches through the icache
 /// (hits in one cycle, misses fill a line from the MMU). Verifies correctness
 /// with the cache enabled, in both single- and dual-dispatch.
-void main() {
+void main() => instructionCacheTests();
+
+void instructionCacheTests({HarborL1CacheConfig? cacheConfig}) {
   tearDown(() async {
     await Simulator.reset();
   });
@@ -31,12 +33,9 @@ void main() {
     type: RiverCoreType.general,
     executionMode: ExecutionMode.outOfOrder,
     speculativeFetch: true,
-    l1cache: HarborL1CacheConfig.split(
-      iSize: 32,
-      dSize: 64,
-      ways: 1,
-      lineSize: 4,
-    ),
+    l1cache:
+        cacheConfig ??
+        HarborL1CacheConfig.split(iSize: 32, dSize: 64, ways: 1, lineSize: 4),
   );
 
   RiverCoreConfig icacheDual() => RiverCoreConfig(
@@ -52,12 +51,9 @@ void main() {
     executionMode: ExecutionMode.outOfOrder,
     speculativeFetch: true,
     issueWidth: IssueWidth.dual,
-    l1cache: HarborL1CacheConfig.split(
-      iSize: 32,
-      dSize: 64,
-      ways: 1,
-      lineSize: 4,
-    ),
+    l1cache:
+        cacheConfig ??
+        HarborL1CacheConfig.split(iSize: 32, dSize: 64, ways: 1, lineSize: 4),
   );
 
   int iimm(int imm, int rs1, int f3, int rd) =>
