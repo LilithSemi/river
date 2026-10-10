@@ -4,7 +4,9 @@ import 'package:river_hdl/river_hdl.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-void main() {
+void main() => physicalAliasTests();
+
+void physicalAliasTests({int dSize = 4096}) {
   tearDown(Simulator.reset);
   for (final microcoded in [false, true]) {
     for (final (cached, remap, device) in [
@@ -80,8 +82,8 @@ void main() {
                   ? MicrocodeMode.full
                   : MicrocodeMode.none,
               l1cache: cached
-                  ? const HarborL1CacheConfig.unified(
-                      HarborL1dCacheConfig(size: 4096, ways: 1, lineSize: 16),
+                  ? HarborL1CacheConfig.unified(
+                      HarborL1dCacheConfig(size: dSize, ways: 1, lineSize: 16),
                     )
                   : null,
               mmu: HarborMmuConfig(

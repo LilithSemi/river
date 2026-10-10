@@ -4,7 +4,9 @@ import 'package:river_hdl/src/core/physical_l1.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-void main() {
+void main() => physicalFlushTests();
+
+void physicalFlushTests({int dSize = 64}) {
   tearDown(Simulator.reset);
   for (final width in [32, 64]) {
     test(
@@ -27,8 +29,8 @@ void main() {
           ack,
           Const(0),
           Const(0, width: width),
-          config: const HarborL1CacheConfig.unified(
-            HarborL1dCacheConfig(size: 64, ways: 1, lineSize: 16),
+          config: HarborL1CacheConfig.unified(
+            HarborL1dCacheConfig(size: dSize, ways: 1, lineSize: 16),
           ),
           pma: const HarborPmaConfig(
             regions: [HarborPmaRegion.memory(start: 0x100, size: 0x100)],

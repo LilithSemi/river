@@ -4,7 +4,9 @@ import 'package:river_hdl/src/core/physical_l1.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-void main() {
+void main() => physicalPmaTests();
+
+void physicalPmaTests({int dSize = 64}) {
   tearDown(Simulator.reset);
   for (final width in [32, 64]) {
     for (final fetch in [false, true]) {
@@ -55,7 +57,7 @@ void main() {
             rdata,
             config: HarborL1CacheConfig.split(
               iSize: 64,
-              dSize: 64,
+              dSize: dSize,
               ways: 1,
               lineSize: 16,
             ),

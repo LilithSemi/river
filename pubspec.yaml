@@ -15,9 +15,9 @@ workspace:
 dependency_overrides:
   harbor:
     git:
-      url: https://git.lilithsemi.com/LilithSemi/harbor
+      url: https://github.com/murdoa/harbor.git
       path: packages/harbor
-      ref: ef4ec03a24c3b7d55fc5ee8841a7f8403b9ee095
+      ref: 57b7bdccb1b2e2bef2c87c387f339d00b2274d2a
 
 dev_dependencies:
   coverage: ^1.15.0
