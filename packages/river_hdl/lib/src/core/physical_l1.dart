@@ -139,6 +139,8 @@ class RiverPhysicalL1 extends Module {
       xlen: xlen,
       reqAddrBits: xlen,
       cacheableBase: 0,
+      // This stage receives translated addresses and checks whole-line PMAs.
+      physicalAddresses: true,
       memFaultIn: Const(0),
       target: target,
     );
