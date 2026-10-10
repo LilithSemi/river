@@ -33,7 +33,21 @@ class MicrocodeAlu extends Module {
 
     // ONE shared adder: add/sub/addw/subw. sub-family inverts b and carries in.
     final isSub = f(MicroOpAluFunct.sub) | f(MicroOpAluFunct.subw);
-    final sum = a + mux(isSub, ~b, b) + isSub.zeroExtend(xlen);
+    final addB = mux(isSub, ~b, b);
+    Logic sum;
+    if (xlen == 64) {
+      // Carry-select halves keep operand inversion off a full XLEN carry
+      // chain. Both upper carry outcomes are computed in parallel.
+      final low =
+          a.slice(31, 0).zeroExtend(33) +
+          addB.slice(31, 0).zeroExtend(33) +
+          isSub.zeroExtend(33);
+      final high0 = a.slice(63, 32) + addB.slice(63, 32);
+      final high1 = a.slice(63, 32) + addB.slice(63, 32) + Const(1, width: 32);
+      sum = [mux(low[32], high1, high0), low.slice(31, 0)].swizzle();
+    } else {
+      sum = a + addB + isSub.zeroExtend(xlen);
+    }
     final sumW = sum.slice(31, 0).signExtend(xlen);
 
     // Bitwise.

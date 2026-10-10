@@ -407,10 +407,18 @@ class DynamicInstructionDecoder extends InstructionDecoder {
       return pm & nzf & zf;
     }
 
+    final laneMatches = [for (var l = 0; l < lanes; l++) laneMatch(laneRow(l))];
+    var selectedMatch =
+        laneMatches.last & rowField(laneRow(lanes - 1), 'mask').neq(0);
     var selData = laneRow(lanes - 1);
     for (var l = lanes - 2; l >= 0; l--) {
+      selectedMatch = mux(
+        laneMatches[l],
+        rowField(laneRow(l), 'mask').neq(0),
+        selectedMatch,
+      );
       selData = mux(
-        laneMatch(laneRow(l)),
+        laneMatches[l],
         laneRow(l),
         selData,
       ).named('decodeSelData_$l');
@@ -451,20 +459,9 @@ class DynamicInstructionDecoder extends InstructionDecoder {
         .toList();
     final opIdxWidth = pattern['opIndex']!.width;
 
-    final nzfMatch = mux(
-      pattern['nzfMask']!.neq(0),
-      (instr & pattern['nzfMask']!).neq(0),
-      Const(1),
-    ).named('nzfMatch');
-    final zfMatch = mux(
-      pattern['zfMask']!.neq(0),
-      (instr & pattern['zfMask']!).eq(0),
-      Const(1),
-    ).named('zfMatch');
-
-    final patternMatch = (instr & pattern['mask']!)
-        .eq(pattern['value']!)
-        .named('patternMatch');
+    // Carry the winning lane's match alongside its row instead of matching
+    // the priority-muxed row again. Preserve zero-mask tail rejection and the
+    // same lowest-lane priority for both the metadata and match decision.
 
     // STAGE 2 field extraction, sourced from the REGISTERED match result. This
     // is the identical field logic as before, just driven by _matchInstr /
@@ -512,14 +509,9 @@ class DynamicInstructionDecoder extends InstructionDecoder {
         ]),
     ];
 
-    // "No valid decode this cycle" output clear (fresh Conditionals each call).
-    List<Conditional> clearOutputs() => [
-      done < 0,
-      valid < 0,
-      index < 0,
-      ...instrTypeMap.entries.map((entry) => entry.value < 0),
-      ...fields.entries.map((entry) => entry.value < 0),
-    ];
+    // Only completion status depends on the ROM match. Clear search-stage
+    // data independently so the match cone does not drive every field bit.
+    List<Conditional> clearOutputs() => [done < 0, valid < 0];
 
     // First cycle of a NEW instruction: the fetch holds `pc_in` stable across the
     // multi-cycle scan, so `pc_in != pc_out` (pc_out is last cycle's pc_in) is
@@ -547,6 +539,9 @@ class DynamicInstructionDecoder extends InstructionDecoder {
             then: [microcodeRead.en < 0, ...computeFields()],
             orElse: [
               // STAGE 1: search the microcode ROM, one packed row per cycle.
+              index < 0,
+              ...instrTypeMap.entries.map((entry) => entry.value < 0),
+              ...fields.entries.map((entry) => entry.value < 0),
               microcodeRead.en < 1,
               // _counter is sized for the unpacked pattern count; the packed ROM
               // has ceil(patterns/lanes) words, so its address port is narrower.
@@ -576,10 +571,7 @@ class DynamicInstructionDecoder extends InstructionDecoder {
                         microcodeRead.valid,
                         then: [
                           If(
-                            patternMatch &
-                                nzfMatch &
-                                zfMatch &
-                                pattern['mask']!.neq(0),
+                            selectedMatch,
                             // Match: latch ONLY the result; the field Cases run next
                             // cycle in stage 2. done/valid stay low until then. Exec
                             // already tolerates variable decode latency (the ROM
@@ -630,17 +622,7 @@ class DynamicInstructionDecoder extends InstructionDecoder {
                                 then: [
                                   If(
                                     _rescanned,
-                                    then: [
-                                      done < 1,
-                                      valid < 0,
-                                      index < 0,
-                                      ...instrTypeMap.entries.map(
-                                        (entry) => entry.value < 0,
-                                      ),
-                                      ...fields.entries.map(
-                                        (entry) => entry.value < 0,
-                                      ),
-                                    ],
+                                    then: [done < 1, valid < 0],
                                     orElse: [
                                       _counter < 0,
                                       _rescanned < 1,
@@ -656,15 +638,7 @@ class DynamicInstructionDecoder extends InstructionDecoder {
                             ],
                           ),
                         ],
-                        orElse: [
-                          done < 1,
-                          valid < 0,
-                          index < 0,
-                          ...instrTypeMap.entries.map(
-                            (entry) => entry.value < 0,
-                          ),
-                          ...fields.entries.map((entry) => entry.value < 0),
-                        ],
+                        orElse: [done < 1, valid < 0],
                       ),
                     ],
                     orElse: clearOutputs(),
