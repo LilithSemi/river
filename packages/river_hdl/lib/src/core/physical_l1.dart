@@ -30,7 +30,7 @@ class RiverPhysicalL1 extends Module {
     final xlen = addr.width;
     final laneBits = (xlen ~/ 8 - 1).bitLength;
     for (final bytes in [
-      config.d.lineSize,
+      if (config.d != null) config.d!.lineSize,
       if (config.i != null) config.i!.lineSize,
     ]) {
       if (bytes < xlen ~/ 8 || bytes > 4096 || (bytes & (bytes - 1)) != 0) {
@@ -100,7 +100,11 @@ class RiverPhysicalL1 extends Module {
         ~walk &
         fetch;
     final selectD =
-        cacheableLine(config.d.lineSize, executable: false) & ~walk & ~fetch;
+        (config.d == null
+            ? Const(0)
+            : cacheableLine(config.d!.lineSize, executable: false)) &
+        ~walk &
+        ~fetch;
     final bypass = ~selectI & ~selectD;
 
     final done = Logic(name: 'memoryDone');
@@ -134,42 +138,52 @@ class RiverPhysicalL1 extends Module {
       icache.input('mem_fault').srcConnection! <= Const(0);
       icache.input('mem_rdata').srcConnection! <= result;
     }
-    final dcache = HarborL1DCache(
-      config: config.d,
-      xlen: xlen,
-      reqAddrBits: xlen,
-      cacheableBase: 0,
-      memFaultIn: Const(0),
-      target: target,
-    );
-    dcache.input('clk').srcConnection! <= clk;
-    dcache.input('reset').srcConnection! <= reset;
-    dcache.input('req_addr').srcConnection! <= addr;
-    dcache.input('req_valid').srcConnection! <= valid & selectD;
-    dcache.input('req_write').srcConnection! <= write;
-    dcache.input('req_data').srcConnection! <= data;
-    dcache.input('req_size').srcConnection! <= size;
-    dcache.input('flush').srcConnection! <= flush | (valid & bypass & write);
-    dcache.input('mem_done').srcConnection! <= dDone;
-    dcache.input('mem_valid').srcConnection! <= success;
-    // D-cache bypass responses are lane-zero; refill beats are aligned.
-    dcache.input('mem_rdata').srcConnection! <=
-        result >> [busAddr.getRange(0, laneBits), Const(0, width: 3)].swizzle();
+    HarborL1DCache? dcache;
+    if (config.d != null) {
+      dcache = HarborL1DCache(
+        config: config.d!,
+        xlen: xlen,
+        reqAddrBits: xlen,
+        cacheableBase: 0,
+        // This stage receives translated addresses and checks whole-line PMAs.
+        physicalAddresses: true,
+        memFaultIn: Const(0),
+        target: target,
+      );
+      dcache.input('clk').srcConnection! <= clk;
+      dcache.input('reset').srcConnection! <= reset;
+      dcache.input('req_addr').srcConnection! <= addr;
+      dcache.input('req_valid').srcConnection! <= valid & selectD;
+      dcache.input('req_write').srcConnection! <= write;
+      dcache.input('req_data').srcConnection! <= data;
+      dcache.input('req_size').srcConnection! <= size;
+      dcache.input('flush').srcConnection! <= flush | (valid & bypass & write);
+      dcache.input('mem_done').srcConnection! <= dDone;
+      dcache.input('mem_valid').srcConnection! <= success;
+      // D-cache bypass responses are lane-zero; refill beats are aligned.
+      dcache.input('mem_rdata').srcConnection! <=
+          result >>
+              [busAddr.getRange(0, laneBits), Const(0, width: 3)].swizzle();
+    }
     final iEn = icache?.memEn ?? Const(0);
-    final dEn = dcache.memEn;
+    final dEn = dcache?.memEn ?? Const(0);
     final bypassEn = valid & bypass;
     final request = iEn | dEn | bypassEn;
     final requestAddr = mux(
       iEn,
       icache?.memAddr ?? addr,
-      mux(dEn, dcache.memAddr, addr),
+      mux(dEn, dcache?.memAddr ?? addr, addr),
     );
-    final requestWrite = mux(iEn, Const(0), mux(dEn, dcache.memWe, write));
-    final requestData = mux(dEn, dcache.memWdata, data);
+    final requestWrite = mux(
+      iEn,
+      Const(0),
+      mux(dEn, dcache?.memWe ?? write, write),
+    );
+    final requestData = mux(dEn, dcache?.memWdata ?? data, data);
     final requestSize = mux(
       iEn,
       Const(laneBits, width: 3),
-      mux(dEn, dcache.memSize, size),
+      mux(dEn, dcache?.memSize ?? size, size),
     );
     Sequential(clk, [
       If(
@@ -220,8 +234,8 @@ class RiverPhysicalL1 extends Module {
     ]);
     final iOk = icache?.respValid ?? Const(0);
     final iErr = icache?.respFault ?? Const(0);
-    final dOk = dcache.respValid;
-    final dErr = dcache.respFault;
+    final dOk = dcache?.respValid ?? Const(0);
+    final dErr = dcache?.respFault ?? Const(0);
     final bypassDone = done & owner.eq(0);
     addOutput('response_ack') <=
         valid & mux(selectI, iOk, mux(selectD, dOk, bypassDone & success));
@@ -236,7 +250,7 @@ class RiverPhysicalL1 extends Module {
         mux(
           selectI,
           icache?.respData ?? result,
-          mux(selectD, dcache.respData << laneShift, result),
+          mux(selectD, (dcache?.respData ?? result) << laneShift, result),
         );
     addOutput('cyc') <= active;
     addOutput('we') <= busWrite;

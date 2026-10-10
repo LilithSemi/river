@@ -900,6 +900,12 @@ class PinAssignment {
 class RiverGenIpConfig {
   final String name;
   final List<String> cores;
+
+  /// Opt into a 64-byte, direct-mapped instruction-only L1 with 8-byte lines.
+  /// False preserves each core tier's existing cache defaults. On the physical
+  /// path only declared SRAM/DRAM is eligible; boot ROM and MMIO bypass.
+  /// Supported for scalar in-order cores, not the OoO rc1-m profile.
+  final bool instructionOnlyCache;
   final String interconnect;
   final int clockFrequency;
   final int oscFrequency;
@@ -946,6 +952,7 @@ class RiverGenIpConfig {
   const RiverGenIpConfig({
     required this.name,
     required this.cores,
+    this.instructionOnlyCache = false,
     this.interconnect = 'wishbone',
     this.clockFrequency = 48000000,
     this.oscFrequency = 12000000,
@@ -1165,6 +1172,17 @@ class RiverGenIpConfig {
     // `HarborMmuConfig.hasPaging` is false: the core/MMU gate off the entire
     // Sv39 page-table-walk datapath + satp/SUM/MXR hookups, leaving only the
     // bare bus arbiter. Used for machine-mode bring-up bitstreams.
+    if (instructionOnlyCache &&
+        (!const ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-f'].contains(coreModel) ||
+            cores.any(
+              (c) =>
+                  const ['rc1-n', 'rc1-mi'].contains(c) !=
+                  (mxlen == RiscVMxlen.rv32),
+            ))) {
+      throw ArgumentError(
+        'Instruction-only cache requires same-XLEN scalar in-order cores',
+      );
+    }
     final pagingOn = enableMmu && mxlen == RiscVMxlen.rv64;
     final mmu = HarborMmuConfig(
       mxlen: mxlen,
@@ -1175,6 +1193,9 @@ class RiverGenIpConfig {
       pmp: HarborPmpConfig.none,
       hasSupervisorUserMemory: pagingOn,
       hasMakeExecutableReadable: pagingOn,
+      pma: instructionOnlyCache && pagingOn
+          ? _instructionCachePma()
+          : const HarborPmaConfig(),
     );
 
     final factory = _coreModels[coreModel];
@@ -1183,6 +1204,11 @@ class RiverGenIpConfig {
     }
 
     return factory(
+      l1cache: instructionOnlyCache
+          ? const HarborL1CacheConfig.instructionOnly(
+              HarborL1iCacheConfig(size: 64, ways: 1, lineSize: 8),
+            )
+          : null,
       hartId: hartId,
       mmu: mmu,
       interrupts: [],
@@ -1196,6 +1222,47 @@ class RiverGenIpConfig {
           ? bootRomBase
           : (memories.isNotEmpty ? memories.first.address : 0),
     );
+  }
+
+  HarborPmaConfig _instructionCachePma() {
+    // Use declared RAM windows, never an open-ended cacheability threshold.
+    // Unlisted addresses bypass; these PMAs do not enable misaligned loads.
+    final ram = devices.where((d) => d.type == 'sram' || d.type == 'dram');
+    final regions = <HarborPmaRegion>[];
+    for (final d in ram) {
+      final start = d.address;
+      final size = d.size;
+      if (start == null ||
+          size == null ||
+          start < 0 ||
+          size <= 0 ||
+          BigInt.from(start) + BigInt.from(size) > (BigInt.one << mxlen.size)) {
+        throw ArgumentError('Invalid cacheable RAM window: ${d.name}');
+      }
+      final end = BigInt.from(start) + BigInt.from(size);
+      for (final other in devices) {
+        if (identical(d, other) ||
+            other.address == null ||
+            other.type == 'flash-firmware') {
+          continue;
+        }
+        final otherStart = BigInt.from(other.address!);
+        final otherEnd = otherStart + BigInt.from(other.effectiveSize);
+        if (BigInt.from(start) < otherEnd && otherStart < end) {
+          throw ArgumentError('Cacheable RAM overlaps device: ${other.name}');
+        }
+      }
+      regions.add(
+        HarborPmaRegion(
+          start: start,
+          size: size,
+          atomicSupport: false,
+          misalignedSupport: false,
+          accessWidths: [mxlen.size ~/ 8],
+        ),
+      );
+    }
+    return HarborPmaConfig(regions: regions);
   }
 
   WishboneConfig buildBusConfig() => WishboneConfig(

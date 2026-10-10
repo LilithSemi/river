@@ -4,7 +4,13 @@ import 'package:river_hdl/river_hdl.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-void main() {
+void main() => physicalAliasTests();
+
+void physicalAliasTests({
+  int dSize = 4096,
+  HarborL1CacheConfig? cacheConfig,
+  bool uncachedData = false,
+}) {
   tearDown(Simulator.reset);
   for (final microcoded in [false, true]) {
     for (final (cached, remap, device) in [
@@ -80,9 +86,14 @@ void main() {
                   ? MicrocodeMode.full
                   : MicrocodeMode.none,
               l1cache: cached
-                  ? const HarborL1CacheConfig.unified(
-                      HarborL1dCacheConfig(size: 4096, ways: 1, lineSize: 16),
-                    )
+                  ? cacheConfig ??
+                        HarborL1CacheConfig.unified(
+                          HarborL1dCacheConfig(
+                            size: dSize,
+                            ways: 1,
+                            lineSize: 16,
+                          ),
+                        )
                   : null,
               mmu: HarborMmuConfig(
                 mxlen: RiscVMxlen.rv64,
@@ -183,6 +194,13 @@ void main() {
             expect(reg(10), 0x11111111);
             if (!device) expect(reg(12), 0x11111111);
             expect(stores, remap || device ? 0 : 1);
+            if (uncachedData && cached && !device) {
+              expect(
+                dataReads,
+                remap ? 2 : 3,
+                reason: 'data reads remain uncached',
+              );
+            }
             if (remap) {
               expect(
                 (reg(14) >> 44) & 0xffff,

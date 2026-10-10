@@ -359,7 +359,7 @@ class RiverCore extends BridgeModule {
     final physicalCaches =
         l1 != null &&
         !dualDispatch &&
-        l1.d.lineSize <= 4096 &&
+        (l1.d == null || l1.d!.lineSize <= 4096) &&
         (l1.i == null || l1.i!.lineSize <= 4096) &&
         config.mmu.hasPaging &&
         !config.hasHypervisor &&
@@ -527,7 +527,7 @@ class RiverCore extends BridgeModule {
     // captures correctly, never a back-to-back burst. The D-cache extends the
     // same pacing to data loads.
     final useICache = l1?.i != null && !physicalCaches;
-    final useDCache = l1 != null && !physicalCaches;
+    final useDCache = l1?.d != null && !physicalCaches;
 
     // Permission context for legacy L1 tags. Those caches are in FRONT of the MMU,
     // so a HIT never reaches the MMU and no permission check runs on it. Without
@@ -631,7 +631,7 @@ class RiverCore extends BridgeModule {
     HarborL1DCache? dcache;
     if (useDCache) {
       dcache = HarborL1DCache(
-        config: l1.d,
+        config: l1!.d!,
         xlen: config.mxlen.size,
         ctxBits: dCtx?.width ?? 0,
         reqAddrBits: l1AddrBits,
