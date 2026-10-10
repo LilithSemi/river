@@ -14,6 +14,7 @@ lib.extendMkDerivation {
   excludeDrvArgNames = [
     "socName"
     "cores"
+    "instructionOnlyCache"
     "interconnect"
     "clockFreq"
     "oscFreq"
@@ -30,6 +31,7 @@ lib.extendMkDerivation {
       name ? "river-ip-${socName}",
       socName ? "river_soc",
       cores ? [ "rc1-s" ],
+      instructionOnlyCache ? false,
       interconnect ? "wishbone",
       clockFreq ? 48000000,
       # The board's physical oscillator; the clock generator synthesizes
@@ -57,6 +59,11 @@ lib.extendMkDerivation {
         "rc1-f"
       ]
     ) cores) "river-ip: cores must each be one of [rc1-n, rc1-mi, rc1-s, rc1-m, rc1-f]";
+    assert lib.assertMsg (builtins.isBool instructionOnlyCache)
+      "river-ip: instructionOnlyCache must be a boolean";
+    assert lib.assertMsg (
+      !instructionOnlyCache || !(builtins.elem "rc1-m" cores)
+    ) "river-ip: instructionOnlyCache requires scalar in-order cores";
     assert lib.assertMsg (builtins.elem interconnect [
       "wishbone"
       "axi"
@@ -72,6 +79,7 @@ lib.extendMkDerivation {
       };
 
       coreFlags = lib.concatMapStringsSep " " (c: "--core ${c}") cores;
+      cacheFlag = lib.optionalString instructionOnlyCache "--instruction-only-cache";
       # Memory regions are devices in the unified genip interface. Reorder the
       # declarative addr:size:type[:board][:params] form to the genip device
       # form type:addr:size[:board][:params] and pass each via --device.
@@ -96,6 +104,7 @@ lib.extendMkDerivation {
     builtins.removeAttrs args [
       "socName"
       "cores"
+      "instructionOnlyCache"
       "interconnect"
       "clockFreq"
       "oscFreq"
@@ -119,7 +128,7 @@ lib.extendMkDerivation {
 
       buildPhase = ''
         runHook preBuild
-        river-genip ${cliArgs} ${coreFlags} ${memoryFlags} ${deviceFlags} ${targetFlag} ${boardFlag} ${pdkRootFlag} ${pinFlags} ${bootProgramFlag} --output "$out"
+        river-genip ${cliArgs} ${coreFlags} ${cacheFlag} ${memoryFlags} ${deviceFlags} ${targetFlag} ${boardFlag} ${pdkRootFlag} ${pinFlags} ${bootProgramFlag} --output "$out"
         runHook postBuild
       '';
 
@@ -129,6 +138,7 @@ lib.extendMkDerivation {
         inherit
           socName
           cores
+          instructionOnlyCache
           interconnect
           clockFreq
           memories

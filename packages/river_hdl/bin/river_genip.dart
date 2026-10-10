@@ -21,6 +21,14 @@ Future<void> main(List<String> arguments) async {
       defaultsTo: ['rc1-mi'],
       allowed: ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-m', 'rc1-f'],
     )
+    ..addFlag(
+      'instruction-only-cache',
+      negatable: false,
+      help:
+          'Use an instruction-only L1 on scalar in-order cores. '
+          'Data stays uncached; physical instruction caching covers '
+          'declared SRAM/DRAM only.',
+    )
     ..addOption(
       'interconnect',
       abbr: 'i',
@@ -154,6 +162,7 @@ Future<void> main(List<String> arguments) async {
   final config = RiverGenIpConfig(
     name: args.option('name')!,
     cores: args.multiOption('core'),
+    instructionOnlyCache: args.flag('instruction-only-cache'),
     interconnect: args.option('interconnect')!,
     clockFrequency: int.parse(args.option('clock-freq')!),
     oscFrequency: int.parse(args.option('osc-freq')!),
