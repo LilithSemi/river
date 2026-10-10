@@ -2031,67 +2031,64 @@ class DynamicExecutionUnit extends ExecutionUnit {
         .slice(MicroOp.functRange.end, MicroOp.functRange.start)
         .named('mopFunct');
 
-    Logic readSource(Logic source) => mux(
-      source.eq(Const(MicroOpSource.imm, width: MicroOpSource.width)),
-      imm,
-      mux(
-        source.eq(Const(MicroOpSource.alu, width: MicroOpSource.width)),
-        alu,
-        mux(
-          source.eq(Const(MicroOpSource.rs1, width: MicroOpSource.width)),
-          rs1,
-          mux(
-            source.eq(Const(MicroOpSource.rs2, width: MicroOpSource.width)),
-            rs2,
-            mux(
-              source.eq(Const(MicroOpSource.rd, width: MicroOpSource.width)),
-              rd,
-              nextPc,
-            ),
-          ),
+    Logic readSource(Logic source) {
+      final value = Logic(name: 'sourceValue', width: mxlen.size);
+      Combinational([
+        Case(
+          source,
+          [
+            for (final entry in {
+              MicroOpSource.imm: imm,
+              MicroOpSource.alu: alu,
+              MicroOpSource.rs1: rs1,
+              MicroOpSource.rs2: rs2,
+              MicroOpSource.rd: rd,
+            }.entries)
+              CaseItem(Const(entry.key, width: MicroOpSource.width), [
+                value < entry.value,
+              ]),
+          ],
+          defaultItem: [value < nextPc],
         ),
-      ),
-    );
+      ]);
+      return value;
+    }
 
     // rs3, the third source of an r4-type fused multiply-add, exists only when
     // the ISA carries such an op. Its decode field then appears in [fields].
     final hasRs3 = fields.containsKey('rs3');
 
-    Logic readField(Logic field, {bool register = true}) => mux(
-      field.eq(Const(MicroOpField.rd, width: MicroOpField.width)),
-      (register ? rd : fields['rd']!).zeroExtend(mxlen.size),
-      mux(
-        field.eq(Const(MicroOpField.rs1, width: MicroOpField.width)),
-        (register ? rs1 : fields['rs1']!).zeroExtend(mxlen.size),
-        mux(
-          field.eq(Const(MicroOpField.rs2, width: MicroOpField.width)),
-          (register ? rs2 : fields['rs2']!).zeroExtend(mxlen.size),
-          mux(
-            field.eq(Const(MicroOpField.imm, width: MicroOpField.width)),
-            register ? imm : fields['imm']!,
-            mux(
-              field.eq(Const(MicroOpField.pc, width: MicroOpField.width)),
-              nextPc,
-              // rs3 is named ONLY as a register INDEX, by the extra ReadRegister
-              // that a fused multiply-add carries. The FPU takes its third
-              // operand straight from the rs3 latch, so no XLEN-wide data path
-              // ever selects rs3. Folding rs3 into the decode-field variant only
-              // keeps the register variant, which is the wide one and has many
-              // more users, at its existing five-way mux.
-              (hasRs3 && !register)
-                  ? mux(
-                      field.eq(
-                        Const(MicroOpField.rs3, width: MicroOpField.width),
-                      ),
-                      fields['rs3']!.zeroExtend(mxlen.size),
-                      nextSp,
-                    )
-                  : nextSp,
-            ),
-          ),
+    Logic readField(Logic field, {bool register = true}) {
+      final value = Logic(name: 'fieldValue', width: mxlen.size);
+      // Distinct field codes are parallel choices, not a priority mux chain.
+      // rs3 remains an INDEX-only source; the FPU uses its separate data latch.
+      final choices = {
+        MicroOpField.rd: (register ? rd : fields['rd']!).zeroExtend(mxlen.size),
+        MicroOpField.rs1: (register ? rs1 : fields['rs1']!).zeroExtend(
+          mxlen.size,
         ),
-      ),
-    );
+        MicroOpField.rs2: (register ? rs2 : fields['rs2']!).zeroExtend(
+          mxlen.size,
+        ),
+        MicroOpField.imm: register ? imm : fields['imm']!,
+        MicroOpField.pc: nextPc,
+        if (hasRs3 && !register)
+          MicroOpField.rs3: fields['rs3']!.zeroExtend(mxlen.size),
+      };
+      Combinational([
+        Case(
+          field,
+          [
+            for (final entry in choices.entries)
+              CaseItem(Const(entry.key, width: MicroOpField.width), [
+                value < entry.value,
+              ]),
+          ],
+          defaultItem: [value < nextSp],
+        ),
+      ]);
+      return value;
+    }
 
     // Shared microcode-ALU operands: hoisted out of the ~19-arm funct Case so
     // synth infers ONE operand mux per side instead of one per arm (mux-bound).
