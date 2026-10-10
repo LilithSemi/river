@@ -4,7 +4,9 @@ import 'package:river_hdl/river_hdl.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-void main() {
+void main() => physicalL1Tests();
+
+void physicalL1Tests({int dSize = 128}) {
   tearDown(Simulator.reset);
   for (final lineSize in [16, 64]) {
     test(
@@ -65,7 +67,7 @@ void main() {
           cacheFlush: flush,
           physicalL1: HarborL1CacheConfig.split(
             iSize: 128,
-            dSize: 128,
+            dSize: dSize,
             ways: 1,
             lineSize: lineSize,
           ),
