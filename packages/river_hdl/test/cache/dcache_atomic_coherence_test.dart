@@ -44,7 +44,7 @@ void main() {
         dSize: 256,
         ways: 1,
         lineSize: 8,
-      ).d,
+      ).d!,
       xlen: 64,
     );
     dc.input('clk').srcConnection! <= clk;

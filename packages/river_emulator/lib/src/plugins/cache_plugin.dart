@@ -33,7 +33,7 @@ class CachePlugin extends FiberPlugin {
 
     l1d = config.l1cache?.d != null
         ? Cache(
-            config.l1cache!.d,
+            config.l1cache!.d!,
             fill: (addr, size) async {
               return await mmu.readBlock(addr, size, pageTranslate: false);
             },
