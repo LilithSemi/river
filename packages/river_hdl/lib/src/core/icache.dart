@@ -130,9 +130,11 @@ class RiverICache extends BridgeModule {
     }
 
     // Per-line DATA in a block RAM (one read port per lookup port, one shared
-    // write port for fills). readLatency forced to 1 so the sim flop model
-    // behaves exactly like the ECP5 DP16KD registered read.
+    // write port for fills). The cache expects read latency 1, which the sim
+    // flop model and the ECP5 DP16KD registered read both give. The iCE40
+    // block RAM reads at latency 0, so one flop after it gives the same timing.
     final nEntries = numLines * lineWords;
+    final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
       numEntries: nEntries,
       dataWidth: xlen,
@@ -140,7 +142,7 @@ class RiverICache extends BridgeModule {
       numWritePorts: 1,
       reservedZero: false,
       target: target,
-      forceReadLatency: 1,
+      forceReadLatency: ramLatency,
       name: 'icache_data',
     );
     addSubModule(dataRam);
@@ -219,11 +221,14 @@ class RiverICache extends BridgeModule {
     // addrQ, data from the block-RAM read that answers addrQ this cycle.
     done0 <= hit0;
     valid0 <= hit0;
-    rdata0 <= dataRam.readData(0);
+    Logic ramRead(int r) => ramLatency == 1
+        ? dataRam.readData(r)
+        : flop(clk, dataRam.readData(r));
+    rdata0 <= ramRead(0);
     if (dualPort) {
       done1 <= hit1;
       valid1 <= hit1;
-      rdata1 <= dataRam.readData(1);
+      rdata1 <= ramRead(1);
     }
 
     // Data block-RAM write port: one fill word per MMU response.
