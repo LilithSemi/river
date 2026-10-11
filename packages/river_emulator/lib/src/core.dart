@@ -1100,27 +1100,28 @@ class RiverCore implements CsrContext {
         state.pc = trap(state.pc, TrapException(trapKind));
         return state;
       } else if (mop is RiscVBranch) {
-        final target = state.readSource(mop.target);
-
         final value = mop.offsetField != null
             ? state.readField(mop.offsetField!)
             : mop.offset;
 
-        // Unsigned conditions cannot come from the sign of the signed rs1-rs2
-        // difference (`target`), so compare the operands as unsigned, same width
-        // handling as SLTU above (flip the top bit at xlen=64).
+        // Every condition compares the operands directly. The signed and
+        // equality forms used to read the sign of an rs1-rs2 difference, which
+        // is 0 unless a preceding mop put the subtraction there. Unsigned uses
+        // the same width handling as SLTU (flip the top bit at xlen=64).
         final xlen = config.mxlen.size;
         final lhs = state.readField(RiscVMicroOpField.rs1);
         final rhs = state.readField(RiscVMicroOpField.rs2);
         final ltu = xlen < 64
             ? lhs.toUnsigned(xlen) < rhs.toUnsigned(xlen)
             : (lhs ^ 0x8000000000000000) < (rhs ^ 0x8000000000000000);
+        final a = lhs.toSigned(xlen);
+        final b = rhs.toSigned(xlen);
 
         final condition = switch (mop.condition) {
-          RiscVBranchCondition.eq => target == 0,
-          RiscVBranchCondition.ne => target != 0,
-          RiscVBranchCondition.lt => target < 0,
-          RiscVBranchCondition.ge => target >= 0,
+          RiscVBranchCondition.eq => a == b,
+          RiscVBranchCondition.ne => a != b,
+          RiscVBranchCondition.lt => a < b,
+          RiscVBranchCondition.ge => a >= b,
           RiscVBranchCondition.ltu => ltu,
           RiscVBranchCondition.geu => !ltu,
         };
