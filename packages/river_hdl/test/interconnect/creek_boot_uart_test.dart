@@ -34,7 +34,7 @@ void main() {
         name: 'creek_v1',
         cores: const ['rc1-s'],
         clockFrequency: clockHz,
-        oscFrequency: clockHz, // equal -> passthrough clock in sim
+        oscFrequencyOverride: clockHz, // equal -> passthrough clock in sim
         devices: [
           Device.parse('flash:0x20000000:16M'),
           Device.parse('sram:0x80000000:32K'),

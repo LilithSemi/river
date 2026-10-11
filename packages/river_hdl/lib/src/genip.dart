@@ -902,7 +902,10 @@ class RiverGenIpConfig {
   final List<String> cores;
   final String interconnect;
   final int clockFrequency;
-  final int oscFrequency;
+
+  /// The oscillator frequency as given on the command line. Null means "not
+  /// set", so [oscFrequency] takes the board's own figure.
+  final int? oscFrequencyOverride;
 
   /// The unified `--device` list: every addressed thing in the SoC (memory-backed
   /// regions, MMIO peripherals, and the usb-dfu/debug-jtag/flash-firmware
@@ -948,7 +951,7 @@ class RiverGenIpConfig {
     required this.cores,
     this.interconnect = 'wishbone',
     this.clockFrequency = 48000000,
-    this.oscFrequency = 12000000,
+    this.oscFrequencyOverride,
     this.devices = const [],
     this.target,
     this.boardName,
@@ -1246,6 +1249,13 @@ class RiverGenIpConfig {
   /// The resolved Harbor board, when `--board` names one.
   HarborBoard? get board =>
       boardName != null ? HarborBoard.get(boardName!) : null;
+
+  /// The external oscillator frequency. An explicit `--osc-freq` wins, else the
+  /// selected board supplies its own, else 12 MHz. Taking the board figure
+  /// matters: an Arty S7 runs a 100 MHz oscillator, and 12 MHz cannot reach the
+  /// PLLE2 VCO band, so a board build with the old default threw in the PLL.
+  int get oscFrequency =>
+      oscFrequencyOverride ?? board?.oscillatorHz ?? 12000000;
 
   /// The effective FPGA/ASIC target: the explicit `--target`, else one
   /// synthesised from the `--board` identity (so the board can stand in for

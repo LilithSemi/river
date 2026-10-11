@@ -35,8 +35,8 @@ Future<void> main(List<String> arguments) async {
     )
     ..addOption(
       'osc-freq',
-      help: 'External oscillator frequency (Hz)',
-      defaultsTo: '12000000',
+      help: 'External oscillator frequency (Hz). Defaults to the --board '
+          'figure, or 12 MHz when no board is given.',
     )
     ..addMultiOption(
       'device',
@@ -156,7 +156,9 @@ Future<void> main(List<String> arguments) async {
     cores: args.multiOption('core'),
     interconnect: args.option('interconnect')!,
     clockFrequency: int.parse(args.option('clock-freq')!),
-    oscFrequency: int.parse(args.option('osc-freq')!),
+    oscFrequencyOverride: args.option('osc-freq') == null
+        ? null
+        : int.parse(args.option('osc-freq')!),
     devices: args.multiOption('device').map(Device.parse).toList(),
     target: args.option('target') != null
         ? Target.parse(args.option('target')!)

@@ -123,7 +123,7 @@ void main() {
           name: 'flash_test_soc',
           cores: const ['rc1-n'],
           clockFrequency: 48000000,
-          oscFrequency: 48000000,
+          oscFrequencyOverride: 48000000,
           devices: [
             Device.parse('flash:0x20000000:16M'),
             // 4K = 1024 words on this 32-bit bus, the most HarborSram builds

@@ -11,7 +11,7 @@ RiverGenIpConfig _config({
   name: 'irq_wiring_soc',
   cores: [core],
   clockFrequency: 48000000,
-  oscFrequency: 48000000,
+  oscFrequencyOverride: 48000000,
   devices: [
     // 4K = 1024 words, the most HarborSram builds without a `target`.
     Device.parse('sram:0x80000000:4K'),

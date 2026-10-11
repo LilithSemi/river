@@ -313,7 +313,7 @@ void main() {
         name: 'dma_spi_soc',
         cores: const ['rc1-n'],
         clockFrequency: 48000000,
-        oscFrequency: 48000000,
+        oscFrequencyOverride: 48000000,
         devices: [
           // 4K = 1024 words on this 32-bit bus, the most HarborSram builds
           // without a `target`. These tests assert fabric wiring, not capacity.
@@ -341,7 +341,7 @@ void main() {
         name: 'pio_spi_soc',
         cores: const ['rc1-n'],
         clockFrequency: 48000000,
-        oscFrequency: 48000000,
+        oscFrequencyOverride: 48000000,
         devices: [
           // 4K = 1024 words on this 32-bit bus, the most HarborSram builds
           // without a `target`. These tests assert fabric wiring, not capacity.

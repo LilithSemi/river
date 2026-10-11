@@ -12,7 +12,7 @@ void main() {
       name: geared ? 'gear2_soc' : 'gear1_soc',
       cores: const ['rc1-s'],
       clockFrequency: 33333333,
-      oscFrequency: 100000000, // single-osc DDR3 MMCM path
+      oscFrequencyOverride: 100000000, // single-osc DDR3 MMCM path
       target: Target.parse('spartan7:xc7s50:csga324'),
       devices: [
         Device.parse('flash:0x20000000:16M:arty-s7'),
