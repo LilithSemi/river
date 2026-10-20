@@ -1246,9 +1246,35 @@ class RiverGenIpConfig {
     useErr: true,
   );
 
+  /// The bus fabric Harbor builds, from `--interconnect`. Register ports follow
+  /// the kind: Wishbone classic cycles, AXI4-Lite, or TL-UL.
+  ///
+  /// Every peripheral takes this kind, so all the slaves are native to one
+  /// fabric. The masters are not yet: `RiverCore` and the DFU subsystem build a
+  /// `WishboneInterface` directly, which is RTL rather than a parameter, so
+  /// only Wishbone completes a build today. The check names that rather than
+  /// letting the fabric report it at the first master.
+  HarborFabricKind get fabricKind {
+    final kind = switch (interconnect) {
+      'wishbone' => HarborFabricKind.wishbone,
+      'axi' => HarborFabricKind.axi4,
+      'tilelink' => HarborFabricKind.tilelink,
+      _ => throw ArgumentError('Unknown interconnect "$interconnect"'),
+    };
+    if (kind != HarborFabricKind.wishbone) {
+      throw ArgumentError(
+        'interconnect "$interconnect" needs a ${kind.name} master port on the '
+        'core; RiverCore drives Wishbone only',
+      );
+    }
+    return kind;
+  }
+
   /// Outstanding depth for a DMA memory master. Wishbone carries one transfer
-  /// at a time, so the fabric rejects anything deeper.
-  int get dmaOutstanding => 1;
+  /// at a time, so the fabric rejects anything deeper; AXI4 and TileLink
+  /// pipeline, which is where the ADMA gets its throughput back.
+  int get dmaOutstanding =>
+      fabricKind == HarborFabricKind.wishbone ? 1 : 4;
 
   /// The resolved Harbor board, when `--board` names one.
   HarborBoard? get board =>
@@ -1506,6 +1532,7 @@ class RiverGenIpConfig {
     final soc = HarborSoC(
       name: name,
       compatible: 'lilith,${name.replaceAll('_', '-')}',
+      fabricKind: fabricKind,
       acpiOemId: 'LILSMI',
       acpiOemTableId: 'RIVER',
       interruptContexts: interruptContexts,
@@ -1628,6 +1655,7 @@ class RiverGenIpConfig {
       final bootBin = await _buildBootProgram(primaryConfig);
       soc.addPeripheral(
         HarborMaskRom(
+          fabricKind: fabricKind,
           baseAddress: primaryConfig.resetVector,
           initialData: _padToPowerOfTwo(
             _bytesToWords(bootBin, busConfig.dataWidth ~/ 8),
@@ -1650,6 +1678,7 @@ class RiverGenIpConfig {
       final maskromBin = await _buildMaskrom(primaryConfig, busConfig);
       soc.addPeripheral(
         HarborMaskRom(
+          fabricKind: fabricKind,
           baseAddress: primaryConfig.resetVector,
           initialData: _padToPowerOfTwo(
             _bytesToWords(maskromBin, busConfig.dataWidth ~/ 8),
@@ -1673,6 +1702,7 @@ class RiverGenIpConfig {
         // slave. The clock/period values are ignored by the behavioral body.
         if (target is HarborSimTarget) {
           final ddr = HarborDdr3(
+            protocol: fabricKind,
             config: board.config,
             baseAddress: mem.address,
             clockHz: clockFrequency,
@@ -1732,6 +1762,7 @@ class RiverGenIpConfig {
             ddrCkHz: ddrClockFrequency ?? 96000000,
           );
           final ddr = HarborDdr3(
+            protocol: fabricKind,
             config: board.config,
             baseAddress: mem.address,
             clockHz: (tree.controllerClkMhz * 1.0e6).round(),
@@ -1843,6 +1874,7 @@ class RiverGenIpConfig {
         // DDR CK.
         final ctrlHz = tree.controllerMhz.round() * 1000000;
         final ddr = HarborDdr3(
+          protocol: fabricKind,
           config: board.config,
           baseAddress: mem.address,
           clockHz: ctrlHz,
@@ -1920,6 +1952,7 @@ class RiverGenIpConfig {
             (target.vendor == HarborFpgaVendor.openXc7 ||
                 target.vendor == HarborFpgaVendor.vivado);
         final flash = HarborSpiFlashController(
+          fabricKind: fabricKind,
           config: spiConfig,
           baseAddress: mem.address,
           busAddressWidth: busConfig.addressWidth,
@@ -1961,6 +1994,7 @@ class RiverGenIpConfig {
         // hand-maintained SoC top, not here. Genip exposes each device's pins
         // independently.
         final psram = HarborPsramController(
+          fabricKind: fabricKind,
           config: HarborPsramConfig(size: mem.size, mode: HarborPsramMode.quad),
           baseAddress: mem.address,
           busAddressWidth: busConfig.addressWidth,
@@ -1985,6 +2019,7 @@ class RiverGenIpConfig {
       } else {
         soc.addPeripheral(
           HarborSram(
+            protocol: fabricKind,
             baseAddress: mem.address,
             size: mem.size,
             dataWidth: busConfig.dataWidth,
@@ -2309,6 +2344,7 @@ class RiverGenIpConfig {
 
     // The control/status slave the maskrom polls.
     final status = RiverDfuStatus(
+      fabricKind: fabricKind,
       baseAddress: dfuStatusBase,
       busAddressWidth: busConfig.addressWidth,
       busDataWidth: busConfig.dataWidth,
@@ -2360,6 +2396,7 @@ class RiverGenIpConfig {
     HarborDeviceTarget? target,
   ) {
     final dfu = RiverDfuSubsystemSw(
+      fabricKind: fabricKind,
       baseAddress: dfuStatusBase,
       busAddressWidth: busConfig.addressWidth,
       busDataWidth: busConfig.dataWidth,
@@ -2444,6 +2481,7 @@ class RiverGenIpConfig {
     switch (dev.type) {
       case 'uart':
         return HarborUart(
+          fabricKind: fabricKind,
           baseAddress: dev.address,
           clockFrequency: clockFrequency,
           busAddressWidth: busConfig.addressWidth,
@@ -2451,6 +2489,7 @@ class RiverGenIpConfig {
         );
       case 'clint':
         return HarborClint(
+          fabricKind: fabricKind,
           baseAddress: dev.address,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
@@ -2462,6 +2501,7 @@ class RiverGenIpConfig {
         // safe upper bound. Priority/claim logic scales with source count, a real
         // LUT win on small SoCs.
         return HarborPlic(
+          fabricKind: fabricKind,
           baseAddress: dev.address,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
@@ -2475,6 +2515,7 @@ class RiverGenIpConfig {
         // Generic SPI master. Pads (spi_clk/spi_mosi/spi_miso/spi_cs_n) are
         // exposed and bound to a board connector via `iface=` (see [_ifacePins]).
         return HarborSpiController(
+          fabricKind: fabricKind,
           baseAddress: dev.address,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
@@ -2491,6 +2532,7 @@ class RiverGenIpConfig {
         // exposed as top-level ports below, so a board binds them with
         // `--pin name=<dev>@gpio_in:<pad>` style indexed pads.
         return HarborGpio(
+          fabricKind: fabricKind,
           baseAddress: dev.address,
           // Small default: each pin costs an output, a direction, an enable, a
           // status and an edge bit, so a wide default is real area for nothing.
@@ -2519,6 +2561,7 @@ class RiverGenIpConfig {
           // model can drive the response/data lines cleanly (inout pads are
           // fiddly to drive from a host model), matching the ROHD SD oracle.
           ownPads: target is! HarborSimTarget,
+          fabricKind: fabricKind,
           dmaOutstanding: dmaOutstanding,
           dmaAddressWidth: busConfig.addressWidth,
           dmaDataWidth: busConfig.dataWidth,
