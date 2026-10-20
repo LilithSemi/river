@@ -210,7 +210,6 @@ Future<_Dut> _buildSoC({
   final soc = HarborSoC(
     name: 'irq_test_soc',
     compatible: 'lilith,irq-test-soc',
-    busConfig: busConfig,
     interruptContexts: contexts,
     cpus: [HarborCpu(hartId: 0, isa: coreConfig.isa.implementsString)],
   );

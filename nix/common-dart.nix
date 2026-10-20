@@ -2,6 +2,6 @@ lib: {
   pubspecLock = lib.importJSON ../pubspec.lock.json;
 
   gitHashes = {
-    harbor = "sha256-5NkqKO3n/9qKD70u2a5nxU0jbRyf67SX21yuwC7blt8=";
+    harbor = "sha256-TZG/POUtj1OCf60kQqUnpvEhjqdFDd/5/MMAjNsuZY4=";
   };
 }

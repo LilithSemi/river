@@ -30,7 +30,7 @@ class RiverPhysicalL1 extends Module {
     final xlen = addr.width;
     final laneBits = (xlen ~/ 8 - 1).bitLength;
     for (final bytes in [
-      config.d.lineSize,
+      config.d!.lineSize,
       if (config.i != null) config.i!.lineSize,
     ]) {
       if (bytes < xlen ~/ 8 || bytes > 4096 || (bytes & (bytes - 1)) != 0) {
@@ -100,7 +100,7 @@ class RiverPhysicalL1 extends Module {
         ~walk &
         fetch;
     final selectD =
-        cacheableLine(config.d.lineSize, executable: false) & ~walk & ~fetch;
+        cacheableLine(config.d!.lineSize, executable: false) & ~walk & ~fetch;
     final bypass = ~selectI & ~selectD;
 
     final done = Logic(name: 'memoryDone');
@@ -135,7 +135,7 @@ class RiverPhysicalL1 extends Module {
       icache.input('mem_rdata').srcConnection! <= result;
     }
     final dcache = HarborL1DCache(
-      config: config.d,
+      config: config.d!,
       xlen: xlen,
       reqAddrBits: xlen,
       cacheableBase: 0,

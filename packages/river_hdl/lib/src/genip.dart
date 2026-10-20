@@ -1246,6 +1246,10 @@ class RiverGenIpConfig {
     useErr: true,
   );
 
+  /// Outstanding depth for a DMA memory master. Wishbone carries one transfer
+  /// at a time, so the fabric rejects anything deeper.
+  int get dmaOutstanding => 1;
+
   /// The resolved Harbor board, when `--board` names one.
   HarborBoard? get board =>
       boardName != null ? HarborBoard.get(boardName!) : null;
@@ -1502,7 +1506,6 @@ class RiverGenIpConfig {
     final soc = HarborSoC(
       name: name,
       compatible: 'lilith,${name.replaceAll('_', '-')}',
-      busConfig: busConfig,
       acpiOemId: 'LILSMI',
       acpiOemTableId: 'RIVER',
       interruptContexts: interruptContexts,
@@ -1626,7 +1629,10 @@ class RiverGenIpConfig {
       soc.addPeripheral(
         HarborMaskRom(
           baseAddress: primaryConfig.resetVector,
-          initialData: _bytesToWords(bootBin, busConfig.dataWidth ~/ 8),
+          initialData: _padToPowerOfTwo(
+            _bytesToWords(bootBin, busConfig.dataWidth ~/ 8),
+            busConfig.dataWidth ~/ 8,
+          ),
           dataWidth: busConfig.dataWidth,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
@@ -1645,7 +1651,10 @@ class RiverGenIpConfig {
       soc.addPeripheral(
         HarborMaskRom(
           baseAddress: primaryConfig.resetVector,
-          initialData: _bytesToWords(maskromBin, busConfig.dataWidth ~/ 8),
+          initialData: _padToPowerOfTwo(
+            _bytesToWords(maskromBin, busConfig.dataWidth ~/ 8),
+            busConfig.dataWidth ~/ 8,
+          ),
           dataWidth: busConfig.dataWidth,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
@@ -1847,22 +1856,6 @@ class RiverGenIpConfig {
           // (controllerClkPeriodPs = CK*4*gear -> the AC-timing counts are
           // CK/8-correct) and interpose the fabric gearbox.
           controllerGearRatio: ddrGear,
-          // Strictly-ordered (non-posted) DRAM writes: a write is not ACKed to
-          // the fabric until it has crossed and committed. This buys two things,
-          // both HW-proven necessary on the timing-marginal Arty S7 DDR:
-          //   1. Cross-master coherency: a later read by any master (CPU or SDIO
-          //      ADMA) sees the write. Posted writes ACK early and leave a stale
-          //      hole that QEMU + the functional ROHD sim never reproduce.
-          //   2. ADMA pacing: each ADMA card-read block-write waits for its
-          //      commit, which throttles the sustained read to a rate the
-          //      marginal DDR survives. Posted writes remove that pacing. The
-          //      unthrottled ADMA over-stresses the DDR and the board resets
-          //      mid-read (HW-verified 2026-08-15: a posted build resets at the
-          //      boot-file read where this non-posted build loads the kernel).
-          // Costs CPU write throughput (~220-cycle commit per store), which the
-          // real fix (a fast, non-marginal DDR route, or per-master posted so
-          // only the ADMA is paced) would recover. See project #68.
-          postedWrites: false,
           // train=runtime exposes the knob-ABI window for the FSBL engine.
           runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
           name: '${mem.type}_$i',
@@ -2039,12 +2032,17 @@ class RiverGenIpConfig {
     // through the core's decode region (routing-congestion relief). The DMA is
     // throughput-bound, so the two extra latency cycles do not matter.
     for (final dev in mmioDevices) {
-      if ((dev.type == 'spi' || dev.type == 'sdio') &&
-          (dev.params?.dma ?? false)) {
+      final sdio = dev.type == 'sdio';
+      if (sdio || (dev.type == 'spi' && (dev.params?.dma ?? false))) {
+        final master = peripheralsByName[dev.name]!;
         soc.addMaster(
-          peripheralsByName[dev.name]!,
+          master,
           busInterfaceName: 'dma',
           pipeline: true,
+          // The SDIO ADMA is a memory master. Its outstanding depth comes from
+          // the controller so the fabric sizes the leg to match.
+          memory: sdio ? true : null,
+          outstanding: sdio ? dmaOutstanding : null,
           // Put the DMA master on its OWN fabric channel, physically off the
           // primary arbiter. Its wide 64-bit leg was the delta xc7s50 routing
           // hotspot (it smeared the crossbar's arbitration mux through the
@@ -2521,21 +2519,11 @@ class RiverGenIpConfig {
           // model can drive the response/data lines cleanly (inout pads are
           // fiddly to drive from a host model), matching the ROHD SD oracle.
           ownPads: target is! HarborSimTarget,
-          fabricDma: dev.params?.dma ?? false,
+          dmaOutstanding: dmaOutstanding,
           dmaAddressWidth: busConfig.addressWidth,
           dmaDataWidth: busConfig.dataWidth,
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
-          // On a posted-write DDR fabric an ADMA card-read's block writes are
-          // ACKed before they commit to DRAM, so raising data-done when the RX
-          // FIFO drains lets the CPU read the buffer while the last writes are
-          // still in flight (stale data -> the Arty S7 sustained-read reset).
-          // Fence the writes with a read-back so data-done means durable. Only
-          // when this SoC has both the ADMA and a real DDR memory; SRAM-only
-          // SoCs keep the byte-identical straight-through completion.
-          readBackBarrier:
-              (dev.params?.dma ?? false) &&
-              memories.any((m) => m.ddrBoard != null),
           // Drop CYC after EVERY DDR write beat (not every 16) on a DDR SoC. The
           // ADMA otherwise holds CYC across a burst; the DRAM CDC bridge wedges
           // on back-to-back held-CYC transactions on silicon (it needs CYC to
@@ -2960,6 +2948,21 @@ class RiverGenIpConfig {
     }
     await program.build();
     return Uint8List.fromList(program.generateBinary());
+  }
+
+  /// Pads [words] so the ROM window is a power of two. The fabric rejects a
+  /// slave under 4 KB whose size is not a power of two aligned to itself, and a
+  /// boot image is whatever size the assembler produced. The padding reads as
+  /// zero and sits past the program.
+  static List<int> _padToPowerOfTwo(List<int> words, int bytesPerWord) {
+    if (words.isEmpty) return words;
+    final bytes = words.length * bytesPerWord;
+    var span = bytesPerWord;
+    while (span < bytes) {
+      span *= 2;
+    }
+    final target = span ~/ bytesPerWord;
+    return [...words, for (var i = words.length; i < target; i++) 0];
   }
 
   static List<int> _bytesToWords(Uint8List bytes, int bytesPerWord) {

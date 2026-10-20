@@ -132,10 +132,14 @@ class RiverDfuStatus extends BridgeModule with HarborDeviceTreeNodeProvider {
 
   late final BusSlavePort bus;
 
+  /// The fabric this slave port is native to.
+  final HarborFabricKind fabricKind;
+
   RiverDfuStatus({
     required this.baseAddress,
     this.busAddressWidth = 32,
     this.busDataWidth = 32,
+    this.fabricKind = HarborFabricKind.wishbone,
     String? name,
   }) : super('RiverDfuStatus', name: name ?? 'dfu_status') {
     createPort('clk', PortDirection.input);
@@ -151,9 +155,11 @@ class RiverDfuStatus extends BridgeModule with HarborDeviceTreeNodeProvider {
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: BusProtocol.wishbone,
+      kind: fabricKind,
       addressWidth: busAddressWidth,
       dataWidth: busDataWidth,
+      clk: input('clk'),
+      reset: input('reset'),
     );
 
     final clk = input('clk');
@@ -790,10 +796,14 @@ class RiverDfuSubsystemSw extends BridgeModule
   final int busAddressWidth;
   final int busDataWidth;
 
+  /// The fabric this subsystem's slave port is native to.
+  final HarborFabricKind fabricKind;
+
   RiverDfuSubsystemSw({
     required this.baseAddress,
     this.busAddressWidth = 32,
     this.busDataWidth = 32,
+    this.fabricKind = HarborFabricKind.wishbone,
     String? name,
   }) : super('RiverDfuSubsystemSw', name: name ?? 'usb_dfu_sw') {
     // Bus-domain clock/reset (12 MHz). Auto-wired from the bus domain by
@@ -817,9 +827,11 @@ class RiverDfuSubsystemSw extends BridgeModule
     final bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: BusProtocol.wishbone,
+      kind: fabricKind,
       addressWidth: busAddressWidth,
       dataWidth: busDataWidth,
+      clk: input('clk'),
+      reset: input('reset'),
     );
 
     // ch9 core + DFU class device (48 MHz USB domain). No flash sink is
