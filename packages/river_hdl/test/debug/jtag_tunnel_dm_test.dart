@@ -171,7 +171,7 @@ void main() {
       sbaAck = Logic(name: 'sba_ack');
       mem = {};
 
-      tunnel = JtagBscanTunnel(maxScanBits: 64);
+      tunnel = JtagBscanTunnel();
       tunnel.input('clk').srcConnection! <= clk;
       tunnel.input('reset').srcConnection! <= reset;
       tunnel.input('jtck').srcConnection! <= jtck;

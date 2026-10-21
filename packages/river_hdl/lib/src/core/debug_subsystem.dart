@@ -81,7 +81,7 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
     // vendor's config-JTAG user-register primitive below.
     JtagBscanTunnel? tunnel;
     if (!rawJtag) {
-      tunnel = JtagBscanTunnel(maxScanBits: xlen);
+      tunnel = JtagBscanTunnel();
       tunnel.input('clk').srcConnection! <= input('clk');
       tunnel.input('reset').srcConnection! <= input('reset');
     }
