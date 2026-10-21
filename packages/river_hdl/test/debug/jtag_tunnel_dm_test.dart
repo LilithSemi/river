@@ -259,6 +259,11 @@ void main() {
       await host.tapReset();
       await host.innerIr(0x11); // inner IR <- DMI
 
+      // The DM drops a write to any other register while dmactive is 0, so
+      // bring it out of reset first.
+      await host.dmiWrite(0x10, 1); // dmcontrol.dmactive
+      expect((await host.dmiRead(0x10)) & 1, 1);
+
       await host.dmiWrite(0x39, 0x40); // sbaddress0 = 0x40
       await host.dmiWrite(0x3c, 0xCAFEBABE); // sbdata0 -> bus write
       await host.idleFrames(4); // let the bus access drain
