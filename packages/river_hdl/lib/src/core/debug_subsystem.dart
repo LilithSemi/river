@@ -3,7 +3,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:river/river.dart';
 
 import 'debug.dart';
-import 'sba_wishbone.dart';
+import 'sba_waist.dart';
 
 /// SoC-level JTAG debug subsystem. On ECP5 it reaches the debugger over the FPGA
 /// config JTAG (dirtyJtag) via the `JTAGG` ER1 user register + a SiFive bscan
@@ -11,12 +11,12 @@ import 'sba_wishbone.dart';
 ///   Ecp5Jtagg  (config-JTAG user register taps)
 ///     -> JtagBscanTunnel (frame decode -> inner TAP drive)
 ///       -> RiverDebugModule (TAP + DTM + DM + SBA, sim-proven)
-///         -> SbaWishboneAdapter (SBA -> Wishbone master `bus`)
+///         -> SbaWaistAdapter (SBA -> master `bus`)
 ///
-/// Exposes a Wishbone master `bus` (second fabric master for memory access) and
-/// the core-facing debug control ports; JTAG pins are internal to `JTAGG`. genip
-/// wires `bus` via `soc.addMaster` and the control ports to a
-/// `RiverCore(withDebug: true)`.
+/// Exposes a master `bus` of the chosen fabric kind (second fabric master for
+/// memory access) and the core-facing debug control ports. JTAG pins stay
+/// internal to `JTAGG`. genip wires `bus` through `soc.addMaster` and the
+/// control ports to a `RiverCore(withDebug: true)`.
 ///
 /// OpenOCD reaches it with `riscv use_bscan_tunnel 6 1` over the ECP5 TAP.
 /// HW-validation pending; the tunnel framing is the piece to confirm live.
@@ -27,6 +27,7 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
   RiverDebugSubsystem(
     WishboneConfig config, {
     required int xlen,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     this.idcode = 0x10000001,
     // FPGA target: selects the config-JTAG primitive. Xilinx (openXC7/vivado)
     // taps the config TAP with BSCANE2 on USER1; everything else uses the ECP5
@@ -65,13 +66,16 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
     createPort('reg_addr', PortDirection.output, width: 16);
     createPort('reg_wdata', PortDirection.output, width: xlen);
 
-    // Wishbone master (provider): drives the fabric, reads ack/datMiso back.
-    final busRef = addInterface(
-      WishboneInterface(config),
+    final bus = BusMasterPort.create(
+      module: this,
       name: 'bus',
-      role: PairRole.provider,
+      kind: fabricKind,
+      addressWidth: config.addressWidth,
+      dataWidth: config.dataWidth,
+      clk: input('clk'),
+      reset: input('reset'),
+      useErr: config.useErr,
     );
-    final bus = busRef.internalInterface as WishboneInterface;
 
     // Tunnel: framed config-JTAG DR scan -> inner TAP signals. Fed by the
     // vendor's config-JTAG user-register primitive below.
@@ -152,8 +156,7 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
     output('reg_addr') <= dm.regAddr;
     output('reg_wdata') <= dm.regWdata;
 
-    // SBA -> Wishbone.
-    final adapter = SbaWishboneAdapter(
+    final adapter = SbaWaistAdapter(
       dataWidth: config.dataWidth,
       addressWidth: config.addressWidth,
       xlen: xlen,
@@ -163,18 +166,17 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
     adapter.input('sba_addr').srcConnection! <= dm.sbaAddr;
     adapter.input('sba_wdata').srcConnection! <= dm.sbaWdata;
     adapter.input('sba_size').srcConnection! <= dm.sbaSize;
-    adapter.input('wb_ack').srcConnection! <= bus.ack;
-    adapter.input('wb_dat_miso').srcConnection! <= bus.datMiso;
+    adapter.input('ack').srcConnection! <= bus.ack;
+    adapter.input('rdata').srcConnection! <= bus.dataIn;
 
     sbaRdata <= adapter.output('sba_rdata');
     sbaAck <= adapter.output('sba_ack');
 
-    bus.cyc <= adapter.output('wb_cyc');
-    bus.stb <= adapter.output('wb_stb');
-    bus.we <= adapter.output('wb_we');
-    bus.adr <= adapter.output('wb_adr');
-    bus.datMosi <= adapter.output('wb_dat_mosi');
-    bus.sel <= adapter.output('wb_sel');
+    bus.stb <= adapter.output('stb');
+    bus.we <= adapter.output('we');
+    bus.addr <= adapter.output('addr');
+    bus.dataOut <= adapter.output('wdata');
+    bus.sel <= adapter.output('sel');
   }
 
   @override

@@ -15,8 +15,9 @@ import 'usb_dfu_subsystem.dart';
 /// How the USB DFU subsystem is integrated.
 enum UsbDfuMode {
   /// Hardware RAM-sink integration: a second bus master ([UsbDfuRamSink]) DMAs
-  /// the downloaded firmware into an on-chip SRAM through a [HarborCdcFifo] and
-  /// a [RiverWishboneArbiter]. The maskrom polls image_ready and jumps. Heavy.
+  /// the downloaded firmware into an on-chip SRAM through a [HarborCdcFifo].
+  /// The SoC fabric arbitrates it with the core. The maskrom polls image_ready
+  /// and then jumps. This costs the most area of the two modes.
   hardware,
 
   /// Lean software/CAR integration: only the PHY + [UsbEp0Engine] + a small
@@ -1248,27 +1249,12 @@ class RiverGenIpConfig {
 
   /// The bus fabric Harbor builds, from `--interconnect`. Register ports follow
   /// the kind: Wishbone classic cycles, AXI4-Lite, or TL-UL.
-  ///
-  /// Every peripheral takes this kind, so all the slaves are native to one
-  /// fabric. The masters are not yet: `RiverCore` and the DFU subsystem build a
-  /// `WishboneInterface` directly, which is RTL rather than a parameter, so
-  /// only Wishbone completes a build today. The check names that rather than
-  /// letting the fabric report it at the first master.
-  HarborFabricKind get fabricKind {
-    final kind = switch (interconnect) {
-      'wishbone' => HarborFabricKind.wishbone,
-      'axi' => HarborFabricKind.axi4,
-      'tilelink' => HarborFabricKind.tilelink,
-      _ => throw ArgumentError('Unknown interconnect "$interconnect"'),
-    };
-    if (kind != HarborFabricKind.wishbone) {
-      throw ArgumentError(
-        'interconnect "$interconnect" needs a ${kind.name} master port on the '
-        'core; RiverCore drives Wishbone only',
-      );
-    }
-    return kind;
-  }
+  HarborFabricKind get fabricKind => switch (interconnect) {
+    'wishbone' => HarborFabricKind.wishbone,
+    'axi' => HarborFabricKind.axi4,
+    'tilelink' => HarborFabricKind.tilelink,
+    _ => throw ArgumentError('Unknown interconnect "$interconnect"'),
+  };
 
   /// Outstanding depth for a DMA memory master. Wishbone carries one transfer
   /// at a time, so the fabric rejects anything deeper; AXI4 and TileLink
@@ -1641,6 +1627,7 @@ class RiverGenIpConfig {
         timerPending: timerNet,
         swPending: swNet,
         timeIn: timeNet,
+        fabricKind: fabricKind,
       );
       soc.addMaster(core, busInterfaceName: 'dataBus');
       debugCore ??= core;
@@ -2254,17 +2241,9 @@ class RiverGenIpConfig {
     }
 
     if (usbDfu && usbDfuMode == UsbDfuMode.hardware) {
-      if (enableDebug) {
-        // The hardware DFU path uses a fixed 2-master arbiter (core + DFU
-        // RAM-sink). The debug JTAG SBA would be a third master it cannot route.
-        // Make it an explicit error rather than silently dropping JTAG.
-        throw ArgumentError(
-          'debug-jtag is not supported with hardware usb-dfu (the 2-master '
-          'arbitrated fabric has no slot for the debug SBA master); use '
-          'usb-dfu:...:mode=software or drop debug-jtag',
-        );
-      }
       _integrateUsbDfu(soc, busConfig, target);
+      if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
+      finishFabric();
     } else if (usbDfu && usbDfuMode == UsbDfuMode.software) {
       _integrateUsbDfuSoftware(soc, busConfig, target);
       if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
@@ -2287,7 +2266,12 @@ class RiverGenIpConfig {
     HarborDeviceTarget? target,
   ) {
     final xlen = busConfig.dataWidth;
-    final dbg = RiverDebugSubsystem(busConfig, xlen: xlen, target: target);
+    final dbg = RiverDebugSubsystem(
+      busConfig,
+      xlen: xlen,
+      fabricKind: fabricKind,
+      target: target,
+    );
     soc.addMaster(dbg, busInterfaceName: 'bus');
 
     // Under Verilator the TAP is not tunnelled through a config-JTAG
@@ -2326,9 +2310,8 @@ class RiverGenIpConfig {
 
   /// Integrates the USB DFU subsystem into [soc]: instantiates the subsystem
   /// (engine + RAM sink + line tristate, dual clock domain) as a SECOND bus
-  /// master, the [RiverDfuStatus] control/status slave as a peripheral, exposes
-  /// the USB + button pads, and builds a two-master Wishbone fabric (core +
-  /// DFU sink) through a [RiverWishboneArbiter] into a single decoder.
+  /// master, the [RiverDfuStatus] control/status slave as a peripheral, and the
+  /// USB + button pads. The caller builds the fabric.
   void _integrateUsbDfu(
     HarborSoC soc,
     WishboneConfig busConfig,
@@ -2354,6 +2337,7 @@ class RiverGenIpConfig {
     // The DFU subsystem (engine + sink + pads). Its bus master runs on `sys`
     // (auto-wired via addMaster). The 48 MHz USB side is wired manually.
     final dfu = RiverDfuSubsystem(
+      fabricKind: fabricKind,
       loadBase: ram.address,
       regionBytes: ram.size,
       busAddressWidth: busConfig.addressWidth,
@@ -2379,10 +2363,6 @@ class RiverGenIpConfig {
     soc.exposePin(dfu, 'usb_dp', externalName: 'usb_dp');
     soc.exposePin(dfu, 'usb_dm', externalName: 'usb_dm');
     soc.exposePin(dfu, 'usb_pullup', externalName: 'usb_pullup');
-
-    // Two-master fabric: arbitrate [core, dfu] onto one decoder. buildFabric's
-    // per-master decoders would multiply-drive the slaves, so build it here.
-    _buildArbitratedWishboneFabric(soc, busConfig);
   }
 
   /// Integrates the LEAN, software-driven USB DFU subsystem
@@ -2416,59 +2396,6 @@ class RiverGenIpConfig {
     soc.exposePin(dfu, 'usb_dp', externalName: 'usb_dp');
     soc.exposePin(dfu, 'usb_dm', externalName: 'usb_dm');
     soc.exposePin(dfu, 'usb_pullup', externalName: 'usb_pullup');
-  }
-
-  /// Builds a Wishbone fabric for exactly two masters (the River core and the
-  /// DFU RAM-sink) sharing the peripheral set, by merging them through a
-  /// [RiverWishboneArbiter] into a single [WishboneDecoder].
-  void _buildArbitratedWishboneFabric(HarborSoC soc, WishboneConfig busConfig) {
-    final errors = soc.validate();
-    if (errors.isNotEmpty) {
-      throw StateError(
-        'Validation errors in ${soc.name}:\n${errors.join("\n")}',
-      );
-    }
-
-    final masters = soc.masters;
-    if (masters.length != 2) {
-      throw StateError(
-        'USB DFU fabric expects exactly 2 masters (core + dfu), got '
-        '${masters.length}',
-      );
-    }
-    final core = masters[0];
-    final dfu = masters[1];
-
-    final peripherals = soc.peripherals;
-    final mappings = <HarborAddressMapping>[];
-    for (var i = 0; i < peripherals.length; i++) {
-      final p = peripherals[i] as HarborDeviceTreeNodeProvider;
-      mappings.add(HarborAddressMapping(range: p.dtNode.reg, slaveIndex: i));
-    }
-
-    // Arbiter: merge the two masters' provider interfaces into one slave.
-    final (clk, reset) = soc.defaultClock;
-    final arbiter = RiverWishboneArbiter(busConfig);
-    soc.addSubModule(arbiter);
-    arbiter.input('clk').srcConnection! <= clk;
-    arbiter.input('reset').srcConnection! <= reset;
-    connectInterfaces(core.interface('dataBus'), arbiter.interface('m0'));
-    connectInterfaces(dfu.interface('bus'), arbiter.interface('m1'));
-
-    // Decoder: route the merged master to every peripheral slave.
-    final decoder = WishboneDecoder(busConfig, mappings);
-    soc.addSubModule(decoder);
-    // The decoder registers its bus-error and timeout state, so it needs the
-    // clock. Leaving these unconnected compiles but never clocks that logic.
-    decoder.input('clk').srcConnection! <= clk;
-    decoder.input('reset').srcConnection! <= reset;
-    connectInterfaces(arbiter.interface('slave'), decoder.interface('master'));
-    for (var i = 0; i < peripherals.length; i++) {
-      connectInterfaces(
-        decoder.interface('slave_$i'),
-        peripherals[i].interface('bus'),
-      );
-    }
   }
 
   BridgeModule? _createPeripheral(

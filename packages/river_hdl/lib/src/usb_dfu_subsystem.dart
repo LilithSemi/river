@@ -5,111 +5,6 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 // BusSlavePort, HarborDeviceTreeNode(Provider), BusAddressRange, etc.).
 import 'package:river/river.dart';
 
-/// [BridgeModule] wrapper that merges the two SoC masters (River core + DFU
-/// RAM-sink writeback master) onto a single decoder master. Exposes two CONSUMER
-/// master ports (`m0`, `m1`) the upstream masters connect into and one PROVIDER
-/// `slave` port into the decoder. Single bus clock domain (12 MHz `bus_clk` /
-/// `bus_reset`); the USB crossing already happened in [UsbDfuRamSink]'s CDC FIFO.
-class RiverWishboneArbiter extends BridgeModule {
-  RiverWishboneArbiter(WishboneConfig config, {String? name})
-    : super('RiverWishboneArbiter', name: name ?? 'wb_arbiter2') {
-    createPort('clk', PortDirection.input);
-    createPort('reset', PortDirection.input);
-
-    // Two upstream masters: this module is the CONSUMER (it receives the
-    // master's CYC/ADR/... and drives ACK/DAT_MISO back), so the upstream
-    // PROVIDER interfaces connect down into these.
-    final m0Ref = addInterface(
-      WishboneInterface(config),
-      name: 'm0',
-      role: PairRole.consumer,
-    );
-    final m1Ref = addInterface(
-      WishboneInterface(config),
-      name: 'm1',
-      role: PairRole.consumer,
-    );
-    // Downstream merged slave: this module is the PROVIDER, driving the decoder.
-    final slaveRef = addInterface(
-      WishboneInterface(config),
-      name: 'slave',
-      role: PairRole.provider,
-    );
-
-    final m0 = m0Ref.internalInterface as WishboneInterface;
-    final m1 = m1Ref.internalInterface as WishboneInterface;
-    final s = slaveRef.internalInterface as WishboneInterface;
-
-    // Arbitration is inline (not via the raw WishboneArbiter Module): the slave
-    // response signals (ACK/DAT_MISO) driven in by the parent decoder must be
-    // consumed within this module's boundary; nesting the raw arbiter would tap
-    // them across the module edge, which ROHD forbids.
-    //
-    // Grant policy: registered CYC-held round-robin. The grant only changes while
-    // no transfer is in flight, so a burst is never torn mid-transaction.
-    final clk = input('clk');
-    final reset = input('reset');
-
-    // grantM1: 0 -> master 0 (core) is granted, 1 -> master 1 (DFU sink).
-    final grantM1 = Logic(name: 'grant_m1');
-    // last: who was served last, for round-robin fairness.
-    final last = Logic(name: 'last_grant');
-
-    final m0Req = m0.cyc;
-    final m1Req = m1.cyc;
-    final grantedCyc = mux(grantM1, m1Req, m0Req); // current grantee's CYC
-    final busIdle = ~grantedCyc;
-
-    Sequential(clk, [
-      If(
-        reset,
-        then: [grantM1 < Const(0), last < Const(0)],
-        orElse: [
-          // Re-arbitrate only when the bus is idle (no granted transfer running).
-          If(
-            busIdle,
-            then: [
-              // Round-robin: prefer the master that was NOT served last.
-              If(
-                last & m0Req,
-                then: [grantM1 < Const(0), last < Const(0)],
-                orElse: [
-                  If(
-                    ~last & m1Req,
-                    then: [grantM1 < Const(1), last < Const(1)],
-                    orElse: [
-                      // Otherwise keep whichever single master is requesting.
-                      If(m0Req, then: [grantM1 < Const(0), last < Const(0)]),
-                      If(
-                        m1Req & ~m0Req,
-                        then: [grantM1 < Const(1), last < Const(1)],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ],
-      ),
-    ]);
-
-    // Forward the granted master to the slave.
-    s.cyc <= mux(grantM1, m1.cyc, m0.cyc);
-    s.stb <= mux(grantM1, m1.stb, m0.stb);
-    s.we <= mux(grantM1, m1.we, m0.we);
-    s.adr <= mux(grantM1, m1.adr, m0.adr);
-    s.datMosi <= mux(grantM1, m1.datMosi, m0.datMosi);
-    s.sel <= mux(grantM1, m1.sel, m0.sel);
-
-    // Route the slave response back: ACK gated per master, DAT_MISO broadcast.
-    m0.ack <= s.ack & ~grantM1;
-    m1.ack <= s.ack & grantM1;
-    m0.datMiso <= s.datMiso;
-    m1.datMiso <= s.datMiso;
-  }
-}
-
 /// Small Wishbone SLAVE status/control block the maskrom polls to drive a USB
 /// DFU download into RAM. Single-cycle registered ACK, bus (12 MHz) domain.
 ///
@@ -264,8 +159,10 @@ class RiverDfuSubsystem extends BridgeModule {
   final int regionBytes;
   final int busAddressWidth;
   final int busDataWidth;
+  final HarborFabricKind fabricKind;
 
   RiverDfuSubsystem({
+    this.fabricKind = HarborFabricKind.wishbone,
     this.loadBase = 0x80000000,
     required this.regionBytes,
     this.busAddressWidth = 32,
@@ -315,6 +212,7 @@ class RiverDfuSubsystem extends BridgeModule {
 
     // RAM writeback sink (dual domain, Wishbone master).
     final ramSink = UsbDfuRamSink(
+      fabricKind: fabricKind,
       loadBase: loadBase,
       regionBytes: regionBytes,
       busAddressWidth: busAddressWidth,
@@ -764,7 +662,7 @@ class RiverDfuSwSink extends BridgeModule {
 /// The lean, software-driven USB DFU subsystem (CAR target): the cheap
 /// alternative to [RiverDfuSubsystem] for the LFE5U-25F. Drops the whole
 /// hardware RAM-sink tier (no [UsbDfuRamSink], no [HarborCdcFifo], no
-/// [RiverWishboneArbiter], no second bus master). Keeps the ch9 core + DFU
+/// arbitration, no second bus master). Keeps the ch9 core + DFU
 /// device and a small register file fed by [RiverDfuSwSink].
 ///
 /// There is no maskrom boot path for this mode: software running later on

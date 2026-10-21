@@ -1,34 +1,35 @@
 import 'package:rohd/rohd.dart';
 
 /// Adapts the debug module's System Bus Access (SBA) single-outstanding req/ack
-/// port to a Wishbone classic master cycle, so a debugger can read/write SoC
-/// memory over JTAG through the same fabric the core uses.
+/// port to the register waist of a bus master port, so a debugger can
+/// read/write SoC memory over JTAG through the same fabric the core uses.
 ///
 /// SBA side (from [RiverDebugModule]): on [sbaReq] the DM holds [sbaWe],
-/// [sbaAddr] (byte address), [sbaWdata] (right-justified) and [sbaSize] (log2 of
-/// access byte count: 0=byte .. 3=8 bytes) stable until [sbaAck]; [sbaRdata]
-/// presents read data right-justified on that ack.
+/// [sbaAddr] (byte address), [sbaWdata] (right-justified) and [sbaSize] (log2
+/// of access byte count: 0=byte up to 3=8 bytes) stable until [sbaAck].
+/// [sbaRdata] presents read data right-justified on that ack.
 ///
-/// Wishbone side: drives cyc=stb=req, we, byte address, byte-lane-shifted write
-/// data and `sel` byte-enables; on the slave ACK returns read data shifted back
-/// to lane 0. Mirrors the core's load/store lane convention (a sub-word access
-/// uses an aligned beat with `sel`, addressed bytes ride their lane).
-class SbaWishboneAdapter extends Module {
-  /// Wishbone data width in bits.
+/// Waist side: drives stb=req, we, byte address, byte-lane-shifted write data
+/// and `sel` byte-enables. On the waist ack it returns read data shifted back
+/// to lane 0. This mirrors the core's load/store lane convention, where a
+/// sub-word access uses an aligned beat with `sel` and the addressed bytes ride
+/// their own lane.
+class SbaWaistAdapter extends Module {
+  /// Bus data width in bits.
   final int dataWidth;
 
-  /// Wishbone address width in bits.
+  /// Bus address width in bits.
   final int addressWidth;
 
   /// SBA data width in bits (the core XLEN).
   final int xlen;
 
-  SbaWishboneAdapter({
+  SbaWaistAdapter({
     required this.dataWidth,
     required this.addressWidth,
     required this.xlen,
-    super.name = 'sba_wb',
-  }) : super(definitionName: 'SbaWishboneAdapter') {
+    super.name = 'sba_waist',
+  }) : super(definitionName: 'SbaWaistAdapter') {
     final selWidth = dataWidth ~/ 8;
     final selBits = (selWidth - 1).bitLength; // byte-offset bits within a beat
 
@@ -38,21 +39,20 @@ class SbaWishboneAdapter extends Module {
     final sbaAddr = addInput('sba_addr', Logic(width: xlen), width: xlen);
     final sbaWdata = addInput('sba_wdata', Logic(width: xlen), width: xlen);
     final sbaSize = addInput('sba_size', Logic(width: 3), width: 3);
-    final wbAck = addInput('wb_ack', Logic());
-    final wbDatMiso = addInput(
-      'wb_dat_miso',
+    final busAck = addInput('ack', Logic());
+    final busRdata = addInput(
+      'rdata',
       Logic(width: dataWidth),
       width: dataWidth,
     );
 
     final sbaRdata = addOutput('sba_rdata', width: xlen);
     final sbaAck = addOutput('sba_ack');
-    final wbCyc = addOutput('wb_cyc');
-    final wbStb = addOutput('wb_stb');
-    final wbWe = addOutput('wb_we');
-    final wbAdr = addOutput('wb_adr', width: addressWidth);
-    final wbDatMosi = addOutput('wb_dat_mosi', width: dataWidth);
-    final wbSel = addOutput('wb_sel', width: selWidth);
+    final busStb = addOutput('stb');
+    final busWe = addOutput('we');
+    final busAddr = addOutput('addr', width: addressWidth);
+    final busWdata = addOutput('wdata', width: dataWidth);
+    final busSel = addOutput('sel', width: selWidth);
 
     // Byte offset of the access within a bus beat, and the matching bit shift.
     final byteOff = selBits == 0
@@ -78,19 +78,17 @@ class SbaWishboneAdapter extends Module {
           ),
         );
 
-    wbCyc <= sbaReq;
-    wbStb <= sbaReq;
-    wbWe <= sbaWe;
-    // Beat-align the bus address: the data rides its byte lane (shifted by
-    // byteOff below) with `sel`, so the address must point at the aligned beat,
-    // NOT the raw byte offset. The core's dcache/MMU drive the bus the same way
-    // (line-aligned addr + sel); an unaligned addr here makes the DDR downsizer
-    // route a high-lane (4-mod-8) access to the next beat, so SBA reads/writes of
-    // upper-32-bit halves land on the wrong word.
+    busStb <= sbaReq;
+    busWe <= sbaWe;
+    // Beat-align the bus address. The data rides its byte lane with `sel`, so
+    // the address must point at the aligned beat, not the raw byte offset. The
+    // core's dcache and MMU drive the bus the same way. An unaligned address
+    // makes the DDR downsizer send a 4-mod-8 access to the next beat, which
+    // puts SBA reads and writes of upper halves on the wrong word.
     final alignedAddr = selBits == 0
         ? sbaAddr
         : [sbaAddr.getRange(selBits, xlen), Const(0, width: selBits)].swizzle();
-    wbAdr <=
+    busAddr <=
         (xlen >= addressWidth
             ? alignedAddr.getRange(0, addressWidth)
             : alignedAddr.zeroExtend(addressWidth));
@@ -100,13 +98,13 @@ class SbaWishboneAdapter extends Module {
     final wdataFull = xlen >= dataWidth
         ? sbaWdata.getRange(0, dataWidth)
         : sbaWdata.zeroExtend(dataWidth);
-    wbDatMosi <= (wdataFull << bitShift).named('wb_wdata_shifted');
-    wbSel <= (ones << byteOff).getRange(0, selWidth);
+    busWdata <= (wdataFull << bitShift).named('bus_wdata_shifted');
+    busSel <= (ones << byteOff).getRange(0, selWidth);
 
-    sbaAck <= wbAck;
+    sbaAck <= busAck;
     // Shift read data down from its lane to lane 0 (right-justified). Logical
     // shift (`>>>`): ROHD `>>` is arithmetic and would sign-extend.
-    final rdataShifted = (wbDatMiso >>> bitShift).named('sba_rdata_shifted');
+    final rdataShifted = (busRdata >>> bitShift).named('sba_rdata_shifted');
     sbaRdata <=
         (dataWidth >= xlen
             ? rdataShifted.getRange(0, xlen)

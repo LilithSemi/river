@@ -5,7 +5,7 @@ export 'src/data_port.dart';
 export 'src/core/csr.dart';
 export 'src/core/debug.dart';
 export 'src/core/debug_subsystem.dart';
-export 'src/core/sba_wishbone.dart';
+export 'src/core/sba_waist.dart';
 export 'src/core/debug_pump.dart';
 export 'src/core/decoder.dart';
 export 'src/core/exec.dart';

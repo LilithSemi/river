@@ -1,10 +1,10 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
-import 'package:river_hdl/src/core/sba_wishbone.dart';
+import 'package:river_hdl/src/core/sba_waist.dart';
 import 'package:test/test.dart';
 
-/// Drives the adapter's SBA side and models a 64-bit Wishbone memory cell on its
+/// Drives the adapter's SBA side and models a 64-bit Wishbone memory cell on
 /// master side (sel-masked write, combinational read+ack), checking that
 /// sub-word and full-word SBA accesses lane-shift correctly both ways.
 void main() {
@@ -12,9 +12,9 @@ void main() {
     await Simulator.reset();
   });
 
-  test('SBA word and sub-word accesses lane-shift through Wishbone', () async {
+  test('SBA word and sub-word accesses lane-shift through the waist', () async {
     const dw = 64, aw = 64, xlen = 64;
-    final dut = SbaWishboneAdapter(dataWidth: dw, addressWidth: aw, xlen: xlen);
+    final dut = SbaWaistAdapter(dataWidth: dw, addressWidth: aw, xlen: xlen);
 
     final clk = SimpleClockGenerator(10).clk;
     final reset = Logic(name: 'reset');
@@ -30,15 +30,14 @@ void main() {
     dut.input('sba_wdata').srcConnection! <= sbaWdata;
     dut.input('sba_size').srcConnection! <= sbaSize;
 
-    // 64-bit memory cell. Combinational ACK + read; sel-masked write on edge.
+    // 64-bit memory cell. Combinational ack and read, sel-masked write on edge.
     final cell = Logic(name: 'cell', width: dw);
-    final wbCyc = dut.output('wb_cyc');
-    final wbStb = dut.output('wb_stb');
-    final wbWe = dut.output('wb_we');
-    final wbDatMosi = dut.output('wb_dat_mosi');
-    final wbSel = dut.output('wb_sel');
-    dut.input('wb_ack').srcConnection! <= (wbCyc & wbStb);
-    dut.input('wb_dat_miso').srcConnection! <= cell;
+    final wbStb = dut.output('stb');
+    final wbWe = dut.output('we');
+    final wbDatMosi = dut.output('wdata');
+    final wbSel = dut.output('sel');
+    dut.input('ack').srcConnection! <= wbStb;
+    dut.input('rdata').srcConnection! <= cell;
 
     // Per-byte write mask expanded from sel.
     final byteMask = <Logic>[];
@@ -47,10 +46,7 @@ void main() {
     }
     final mask = byteMask.rswizzle();
     Sequential(clk, reset: reset, [
-      If(
-        wbCyc & wbStb & wbWe,
-        then: [cell < ((cell & ~mask) | (wbDatMosi & mask))],
-      ),
+      If(wbStb & wbWe, then: [cell < ((cell & ~mask) | (wbDatMosi & mask))]),
     ]);
 
     reset.inject(1);
@@ -82,7 +78,7 @@ void main() {
       sbaAddr.inject(addr);
       sbaSize.inject(size);
       sbaReq.inject(1);
-      // Combinational read; sample after settle.
+      // Combinational read, so sample after settle.
       await clk.nextPosedge;
       final v = dut.output('sba_rdata').value.toInt();
       sbaReq.inject(0);
@@ -109,10 +105,10 @@ void main() {
     await wr(0x05, 0x9a, 0);
     expect((await rd(0x05, 0)) & 0xff, equals(0x9a), reason: 'byte lane 5');
 
-    // The bus address MUST be beat-aligned: the lane rides `sel`, so a high-half
-    // (4-mod-8) access must present the aligned beat address, not the raw byte
-    // offset, or the DDR downsizer routes it to the wrong beat. Drive a high-lane
-    // access and sample wb_adr while the request is live.
+    // The bus address has to be beat-aligned. The lane rides `sel`, so a
+    // 4-mod-8 access must present the aligned beat address, not the raw byte
+    // offset, or the DDR downsizer sends it to the wrong beat. Drive a
+    // high-lane access and sample addr while the request is live.
     sbaWe.inject(1);
     sbaAddr.inject(0x8000_1004);
     sbaWdata.inject(0x1234);
@@ -120,17 +116,17 @@ void main() {
     sbaReq.inject(1);
     await clk.nextPosedge;
     expect(
-      dut.output('wb_adr').value.toInt() & 0x7,
+      dut.output('addr').value.toInt() & 0x7,
       equals(0),
-      reason: 'wb_adr beat-aligned (low 3 bits clear) for a 4-mod-8 access',
+      reason: 'addr beat-aligned (low 3 bits clear) for a 4-mod-8 access',
     );
     expect(
-      dut.output('wb_adr').value.toInt(),
+      dut.output('addr').value.toInt(),
       equals(0x8000_1000),
-      reason: 'wb_adr points at the aligned beat, sel selects the high lane',
+      reason: 'addr points at the aligned beat, sel selects the high lane',
     );
     expect(
-      dut.output('wb_sel').value.toInt(),
+      dut.output('sel').value.toInt(),
       equals(0xf0),
       reason: 'high 32-bit lane selected',
     );

@@ -37,6 +37,7 @@ class RiverCore extends BridgeModule {
     Logic? timeIn,
     List<String> staticInstructions = const [],
     WishboneConfig? busConfig,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     HarborDeviceTarget? target,
     bool withDebug = false,
     // Number of hardware execute-breakpoint triggers (RISC-V mcontrol, type 2)
@@ -788,30 +789,31 @@ class RiverCore extends BridgeModule {
       pipeExecWrite.valid <= mmu.dportValid & execWriteActive;
     }
 
-    // Expose Wishbone bus master as a proper interface
-    final dataBusRef = addInterface(
-      WishboneInterface(wbConfig),
+    final port = BusMasterPort.create(
+      module: this,
       name: 'dataBus',
-      role: PairRole.provider,
+      kind: fabricKind,
+      addressWidth: wbConfig.addressWidth,
+      dataWidth: wbConfig.dataWidth,
+      clk: clk,
+      reset: reset,
+      useErr: wbConfig.useErr,
     );
-    final wb = dataBusRef.internalInterface as WishboneInterface;
-
-    wb.cyc <= mmu.wbCyc;
-    wb.stb <= mmu.wbStb;
-    wb.we <= mmu.wbWe;
-    wb.adr <= mmu.wbAdr;
-    wb.datMosi <= mmu.wbDatMosi;
-    wb.sel <= mmu.wbSel;
-    wbAckExt <= wb.ack;
-    wbErrExt <= (handleAccessFaults ? (wb.err ?? Const(0)) : Const(0));
-    wbDatMisoExt <= wb.datMiso;
+    port.stb <= mmu.wbStb;
+    port.we <= mmu.wbWe;
+    port.addr <= mmu.wbAdr;
+    port.dataOut <= mmu.wbDatMosi;
+    port.sel <= mmu.wbSel;
+    wbAckExt <= port.ack;
+    wbErrExt <= (handleAccessFaults ? port.err : Const(0));
+    wbDatMisoExt <= port.dataIn;
 
     // Logic-analyzer bus taps: mirror the consumer-direction signals (ACK, read
     // data) to plain outputs for GPIO routing. These inputs cannot be read in
     // the parent without violating module hierarchy, so the core exposes them.
     if (busTap) {
-      addOutput('bustap_ack') <= wb.ack;
-      addOutput('bustap_datmiso', width: wbConfig.dataWidth) <= wb.datMiso;
+      addOutput('bustap_ack') <= port.ack;
+      addOutput('bustap_datmiso', width: wbConfig.dataWidth) <= port.dataIn;
       // Master-side control so a stuck transaction is visible: a hung load shows
       // cyc=stb=1, we=0, ack=0 held forever, with adr at the wedged address.
       addOutput('bustap_cyc') <= mmu.wbCyc;

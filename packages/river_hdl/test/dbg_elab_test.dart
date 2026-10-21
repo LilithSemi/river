@@ -10,7 +10,7 @@ void main() {
     await sub.build();
     final sv = sub.generateSynth();
     expect(sv.contains('RiverDebugModule'), isTrue);
-    expect(sv.contains('SbaWishboneAdapter'), isTrue);
+    expect(sv.contains('SbaWaistAdapter'), isTrue);
   });
 
   test('no FPGA target defaults to the ECP5 JTAGG tap', () async {
