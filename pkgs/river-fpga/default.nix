@@ -17,16 +17,10 @@
   stdenvNoCC,
   yosys,
   nextpnr,
-  # nextpnr-xilinx (0.8.2, from nixpkgs): the router that handles the dense
-  # creek SoC. The openXC7 0.9.x router regressed and cannot route it.
-  nextpnr-xilinx,
-  # Chipdb builder function {device, package} -> derivation, built from the same
-  # nextpnr-xilinx (the BBA schema is tied to the nextpnr source version).
-  nextpnrChipdb,
   icestorm,
   trellis,
-  # openXC7 supplies only the prjxray pack tools (fasm2frames/xc7frames2bit) and
-  # the python fasm module; nextpnr + chipdb + prjxray-db come from nixpkgs.
+  # The complete openXC7 toolchain: Himbächel Xilinx nextpnr, matching
+  # per-family chip databases, and the prjxray pack tools.
   openxc7 ? null,
   openxc7Nixpkgs ? null,
 }:
@@ -36,6 +30,7 @@ lib.extendMkDerivation {
 
   excludeDrvArgNames = [
     "ip"
+    "placer"
     "seed"
   ];
 
@@ -44,6 +39,9 @@ lib.extendMkDerivation {
     {
       ip,
       name ? "river-fpga-${ip.socName}",
+      # nextpnr-xilinx placer. Heap is normally best, while SA avoids the
+      # analytical placer/legalizer path that can stall on some dense designs.
+      placer ? "heap",
       # nextpnr-xilinx placer seed. creek is dense on the xc7s50, so the route
       # is seed-sensitive; bump this if a build fails to route.
       seed ? 2,
@@ -59,11 +57,10 @@ lib.extendMkDerivation {
       package = builtins.elemAt targetParts 2; # e.g. csga324
       part = "${device}${package}";
 
-      # Toolchain pieces (only forced on the spartan7 path). nextpnr + chipdb +
-      # prjxray-db come from nixpkgs (the routing 0.8.2 nextpnr); only the
-      # prjxray pack tools + fasm come from openXC7.
-      chipdb = "${nextpnrChipdb { inherit device package; }}/${part}.bin";
-      xrayDb = "${nextpnr-xilinx}/share/nextpnr/external/prjxray-db";
+      # Toolchain pieces are all from one openXC7 revision so the Himbächel
+      # chipdb schema and router stay in lockstep.
+      chipdb = "${openxc7.nextpnr-xilinx-chipdb.spartan7}/${part}.bin";
+      xrayDb = "${openxc7.nextpnr}/share/nextpnr/external/prjxray-db";
       pyPkgs = openxc7Nixpkgs.python312Packages;
       # prjxray's fasm2frames is a bare python script. Reproduce the openXC7
       # devShell PYTHONPATH so its fasm/prjxray/textx imports resolve.
@@ -91,7 +88,7 @@ lib.extendMkDerivation {
       ];
       xilinxTools = [
         yosys
-        nextpnr-xilinx # 0.8.2 from nixpkgs (routes creek)
+        openxc7.nextpnr
         openxc7.prjxray # fasm2frames + xc7frames2bit
         openxc7Nixpkgs.python312
       ];
@@ -99,6 +96,7 @@ lib.extendMkDerivation {
 
     builtins.removeAttrs args [
       "ip"
+      "placer"
       "seed"
     ]
     // {
@@ -125,7 +123,12 @@ lib.extendMkDerivation {
                 CHIPDB=${chipdb} \
                 XRAY_DB=${xrayDb} \
                 PART=${part}-1 \
-                SEED=${toString seed}
+                PLACER=${placer} \
+                SEED=${toString seed} \
+                PNRFLAGS="--chipdb ${chipdb}" \
+                PREPACK= \
+                PREPLACE= \
+                PREROUTE=
             ''
           else
             ''

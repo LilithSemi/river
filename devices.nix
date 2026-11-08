@@ -144,6 +144,10 @@ in
   };
 
   delta-v1-arty = {
+    # Himbächel's static placer legalizes this dense, cluster-heavy design while
+    # retaining the hard-cell relationships established by the Xilinx packer.
+    placer = "static";
+    seed = 3;
     ip = river-hdl.mkSoC (
       delta-v1-base
       // {

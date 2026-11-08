@@ -4,9 +4,6 @@
   callPackage,
   yosys,
   nextpnr,
-  # nextpnr-xilinx from nixpkgs is the 0.8.2 source that routes the dense creek
-  # SoC; the openXC7 flow's 0.9.x router regressed and fails to route it.
-  nextpnr-xilinx,
   icestorm,
   trellis,
   surfer,
@@ -51,15 +48,11 @@ buildDartApplication (finalAttrs: {
       inherit
         yosys
         nextpnr
-        nextpnr-xilinx
         icestorm
         trellis
         openxc7
         openxc7Nixpkgs
         ;
-      # Chipdb builder (a function of device/package), built from the same
-      # nixpkgs nextpnr-xilinx so the BBA schema matches.
-      nextpnrChipdb = callPackage ../nextpnr-chipdb { };
     };
   };
 })

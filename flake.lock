@@ -28,11 +28,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1775087534,
-        "narHash": "sha256-91qqW8lhL7TLwgQWijoGBbiD4t7/q75KTi8NxjVmSmA=",
+        "lastModified": 1793576659,
+        "narHash": "sha256-V1h85lUaJBQoHFrB2vpXZOE0Ju1MYSnIpsehoVZYlDo=",
         "owner": "hercules-ci",
         "repo": "flake-parts",
-        "rev": "3107b77cd68437b9a76194f0f7f9c55f2329ca5b",
+        "rev": "ea2630b7470978622c7689a1ff75d2b389175399",
         "type": "github"
       },
       "original": {
@@ -87,11 +87,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788033340,
-        "narHash": "sha256-O+y5lb3cR3Ebm92NUTCgCvbJyLlJ0De/d9j5Jn5F8/U=",
+        "lastModified": 1794105388,
+        "narHash": "sha256-n+Ma12zZUkG6ZVCt907G+xLi826vvcOBkGaS8/TSFu0=",
         "ref": "refs/heads/master",
-        "rev": "ddc1d70d05a67ba5a9fe0be33d3852795d07581e",
-        "revCount": 32,
+        "rev": "e146d0a3597eac6a94a2e72f7de01a886c7aca90",
+        "revCount": 281,
         "type": "git",
         "url": "https://git.lilithsemi.com/LilithSemi/harbor"
       },
@@ -102,11 +102,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1776555070,
-        "narHash": "sha256-DXxyq8jsmkgW2ZgoIWVcCmFiXjwcCtz/2yvVyoOMayw=",
+        "lastModified": 1794106775,
+        "narHash": "sha256-ipStxmzwcds1zBIYPJBRX4ZkVNS8/aKOjL4ZCpmxPuo=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "9868368dc9b60a5e0f725a759701438c6acbb606",
+        "rev": "d1016682e69f3fd6244598d1295eb2833601cdc6",
         "type": "github"
       },
       "original": {
@@ -135,11 +135,11 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1785707812,
-        "narHash": "sha256-aLlkja5n6AqI2KFpnjH+pLxgsxPEdYrXLrsuM7xthtw=",
+        "lastModified": 1793053614,
+        "narHash": "sha256-jE9Yeh8nLGzllFcn440ATlEMjhrA3JosV3Of/wlhq94=",
         "owner": "openXC7",
         "repo": "toolchain-nix",
-        "rev": "b2cbf24785829e05266500b9d16e3f0460a009f6",
+        "rev": "22327ebfb31d5fc93fd3b366c05657cb4d0d024d",
         "type": "github"
       },
       "original": {
@@ -203,11 +203,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1775636079,
-        "narHash": "sha256-pc20NRoMdiar8oPQceQT47UUZMBTiMdUuWrYu2obUP0=",
+        "lastModified": 1791885023,
+        "narHash": "sha256-C3alQ2MEt0zVrUSho5NUDo3jmhbff72++bfwoqT9Omo=",
         "owner": "numtide",
         "repo": "treefmt-nix",
-        "rev": "790751ff7fd3801feeaf96d7dc416a8d581265ba",
+        "rev": "0d6d739a833ba9a9c93034862e4a7b061a062a1c",
         "type": "github"
       },
       "original": {
@@ -232,11 +232,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1787442515,
-        "narHash": "sha256-0nVSFfaNeQJe0gUlwDQG+GRiaqM3gY+4Yl7i0+wXghk=",
+        "lastModified": 1791393012,
+        "narHash": "sha256-rz6UhlKUKGMl/vtg9exOQMvcTu3pQ2rhzh9Qrrrl6fA=",
         "ref": "refs/heads/master",
-        "rev": "35bae07702e4e6a82db3a54eed1135f950f5cf31",
-        "revCount": 7,
+        "rev": "d4082ae5d2d4812c9c9979b6a9fa35d75f5dfbae",
+        "revCount": 11,
         "type": "git",
         "url": "https://git.lilithsemi.com/LilithSemi/weir"
       },

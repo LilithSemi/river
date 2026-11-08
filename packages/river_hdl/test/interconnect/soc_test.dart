@@ -145,5 +145,24 @@ void main() {
         expect(sv, contains('HarborSram'), reason: 'sram region stays SRAM');
       },
     );
+
+    test('an AXI SoC builds the core and peripherals on AXI ports', () async {
+      final config = RiverGenIpConfig(
+        name: 'axi_test_soc',
+        cores: const ['rc1-n'],
+        interconnect: 'axi',
+        clockFrequency: 48000000,
+        oscFrequencyOverride: 48000000,
+        devices: [
+          Device.parse('sram:0x80000000:4K'),
+          Device.parse('uart:0x10000000:ns16550a'),
+        ],
+      );
+      final soc = await config.buildSoC();
+      await soc.build();
+      final sv = soc.generateSynth();
+      expect(sv, contains('dataBus_ARVALID'));
+      expect(sv, contains('HarborAxi4Fabric'));
+    });
   });
 }

@@ -154,7 +154,8 @@ class RiverPhysicalL1 extends Module {
     dcache.input('mem_valid').srcConnection! <= success;
     // D-cache bypass responses are lane-zero; refill beats are aligned.
     dcache.input('mem_rdata').srcConnection! <=
-        result >> [busAddr.getRange(0, laneBits), Const(0, width: 3)].swizzle();
+        result >>>
+            [busAddr.getRange(0, laneBits), Const(0, width: 3)].swizzle();
     final iEn = icache?.memEn ?? Const(0);
     final dEn = dcache.memEn;
     final bypassEn = valid & bypass;

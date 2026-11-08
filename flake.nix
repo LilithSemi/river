@@ -257,7 +257,11 @@
                   "${name}" = ip;
                 }
                 // lib.optionalAttrs (isFpga ip) {
-                  "${name}-bitstream" = pkgs.river-hdl.mkFpga { inherit ip; };
+                  "${name}-bitstream" = pkgs.river-hdl.mkFpga {
+                    inherit ip;
+                    placer = cfg.placer or "heap";
+                    seed = cfg.seed or 2;
+                  };
                 }
                 // lib.optionalAttrs (isFpga ip && isNixosCapable ip) {
                   "${name}-nixos-sdcard" = mkNixosSdcard name ip;

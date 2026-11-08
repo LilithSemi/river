@@ -728,6 +728,7 @@ class FpgaTarget extends Target {
           pinMap: pins,
           extraConstraints: extraConstraints,
           useOpenXc7: true,
+          useHimbaechel: true,
         );
       default:
         throw UnsupportedError('Unknown FPGA vendor: $vendor');
@@ -1259,8 +1260,7 @@ class RiverGenIpConfig {
   /// Outstanding depth for a DMA memory master. Wishbone carries one transfer
   /// at a time, so the fabric rejects anything deeper; AXI4 and TileLink
   /// pipeline, which is where the ADMA gets its throughput back.
-  int get dmaOutstanding =>
-      fabricKind == HarborFabricKind.wishbone ? 1 : 4;
+  int get dmaOutstanding => fabricKind == HarborFabricKind.wishbone ? 1 : 4;
 
   /// The resolved Harbor board, when `--board` names one.
   HarborBoard? get board =>
@@ -1419,17 +1419,8 @@ class RiverGenIpConfig {
     // silicon stays in reset.
     frequency: oscFrequency,
     pins: fpgaPinMap,
-    extraConstraints: _ddrClockBelConstraints,
     pdkRoot: pdkRoot,
   );
-
-  /// openXC7 clock-BEL placement constraints for the Xilinx DDR3 PHY.
-  ///
-  /// All DDR clocks (CK / CLKDIV / idelayref / ck90) ride plain GLOBAL BUFGs and
-  /// the read ISERDESE2 CLK shares the CK BUFG net, with zero regional BUFH/BUFHCE
-  /// (matching the HW-verified UberDDR3 oracle). A global BUFG reaches any region's
-  /// HCLK leaf, so there is no region to mis-bind, so NO constraints are emitted.
-  Map<String, String> get _ddrClockBelConstraints => const {};
 
   /// Builds the bundled flash firmware image for the primary core, for emitting
   /// as a standalone `firmware.bin` (flashed at [flashFirmwareOffset]).
