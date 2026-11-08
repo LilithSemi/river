@@ -60,36 +60,28 @@ void main() {
       expect(dts, isNot(contains('0x9')));
     });
 
-    test(
-      'each context drives its own core interrupt line',
-      () async {
-        final soc = await _config(core: 'rc1-s').buildSoC();
-        await soc.build();
-        final sv = soc.generateSynth();
+    test('each context drives its own core interrupt line', () async {
+      final soc = await _config(core: 'rc1-s').buildSoC();
+      await soc.build();
+      final sv = soc.generateSynth();
 
-        // Context 0 is the hart's machine line and context 1 its supervisor line.
-        // Crossing them, or leaving either dangling, is invisible in the tables.
-        expect(sv, contains('.ext_irq_0(core0_ext_pending)'));
-        expect(sv, contains('.ext_irq_1(core0_sei_pending)'));
-        expect(sv, contains('.extPending(core0_ext_pending)'));
-        expect(sv, contains('.seiPending(core0_sei_pending)'));
-      },
-      timeout: const Timeout(Duration(minutes: 10)),
-    );
+      // Context 0 is the hart's machine line and context 1 its supervisor line.
+      // Crossing them, or leaving either dangling, is invisible in the tables.
+      expect(sv, contains('.ext_irq_0(core0_ext_pending)'));
+      expect(sv, contains('.ext_irq_1(core0_sei_pending)'));
+      expect(sv, contains('.extPending(core0_ext_pending)'));
+      expect(sv, contains('.seiPending(core0_sei_pending)'));
+    }, timeout: const Timeout(Duration(minutes: 10)));
 
-    test(
-      'a core without supervisor has no supervisor port',
-      () async {
-        final soc = await _config(core: 'rc1-n').buildSoC();
-        await soc.build();
-        final sv = soc.generateSynth();
+    test('a core without supervisor has no supervisor port', () async {
+      final soc = await _config(core: 'rc1-n').buildSoC();
+      await soc.build();
+      final sv = soc.generateSynth();
 
-        expect(sv, contains('.ext_irq_0(core0_ext_pending)'));
-        expect(sv, isNot(contains('seiPending')));
-        expect(sv, isNot(contains('ext_irq_1')));
-      },
-      timeout: const Timeout(Duration(minutes: 10)),
-    );
+      expect(sv, contains('.ext_irq_0(core0_ext_pending)'));
+      expect(sv, isNot(contains('seiPending')));
+      expect(sv, isNot(contains('ext_irq_1')));
+    }, timeout: const Timeout(Duration(minutes: 10)));
   });
 
   group('device loss', () {

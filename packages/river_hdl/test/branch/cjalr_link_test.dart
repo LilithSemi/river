@@ -91,19 +91,11 @@ Future<void> _runLinkTest(RiverCoreConfig config) async {
 }
 
 void main() {
-  test(
-    'c.jalr link address is PC+2, not PC+4 (rc1-s microcode)',
-    () async {
-      await _runLinkTest(_rc1s());
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('c.jalr link address is PC+2, not PC+4 (rc1-s microcode)', () async {
+    await _runLinkTest(_rc1s());
+  }, timeout: Timeout(Duration(minutes: 5)));
 
-  test(
-    'c.jalr link address is PC+2, not PC+4 (rc1-ma OoO)',
-    () async {
-      await _runLinkTest(_rc1ma());
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('c.jalr link address is PC+2, not PC+4 (rc1-ma OoO)', () async {
+    await _runLinkTest(_rc1ma());
+  }, timeout: Timeout(Duration(minutes: 5)));
 }

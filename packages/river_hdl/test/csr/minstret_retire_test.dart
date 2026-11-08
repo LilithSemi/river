@@ -48,34 +48,30 @@ String _memString(Map<int, int> words) {
 }
 
 void main() {
-  test(
-    'minstret counts instructions and mcycle counts more of them',
-    () async {
-      await Simulator.reset();
-      // Six instructions retire between the two minstret reads: the two csrr
-      // that take the first pair of samples, and the four nops after them.
-      final program = <int, int>{
-        0x00: 0xB02022f3, // csrr x5, minstret
-        0x04: 0xB0002473, // csrr x8, mcycle
-        0x08: 0x00000013, // nop
-        0x0c: 0x00000013, // nop
-        0x10: 0x00000013, // nop
-        0x14: 0x00000013, // nop
-        0x18: 0xB0202373, // csrr x6, minstret
-        0x1c: 0xB00024f3, // csrr x9, mcycle
-        0x20: 0x405303b3, // sub  x7, x6, x5   (instructions retired)
-        0x24: 0x40848533, // sub  x10, x9, x8  (cycles elapsed)
-        0x28: 0x00a3b633, // sltu x12, x7, x10 (instructions < cycles)
-        0x2c: 0x09900593, // addi x11, x0, 0x99 (sentinel: program ran)
-        0x30: 0x00000013, // nop
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x7: 6, Register.x12: 1, Register.x11: 0x99},
-        _rc1s(),
-        nextPc: 0x34,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('minstret counts instructions and mcycle counts more of them', () async {
+    await Simulator.reset();
+    // Six instructions retire between the two minstret reads: the two csrr
+    // that take the first pair of samples, and the four nops after them.
+    final program = <int, int>{
+      0x00: 0xB02022f3, // csrr x5, minstret
+      0x04: 0xB0002473, // csrr x8, mcycle
+      0x08: 0x00000013, // nop
+      0x0c: 0x00000013, // nop
+      0x10: 0x00000013, // nop
+      0x14: 0x00000013, // nop
+      0x18: 0xB0202373, // csrr x6, minstret
+      0x1c: 0xB00024f3, // csrr x9, mcycle
+      0x20: 0x405303b3, // sub  x7, x6, x5   (instructions retired)
+      0x24: 0x40848533, // sub  x10, x9, x8  (cycles elapsed)
+      0x28: 0x00a3b633, // sltu x12, x7, x10 (instructions < cycles)
+      0x2c: 0x09900593, // addi x11, x0, 0x99 (sentinel: program ran)
+      0x30: 0x00000013, // nop
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x7: 6, Register.x12: 1, Register.x11: 0x99},
+      _rc1s(),
+      nextPc: 0x34,
+    );
+  }, timeout: Timeout(Duration(minutes: 5)));
 }

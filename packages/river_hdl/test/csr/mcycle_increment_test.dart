@@ -49,31 +49,27 @@ String _memString(Map<int, int> words) {
 }
 
 void main() {
-  test(
-    'mcycle and minstret advance (not stuck at 0)',
-    () async {
-      await Simulator.reset();
-      // All reads happen in M-mode (reset privilege), where both 0xB00 and
-      // 0xB02 are legal.
-      final program = <int, int>{
-        0x00: 0xB00022f3, // csrr x5, mcycle
-        0x04: 0xB0202473, // csrr x8, minstret
-        0x08: 0x00000013, // nop
-        0x0c: 0x00000013, // nop
-        0x10: 0xB0002373, // csrr x6, mcycle
-        0x14: 0xB02024f3, // csrr x9, minstret
-        0x18: 0x0062b3b3, // sltu x7, x5, x6    (mcycle later > earlier)
-        0x1c: 0x00943533, // sltu x10, x8, x9   (minstret later > earlier)
-        0x20: 0x09900593, // addi x11, x0, 0x99 (sentinel: program ran)
-        0x24: 0x00000013, // nop
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x7: 1, Register.x10: 1, Register.x11: 0x99},
-        _rc1s(),
-        nextPc: 0x28,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('mcycle and minstret advance (not stuck at 0)', () async {
+    await Simulator.reset();
+    // All reads happen in M-mode (reset privilege), where both 0xB00 and
+    // 0xB02 are legal.
+    final program = <int, int>{
+      0x00: 0xB00022f3, // csrr x5, mcycle
+      0x04: 0xB0202473, // csrr x8, minstret
+      0x08: 0x00000013, // nop
+      0x0c: 0x00000013, // nop
+      0x10: 0xB0002373, // csrr x6, mcycle
+      0x14: 0xB02024f3, // csrr x9, minstret
+      0x18: 0x0062b3b3, // sltu x7, x5, x6    (mcycle later > earlier)
+      0x1c: 0x00943533, // sltu x10, x8, x9   (minstret later > earlier)
+      0x20: 0x09900593, // addi x11, x0, 0x99 (sentinel: program ran)
+      0x24: 0x00000013, // nop
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x7: 1, Register.x10: 1, Register.x11: 0x99},
+      _rc1s(),
+      nextPc: 0x28,
+    );
+  }, timeout: Timeout(Duration(minutes: 5)));
 }

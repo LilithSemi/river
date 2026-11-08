@@ -273,42 +273,34 @@ void main() {
   );
 
   for (final latency in [0, 1, 2, 4]) {
-    test(
-      'mixed stream correct at memory latency $latency',
-      () async {
-        final (expected, mem) = _layout(stream);
-        final (got, _) = await runBuffer(
-          mem,
-          count: stream.length,
-          latency: latency,
-        );
-        expect(got.length, stream.length);
-        for (var i = 0; i < stream.length; i++) {
-          expect(got[i], expected[i], reason: 'mixed instr $i lat $latency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40 + latency * 2)),
-    );
+    test('mixed stream correct at memory latency $latency', () async {
+      final (expected, mem) = _layout(stream);
+      final (got, _) = await runBuffer(
+        mem,
+        count: stream.length,
+        latency: latency,
+      );
+      expect(got.length, stream.length);
+      for (var i = 0; i < stream.length; i++) {
+        expect(got[i], expected[i], reason: 'mixed instr $i lat $latency');
+      }
+    }, timeout: Timeout(Duration(seconds: 40 + latency * 2)));
   }
 
   for (final d in [4, 8]) {
-    test(
-      'mixed stream correct at FIFO depth $d',
-      () async {
-        final (expected, mem) = _layout(stream);
-        final (got, _) = await runBuffer(
-          mem,
-          count: stream.length,
-          depth: d,
-          latency: 2,
-        );
-        expect(got.length, stream.length);
-        for (var i = 0; i < stream.length; i++) {
-          expect(got[i], expected[i], reason: 'mixed instr $i depth $d');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40)),
-    );
+    test('mixed stream correct at FIFO depth $d', () async {
+      final (expected, mem) = _layout(stream);
+      final (got, _) = await runBuffer(
+        mem,
+        count: stream.length,
+        depth: d,
+        latency: 2,
+      );
+      expect(got.length, stream.length);
+      for (var i = 0; i < stream.length; i++) {
+        expect(got[i], expected[i], reason: 'mixed instr $i depth $d');
+      }
+    }, timeout: Timeout(Duration(seconds: 40)));
   }
 
   // 32-bit fetch port (wordHalves=2), the RV32 dual-dispatch regression width.

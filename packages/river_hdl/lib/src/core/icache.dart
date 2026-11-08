@@ -221,9 +221,8 @@ class RiverICache extends BridgeModule {
     // addrQ, data from the block-RAM read that answers addrQ this cycle.
     done0 <= hit0;
     valid0 <= hit0;
-    Logic ramRead(int r) => ramLatency == 1
-        ? dataRam.readData(r)
-        : flop(clk, dataRam.readData(r));
+    Logic ramRead(int r) =>
+        ramLatency == 1 ? dataRam.readData(r) : flop(clk, dataRam.readData(r));
     rdata0 <= ramRead(0);
     if (dualPort) {
       done1 <= hit1;

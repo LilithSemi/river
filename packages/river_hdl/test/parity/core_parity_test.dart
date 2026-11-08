@@ -66,15 +66,7 @@ void main() {
       rate: HarborFixedClockRate(48000000),
     ),
     mxlen: RiscVMxlen.rv64,
-    extensions: [
-      rv64i,
-      rv32i,
-      rvM,
-      rvF,
-      rvD,
-      rvZicsr,
-      rvZifencei,
-    ],
+    extensions: [rv64i, rv32i, rvM, rvF, rvD, rvZicsr, rvZifencei],
     interrupts: [],
     mmu: HarborMmuConfig(
       mxlen: RiscVMxlen.rv64,

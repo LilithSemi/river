@@ -49,33 +49,29 @@ String _memString(Map<int, int> words) {
 }
 
 void main() {
-  test(
-    'csrs sie is legal from S-mode (rc1-s microcode)',
-    () async {
-      await Simulator.reset();
-      // Drop to S (MPP=S) then csrs sie: must NOT trap (x7 reaches 0x99).
-      final program = <int, int>{
-        0x00: 0x34151073, // csrw mepc, x10
-        0x04: 0x30059073, // csrw mstatus, x11
-        0x08: 0x30200073, // mret
-        0x40: 0x10462073, // csrs sie, x12   (S-mode)
-        0x44: 0x09900393, // addi x7, x0, 0x99
-        0x48: 0x00000013, // nop
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x7: 0x99},
-        _rc1s(),
-        initRegisters: {
-          Register.x10: 0x40,
-          Register.x11: 0x800,
-          Register.x12: 0x20,
-        },
-        nextPc: 0x4c,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('csrs sie is legal from S-mode (rc1-s microcode)', () async {
+    await Simulator.reset();
+    // Drop to S (MPP=S) then csrs sie: must NOT trap (x7 reaches 0x99).
+    final program = <int, int>{
+      0x00: 0x34151073, // csrw mepc, x10
+      0x04: 0x30059073, // csrw mstatus, x11
+      0x08: 0x30200073, // mret
+      0x40: 0x10462073, // csrs sie, x12   (S-mode)
+      0x44: 0x09900393, // addi x7, x0, 0x99
+      0x48: 0x00000013, // nop
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x7: 0x99},
+      _rc1s(),
+      initRegisters: {
+        Register.x10: 0x40,
+        Register.x11: 0x800,
+        Register.x12: 0x20,
+      },
+      nextPc: 0x4c,
+    );
+  }, timeout: Timeout(Duration(minutes: 5)));
 
   test(
     'ecall from S-mode reaches the M handler with correct mepc/mcause',
@@ -123,62 +119,56 @@ void main() {
     timeout: Timeout(Duration(minutes: 5)),
   );
 
-  test(
-    'ecall from S-mode: mret returns to S, not U (rc1-s microcode)',
-    () async {
-      await Simulator.reset();
-      // Enter S-mode, ecall to M, the M handler bumps mepc and mret's back. The
-      // return MUST land in S: the following `csrs sie` is legal only in S. If the
-      // core drops to U on the ecall-return mret, csrs sie traps and x7 never = 0x99.
-      //   0x00 csrw mtvec, x13   0x30569073  (x13=0x80 M handler)
-      //   0x04 csrw mepc, x10    0x34151073  (x10=0x40 S entry)
-      //   0x08 csrw mstatus,x11  0x30059073  (x11=0x800 MPP=S)
-      //   0x0c mret              0x30200073
-      //   0x40 ecall             0x00000073  (S -> M)
-      //   0x44 addi x9,x0,0x55   0x05500493  (ecall returned marker)
-      //   0x48 csrs sie, x12     0x10462073  (legal only if back in S)
-      //   0x4c addi x7,x0,0x99   0x09900393  (no-trap marker = S)
-      //   0x50 nop (halt)        0x00000013
-      //   0x80 csrr x14, mepc    0x34102773
-      //   0x84 addi x14,x14,4    0x00470713
-      //   0x88 csrw mepc, x14    0x34171073
-      //   0x8c mret              0x30200073  (return to 0x44 at MPP=S)
-      final program = <int, int>{
-        0x00: 0x30569073,
-        0x04: 0x34151073,
-        0x08: 0x30059073,
-        0x0c: 0x30200073,
-        0x40: 0x00000073,
-        0x44: 0x05500493,
-        0x48: 0x10462073,
-        0x4c: 0x09900393,
-        0x50: 0x00000013,
-        // M ecall handler: mark x8 (handler entered), bump mepc, mret.
-        0x80: 0x01100413, // addi x8, x0, 0x11
-        0x84: 0x34102773, // csrr x14, mepc
-        0x88: 0x00470713, // addi x14, x14, 4
-        0x8c: 0x34171073, // csrw mepc, x14
-        0x90: 0x30200073, // mret
-      };
-      await coreTest(
-        _memString(program),
-        {
-          Register.x8: 0x11, // M ecall handler ran (ecall -> M works)
-          Register.x9:
-              0x55, // ecall round-trip completed (mret returned to 0x44)
-          Register.x7:
-              0x99, // csrs sie did NOT trap => mret returned to S, not U
-        },
-        _rc1s(),
-        initRegisters: {
-          Register.x13: 0x80, // mtvec = M ecall handler
-          Register.x10: 0x40, // mepc = S entry
-          Register.x11: 0x800, // mstatus.MPP = S
-          Register.x12: 0x20, // sie bits
-        },
-        nextPc: 0x54,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 5)),
-  );
+  test('ecall from S-mode: mret returns to S, not U (rc1-s microcode)', () async {
+    await Simulator.reset();
+    // Enter S-mode, ecall to M, the M handler bumps mepc and mret's back. The
+    // return MUST land in S: the following `csrs sie` is legal only in S. If the
+    // core drops to U on the ecall-return mret, csrs sie traps and x7 never = 0x99.
+    //   0x00 csrw mtvec, x13   0x30569073  (x13=0x80 M handler)
+    //   0x04 csrw mepc, x10    0x34151073  (x10=0x40 S entry)
+    //   0x08 csrw mstatus,x11  0x30059073  (x11=0x800 MPP=S)
+    //   0x0c mret              0x30200073
+    //   0x40 ecall             0x00000073  (S -> M)
+    //   0x44 addi x9,x0,0x55   0x05500493  (ecall returned marker)
+    //   0x48 csrs sie, x12     0x10462073  (legal only if back in S)
+    //   0x4c addi x7,x0,0x99   0x09900393  (no-trap marker = S)
+    //   0x50 nop (halt)        0x00000013
+    //   0x80 csrr x14, mepc    0x34102773
+    //   0x84 addi x14,x14,4    0x00470713
+    //   0x88 csrw mepc, x14    0x34171073
+    //   0x8c mret              0x30200073  (return to 0x44 at MPP=S)
+    final program = <int, int>{
+      0x00: 0x30569073,
+      0x04: 0x34151073,
+      0x08: 0x30059073,
+      0x0c: 0x30200073,
+      0x40: 0x00000073,
+      0x44: 0x05500493,
+      0x48: 0x10462073,
+      0x4c: 0x09900393,
+      0x50: 0x00000013,
+      // M ecall handler: mark x8 (handler entered), bump mepc, mret.
+      0x80: 0x01100413, // addi x8, x0, 0x11
+      0x84: 0x34102773, // csrr x14, mepc
+      0x88: 0x00470713, // addi x14, x14, 4
+      0x8c: 0x34171073, // csrw mepc, x14
+      0x90: 0x30200073, // mret
+    };
+    await coreTest(
+      _memString(program),
+      {
+        Register.x8: 0x11, // M ecall handler ran (ecall -> M works)
+        Register.x9: 0x55, // ecall round-trip completed (mret returned to 0x44)
+        Register.x7: 0x99, // csrs sie did NOT trap => mret returned to S, not U
+      },
+      _rc1s(),
+      initRegisters: {
+        Register.x13: 0x80, // mtvec = M ecall handler
+        Register.x10: 0x40, // mepc = S entry
+        Register.x11: 0x800, // mstatus.MPP = S
+        Register.x12: 0x20, // sie bits
+      },
+      nextPc: 0x54,
+    );
+  }, timeout: Timeout(Duration(minutes: 5)));
 }

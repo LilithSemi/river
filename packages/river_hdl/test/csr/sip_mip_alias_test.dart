@@ -250,88 +250,80 @@ void main() {
     timeout: Timeout(Duration(minutes: 10)),
   );
 
-  test(
-    'supervisor cannot clear the PLIC line through sip.SEIP',
-    () async {
-      await Simulator.reset();
-      // sip.SEIP is READ-ONLY to supervisor: the bit software sees is the
-      // interrupt controller's wire, and only claiming the source at the PLIC
-      // lowers it. A csrc that could clear it would let a handler lose an
-      // interrupt that is still asserted.
-      //   csrw mideleg,x11   x11 = SEIP
-      //   csrr x9,mideleg    the delegation the rest of this test depends on
-      //   csrc sip,x13       x13 = SEIP, an attempt to clear the line
-      //   csrr x5,sip        must STILL show it
-      //   csrr x6,mip        must STILL show it
-      final program = <int, int>{
-        0x00: 0x30359073, // csrw mideleg,x11
-        0x04: 0x303024f3, // csrr x9,mideleg
-        0x08: 0x14463073, // csrc sip,x13
-        0x0c: 0x144022f3, // csrr x5,sip
-        0x10: 0x34402373, // csrr x6,mip
-        0x14: 0x0000006F, // j .
-      };
-      final r = await run(
-        program,
-        {11: seip, 13: seip},
-        seiLine: true,
-        parkPc: 0x14,
-      );
-      expect(r.parked, isTrue, reason: 'the program never reached its park');
-      expect(
-        r.regs[9],
-        BigInt.from(seip),
-        reason:
-            'mideleg did not take the delegation, so the rest of this test '
-            'would prove nothing',
-      );
-      expect(
-        r.regs[5],
-        BigInt.from(seip),
-        reason:
-            'a csrc of sip.SEIP changed what sip shows. The bit is the PLIC '
-            'wire, so it must stay set until the source is claimed.',
-      );
-      expect(
-        r.regs[6],
-        BigInt.from(seip),
-        reason: 'mip.SEIP must show the line whatever software writes',
-      );
-    },
-    timeout: Timeout(Duration(minutes: 10)),
-  );
+  test('supervisor cannot clear the PLIC line through sip.SEIP', () async {
+    await Simulator.reset();
+    // sip.SEIP is READ-ONLY to supervisor: the bit software sees is the
+    // interrupt controller's wire, and only claiming the source at the PLIC
+    // lowers it. A csrc that could clear it would let a handler lose an
+    // interrupt that is still asserted.
+    //   csrw mideleg,x11   x11 = SEIP
+    //   csrr x9,mideleg    the delegation the rest of this test depends on
+    //   csrc sip,x13       x13 = SEIP, an attempt to clear the line
+    //   csrr x5,sip        must STILL show it
+    //   csrr x6,mip        must STILL show it
+    final program = <int, int>{
+      0x00: 0x30359073, // csrw mideleg,x11
+      0x04: 0x303024f3, // csrr x9,mideleg
+      0x08: 0x14463073, // csrc sip,x13
+      0x0c: 0x144022f3, // csrr x5,sip
+      0x10: 0x34402373, // csrr x6,mip
+      0x14: 0x0000006F, // j .
+    };
+    final r = await run(
+      program,
+      {11: seip, 13: seip},
+      seiLine: true,
+      parkPc: 0x14,
+    );
+    expect(r.parked, isTrue, reason: 'the program never reached its park');
+    expect(
+      r.regs[9],
+      BigInt.from(seip),
+      reason:
+          'mideleg did not take the delegation, so the rest of this test '
+          'would prove nothing',
+    );
+    expect(
+      r.regs[5],
+      BigInt.from(seip),
+      reason:
+          'a csrc of sip.SEIP changed what sip shows. The bit is the PLIC '
+          'wire, so it must stay set until the source is claimed.',
+    );
+    expect(
+      r.regs[6],
+      BigInt.from(seip),
+      reason: 'mip.SEIP must show the line whatever software writes',
+    );
+  }, timeout: Timeout(Duration(minutes: 10)));
 
-  test(
-    'an undelegated interrupt reads as zero through sip and sie',
-    () async {
-      await Simulator.reset();
-      // mideleg stays 0. The spec says a cause that is not delegated reads as
-      // zero in sip/sie and is not writable there. This is the same mideleg the
-      // trap-target choice uses, so the two models cannot disagree.
-      //   csrr x5,sip        line asserted, but SEI is NOT delegated -> 0
-      //   csrw sie,x12       must not reach mie
-      //   csrr x8,mie
-      final program = <int, int>{
-        0x00: 0x144022f3, // csrr x5,sip
-        0x04: 0x10461073, // csrw sie,x12
-        0x08: 0x30402473, // csrr x8,mie
-        0x0c: 0x0000006F, // j .
-      };
-      final r = await run(program, {12: seip}, seiLine: true, parkPc: 0x0c);
-      expect(r.parked, isTrue, reason: 'the program never reached its park');
-      expect(
-        r.regs[5],
-        BigInt.zero,
-        reason: 'an undelegated interrupt must read as zero through sip',
-      );
-      expect(
-        r.regs[8],
-        BigInt.zero,
-        reason: 'sie must not write an interrupt mideleg does not delegate',
-      );
-    },
-    timeout: Timeout(Duration(minutes: 10)),
-  );
+  test('an undelegated interrupt reads as zero through sip and sie', () async {
+    await Simulator.reset();
+    // mideleg stays 0. The spec says a cause that is not delegated reads as
+    // zero in sip/sie and is not writable there. This is the same mideleg the
+    // trap-target choice uses, so the two models cannot disagree.
+    //   csrr x5,sip        line asserted, but SEI is NOT delegated -> 0
+    //   csrw sie,x12       must not reach mie
+    //   csrr x8,mie
+    final program = <int, int>{
+      0x00: 0x144022f3, // csrr x5,sip
+      0x04: 0x10461073, // csrw sie,x12
+      0x08: 0x30402473, // csrr x8,mie
+      0x0c: 0x0000006F, // j .
+    };
+    final r = await run(program, {12: seip}, seiLine: true, parkPc: 0x0c);
+    expect(r.parked, isTrue, reason: 'the program never reached its park');
+    expect(
+      r.regs[5],
+      BigInt.zero,
+      reason: 'an undelegated interrupt must read as zero through sip',
+    );
+    expect(
+      r.regs[8],
+      BigInt.zero,
+      reason: 'sie must not write an interrupt mideleg does not delegate',
+    );
+  }, timeout: Timeout(Duration(minutes: 10)));
 
   test(
     'the line delivered through the sip view actually vectors to stvec',

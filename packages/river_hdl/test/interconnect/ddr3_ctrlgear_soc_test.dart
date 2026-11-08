@@ -36,16 +36,12 @@ void main() {
     return soc.generateSynth();
   }
 
-  test(
-    'CONTROL: the same FPGA SoC WITHOUT the dram builds',
-    () async {
-      // Isolates whether the mmioDevices/buildSoC path is broken by unrelated WIP
-      // (a build failure here == pre-existing, independent of the DDR gearing).
-      final sv = await genDdr3Sv(geared: false, withDram: false);
-      expect(sv, contains('module'));
-    },
-    timeout: const Timeout(Duration(minutes: 3)),
-  );
+  test('CONTROL: the same FPGA SoC WITHOUT the dram builds', () async {
+    // Isolates whether the mmioDevices/buildSoC path is broken by unrelated WIP
+    // (a build failure here == pre-existing, independent of the DDR gearing).
+    final sv = await genDdr3Sv(geared: false, withDram: false);
+    expect(sv, contains('module'));
+  }, timeout: const Timeout(Duration(minutes: 3)));
 
   test(
     'ctrlgear absent (gearRatio 1) is byte-identical: no gearbox/serdes/CK8',
@@ -59,16 +55,12 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
-  test(
-    'ctrlgear=2 wires the CK/8 controller + CK/4 serdes + gearbox',
-    () async {
-      final sv = await genDdr3Sv(geared: true);
-      // The DDR MMCM emits CK/8 on CLKOUT5.
-      expect(sv, contains('.CLKOUT5_DIVIDE('));
-      // HarborDdr3 gained its second (serdes) clock port and the gearbox module.
-      expect(sv, contains('ddr_serdes_clk'));
-      expect(sv, contains('ddr3_gearbox'));
-    },
-    timeout: const Timeout(Duration(minutes: 3)),
-  );
+  test('ctrlgear=2 wires the CK/8 controller + CK/4 serdes + gearbox', () async {
+    final sv = await genDdr3Sv(geared: true);
+    // The DDR MMCM emits CK/8 on CLKOUT5.
+    expect(sv, contains('.CLKOUT5_DIVIDE('));
+    // HarborDdr3 gained its second (serdes) clock port and the gearbox module.
+    expect(sv, contains('ddr_serdes_clk'));
+    expect(sv, contains('ddr3_gearbox'));
+  }, timeout: const Timeout(Duration(minutes: 3)));
 }

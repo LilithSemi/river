@@ -1,6 +1,5 @@
 import 'package:harbor/harbor.dart';
 
-
 /// RISC-V application-processor profile extension sets (RVA22 / RVA23).
 ///
 /// These are the canonical mandatory-extension lists used to build River core

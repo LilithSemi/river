@@ -274,21 +274,17 @@ void main() {
   // latencies are covered by the in-pipeline test (core_prefetch_test) where the
   // fetch port is the real MMU. See project_hdl_prefetch.
   for (final latency in [0]) {
-    test(
-      'sequential stream correct at latency $latency',
-      () async {
-        final got = await runPrefetch(
-          progAt({0: seq}),
-          count: 8,
-          latency: latency,
-        );
-        expect(got.length, 8);
-        for (var i = 0; i < 8; i++) {
-          expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 30 + latency)),
-    );
+    test('sequential stream correct at latency $latency', () async {
+      final got = await runPrefetch(
+        progAt({0: seq}),
+        count: 8,
+        latency: latency,
+      );
+      expect(got.length, 8);
+      for (var i = 0; i < 8; i++) {
+        expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
+      }
+    }, timeout: Timeout(Duration(seconds: 30 + latency)));
   }
 
   test('redirect mid-stream resteers to the new PC', () async {
@@ -318,73 +314,56 @@ void main() {
   final memMap = {for (var i = 0; i < seq.length; i++) i * 4: seq[i]};
 
   for (final latency in [0, 1, 2, 4, 8]) {
-    test(
-      'pulse port: sequential stream correct at latency $latency',
-      () async {
-        final got = await runPrefetchPulse(memMap, count: 8, latency: latency);
-        expect(got.length, 8);
-        for (var i = 0; i < 8; i++) {
-          expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40 + latency * 2)),
-    );
+    test('pulse port: sequential stream correct at latency $latency', () async {
+      final got = await runPrefetchPulse(memMap, count: 8, latency: latency);
+      expect(got.length, 8);
+      for (var i = 0; i < 8; i++) {
+        expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
+      }
+    }, timeout: Timeout(Duration(seconds: 40 + latency * 2)));
   }
 
   // Deeper FIFO (power-of-two): correctness must hold at any depth (the depth
   // is a buffering knob; it does not change which instructions are delivered).
   for (final d in [4, 8]) {
-    test(
-      'pulse port: depth $d delivers the correct stream',
-      () async {
-        final got = await runPrefetchPulse(
-          memMap,
-          count: 8,
-          latency: 3,
-          depth: d,
-        );
-        expect(got.length, 8);
-        for (var i = 0; i < 8; i++) {
-          expect(got[i], (i * 4, seq[i]), reason: 'instr $i depth $d');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40)),
-    );
+    test('pulse port: depth $d delivers the correct stream', () async {
+      final got = await runPrefetchPulse(
+        memMap,
+        count: 8,
+        latency: 3,
+        depth: d,
+      );
+      expect(got.length, 8);
+      for (var i = 0; i < 8; i++) {
+        expect(got[i], (i * 4, seq[i]), reason: 'instr $i depth $d');
+      }
+    }, timeout: Timeout(Duration(seconds: 40)));
   }
 
   for (final latency in [1, 4]) {
-    test(
-      'pulse port: redirect mid-stream at latency $latency',
-      () async {
-        final tgt = [
-          for (var i = 0; i < 8; i++) (0x00000093 | ((i + 1) << 20)),
-        ];
-        final mem = {
-          ...memMap,
-          for (var i = 0; i < tgt.length; i++) 0x40 + i * 4: tgt[i],
-        };
-        final got = await runPrefetchPulse(
-          mem,
-          count: 7,
-          latency: latency,
-          redirectAfter: 3,
-          redirectPc: 0x40,
-        );
-        for (var i = 0; i < 3; i++) {
-          expect(got[i], (
-            i * 4,
-            seq[i],
-          ), reason: 'pre-redirect $i lat $latency');
-        }
-        for (var i = 3; i < got.length; i++) {
-          final j = i - 3;
-          expect(got[i], (
-            0x40 + j * 4,
-            tgt[j],
-          ), reason: 'post-redirect $j lat $latency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40 + latency * 2)),
-    );
+    test('pulse port: redirect mid-stream at latency $latency', () async {
+      final tgt = [for (var i = 0; i < 8; i++) (0x00000093 | ((i + 1) << 20))];
+      final mem = {
+        ...memMap,
+        for (var i = 0; i < tgt.length; i++) 0x40 + i * 4: tgt[i],
+      };
+      final got = await runPrefetchPulse(
+        mem,
+        count: 7,
+        latency: latency,
+        redirectAfter: 3,
+        redirectPc: 0x40,
+      );
+      for (var i = 0; i < 3; i++) {
+        expect(got[i], (i * 4, seq[i]), reason: 'pre-redirect $i lat $latency');
+      }
+      for (var i = 3; i < got.length; i++) {
+        final j = i - 3;
+        expect(got[i], (
+          0x40 + j * 4,
+          tgt[j],
+        ), reason: 'post-redirect $j lat $latency');
+      }
+    }, timeout: Timeout(Duration(seconds: 40 + latency * 2)));
   }
 }

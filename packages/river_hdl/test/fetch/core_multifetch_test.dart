@@ -190,23 +190,19 @@ void main() {
   // In-core win: at a fetch latency, multi-outstanding (external pipelined
   // memory) should beat the single-outstanding prefetch fetcher over the bus at
   // the same latency, recovering toward the alloc floor.
-  test(
-    'multi-outstanding fetch hides latency in-core',
-    () async {
-      const lat = 4;
-      final single = await run(mk(), busLatency: lat); // prefetch over bus
-      final multi = await run(mk(fetchOutstanding: 5), fetchLatency: lat);
-      // ignore: avoid_print
-      print(
-        '\n=== in-core fetch latency $lat: single-outstanding=$single cyc, '
-        'multi-outstanding=$multi cyc (${(single / multi).toStringAsFixed(2)}x) ===\n',
-      );
-      expect(
-        multi,
-        lessThan(single),
-        reason: 'multi-outstanding should hide fetch latency in-core',
-      );
-    },
-    timeout: Timeout(Duration(seconds: 200)),
-  );
+  test('multi-outstanding fetch hides latency in-core', () async {
+    const lat = 4;
+    final single = await run(mk(), busLatency: lat); // prefetch over bus
+    final multi = await run(mk(fetchOutstanding: 5), fetchLatency: lat);
+    // ignore: avoid_print
+    print(
+      '\n=== in-core fetch latency $lat: single-outstanding=$single cyc, '
+      'multi-outstanding=$multi cyc (${(single / multi).toStringAsFixed(2)}x) ===\n',
+    );
+    expect(
+      multi,
+      lessThan(single),
+      reason: 'multi-outstanding should hide fetch latency in-core',
+    );
+  }, timeout: Timeout(Duration(seconds: 200)));
 }

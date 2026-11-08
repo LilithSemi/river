@@ -63,7 +63,8 @@ class WishboneMasterStub extends BridgeModule {
 class MmioTop extends BridgeModule {
   final BridgeModule dut;
 
-  MmioTop(this.dut, {String? name}) : super('MmioTop', name: name ?? 'mmio_top') {
+  MmioTop(this.dut, {String? name})
+    : super('MmioTop', name: name ?? 'mmio_top') {
     createPort('cyc_in', PortDirection.input);
     createPort('stb_in', PortDirection.input);
     createPort('we_in', PortDirection.input);
@@ -155,108 +156,21 @@ void main() {
   });
 
   group('RiverDfuStatus (hardware mode)', () {
-    test('STATUS/CONTROL/ENTRY/BYTES offsets map to the right fields', () async {
-      final dut = RiverDfuStatus(
-        baseAddress: 0,
-        busAddressWidth: _addrWidth,
-        busDataWidth: _dataWidth,
-      );
-      final top = MmioTop(dut);
-
-      final clk = SimpleClockGenerator(10).clk;
-      final reset = Logic(name: 'reset');
-      final imageReady = Logic(name: 'image_ready');
-      final entryAddr = Logic(name: 'entry_addr', width: _addrWidth);
-      final bytesWritten = Logic(name: 'bytes_written', width: 32);
-      final cyc = Logic(name: 'cyc');
-      final stb = Logic(name: 'stb');
-      final we = Logic(name: 'we');
-      final adr = Logic(name: 'adr', width: _addrWidth);
-      final datMosi = Logic(name: 'dat_mosi', width: _dataWidth);
-      final sel = Logic(name: 'sel', width: _dataWidth ~/ 8);
-
-      dut.input('clk').srcConnection! <= clk;
-      dut.input('reset').srcConnection! <= reset;
-      dut.input('image_ready').srcConnection! <= imageReady;
-      dut.input('entry_addr').srcConnection! <= entryAddr;
-      dut.input('bytes_written').srcConnection! <= bytesWritten;
-      top.input('cyc_in').srcConnection! <= cyc;
-      top.input('stb_in').srcConnection! <= stb;
-      top.input('we_in').srcConnection! <= we;
-      top.input('adr_in').srcConnection! <= adr;
-      top.input('dat_mosi_in').srcConnection! <= datMosi;
-      top.input('sel_in').srcConnection! <= sel;
-
-      await top.build();
-
-      reset.inject(1);
-      imageReady.inject(0);
-      entryAddr.inject(0x08000000);
-      bytesWritten.inject(0);
-      cyc.inject(0);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      datMosi.inject(0);
-      sel.inject(0);
-      Simulator.setMaxSimTime(2000000);
-      unawaited(Simulator.run());
-      await clk.nextPosedge;
-      await clk.nextPosedge;
-      reset.inject(0);
-      await clk.nextPosedge;
-
-      final wb = WbDriver(
-        top: top,
-        clk: clk,
-        cyc: cyc,
-        stb: stb,
-        we: we,
-        adr: adr,
-        datMosi: datMosi,
-        sel: sel,
-      );
-
-      // ENTRY (0x08) and BYTES (0x0C) pass the inputs straight through.
-      expect(await wb.read(0x08), equals(0x08000000));
-      expect(await wb.read(0x0C), equals(0));
-
-      // CONTROL (0x04): usb_enable read/write.
-      expect(await wb.read(0x04), equals(0));
-      await wb.write(0x04, 0x1);
-      expect(await wb.read(0x04), equals(0x1));
-      expect(dut.usbEnable.value.toBool(), isTrue);
-
-      // STATUS (0x00): sticky image_ready, bit0.
-      expect(await wb.read(0x00), equals(0));
-      imageReady.inject(1);
-      await clk.nextPosedge;
-      imageReady.inject(0);
-      await clk.nextPosedge;
-      expect(await wb.read(0x00), equals(1));
-
-      await Simulator.endSimulation();
-    });
-  });
-
-  group('RiverDfuSubsystemSw (software mode)', () {
     test(
-      'STATUS/CONTROL/RXDATA/BYTES offsets, W1P advance, usb_enable '
-      'readback and the cleared (W1C) bit',
+      'STATUS/CONTROL/ENTRY/BYTES offsets map to the right fields',
       () async {
-        final dut = RiverDfuSubsystemSw(baseAddress: 0);
+        final dut = RiverDfuStatus(
+          baseAddress: 0,
+          busAddressWidth: _addrWidth,
+          busDataWidth: _dataWidth,
+        );
         final top = MmioTop(dut);
 
-        final busClk = SimpleClockGenerator(23).clk;
-        final usbClk = SimpleClockGenerator(9).clk;
-        final busReset = Logic(name: 'bus_reset');
-        // usb_reset is released once (no real USB transfer ever runs):
-        // this checks the register plumbing. Held forever it would also
-        // hold RiverDfuSwSink's seen-usb-reset recovery active, which
-        // keeps the cleared sticky set the whole time.
-        final usbReset = Logic(name: 'usb_reset_hold');
-        final dp = Logic(name: 'usb_dp_wire');
-        final dm = Logic(name: 'usb_dm_wire');
+        final clk = SimpleClockGenerator(10).clk;
+        final reset = Logic(name: 'reset');
+        final imageReady = Logic(name: 'image_ready');
+        final entryAddr = Logic(name: 'entry_addr', width: _addrWidth);
+        final bytesWritten = Logic(name: 'bytes_written', width: 32);
         final cyc = Logic(name: 'cyc');
         final stb = Logic(name: 'stb');
         final we = Logic(name: 'we');
@@ -264,12 +178,11 @@ void main() {
         final datMosi = Logic(name: 'dat_mosi', width: _dataWidth);
         final sel = Logic(name: 'sel', width: _dataWidth ~/ 8);
 
-        dut.input('clk').srcConnection! <= busClk;
-        dut.input('reset').srcConnection! <= busReset;
-        dut.input('usb_clk').srcConnection! <= usbClk;
-        dut.input('usb_reset').srcConnection! <= usbReset;
-        dut.inOut('usb_dp') <= dp;
-        dut.inOut('usb_dm') <= dm;
+        dut.input('clk').srcConnection! <= clk;
+        dut.input('reset').srcConnection! <= reset;
+        dut.input('image_ready').srcConnection! <= imageReady;
+        dut.input('entry_addr').srcConnection! <= entryAddr;
+        dut.input('bytes_written').srcConnection! <= bytesWritten;
         top.input('cyc_in').srcConnection! <= cyc;
         top.input('stb_in').srcConnection! <= stb;
         top.input('we_in').srcConnection! <= we;
@@ -279,35 +192,26 @@ void main() {
 
         await top.build();
 
-        busReset.inject(1);
-        usbReset.inject(1);
-        dp.inject(1);
-        dm.inject(0);
+        reset.inject(1);
+        imageReady.inject(0);
+        entryAddr.inject(0x08000000);
+        bytesWritten.inject(0);
         cyc.inject(0);
         stb.inject(0);
         we.inject(0);
         adr.inject(0);
         datMosi.inject(0);
         sel.inject(0);
-        Simulator.setMaxSimTime(4000000);
+        Simulator.setMaxSimTime(2000000);
         unawaited(Simulator.run());
-        await usbClk.nextPosedge;
-        await busClk.nextPosedge;
-        await busClk.nextPosedge;
-        busReset.inject(0);
-        usbReset.inject(0);
-        // Let RiverDfuSwSink's seen-usb-reset recovery window finish
-        // settling before touching any register.
-        for (var i = 0; i < 20; i++) {
-          await usbClk.nextPosedge;
-        }
-        for (var i = 0; i < 20; i++) {
-          await busClk.nextPosedge;
-        }
+        await clk.nextPosedge;
+        await clk.nextPosedge;
+        reset.inject(0);
+        await clk.nextPosedge;
 
         final wb = WbDriver(
           top: top,
-          clk: busClk,
+          clk: clk,
           cyc: cyc,
           stb: stb,
           we: we,
@@ -316,34 +220,131 @@ void main() {
           sel: sel,
         );
 
-        // CONTROL (0x04): usb_enable reads back. advance/clear_ack do not.
-        expect(await wb.read(0x04), equals(0));
-        await wb.write(0x04, 0x1); // usb_enable=1
-        expect(await wb.read(0x04), equals(0x1));
-        await wb.write(0x04, 0x7); // usb_enable=1, advance=1, clear_ack=1
-        expect(
-          await wb.read(0x04),
-          equals(0x1),
-          reason: 'advance/clear_ack are W1P/W1C, never read back set',
-        );
-
-        // usb_pullup mirrors usb_enable (the core's own pullup output is
-        // a constant 1).
-        expect(dut.output('usb_pullup').value.toBool(), isTrue);
-
-        // RXDATA/BYTES (0x08/0x0C): idle with usb held in reset.
-        expect(await wb.read(0x08), equals(0));
+        // ENTRY (0x08) and BYTES (0x0C) pass the inputs straight through.
+        expect(await wb.read(0x08), equals(0x08000000));
         expect(await wb.read(0x0C), equals(0));
 
-        // STATUS (0x00) bit3: cleared starts low, and clear_ack on an
-        // already-clear bit is a harmless no-op.
-        expect(await wb.read(0x00) & 0x8, equals(0));
-        await wb.write(0x04, 0x5); // usb_enable=1, clear_ack=1
-        expect(await wb.read(0x00) & 0x8, equals(0));
+        // CONTROL (0x04): usb_enable read/write.
+        expect(await wb.read(0x04), equals(0));
+        await wb.write(0x04, 0x1);
+        expect(await wb.read(0x04), equals(0x1));
+        expect(dut.usbEnable.value.toBool(), isTrue);
+
+        // STATUS (0x00): sticky image_ready, bit0.
+        expect(await wb.read(0x00), equals(0));
+        imageReady.inject(1);
+        await clk.nextPosedge;
+        imageReady.inject(0);
+        await clk.nextPosedge;
+        expect(await wb.read(0x00), equals(1));
 
         await Simulator.endSimulation();
       },
     );
+  });
+
+  group('RiverDfuSubsystemSw (software mode)', () {
+    test('STATUS/CONTROL/RXDATA/BYTES offsets, W1P advance, usb_enable '
+        'readback and the cleared (W1C) bit', () async {
+      final dut = RiverDfuSubsystemSw(baseAddress: 0);
+      final top = MmioTop(dut);
+
+      final busClk = SimpleClockGenerator(23).clk;
+      final usbClk = SimpleClockGenerator(9).clk;
+      final busReset = Logic(name: 'bus_reset');
+      // usb_reset is released once (no real USB transfer ever runs):
+      // this checks the register plumbing. Held forever it would also
+      // hold RiverDfuSwSink's seen-usb-reset recovery active, which
+      // keeps the cleared sticky set the whole time.
+      final usbReset = Logic(name: 'usb_reset_hold');
+      final dp = Logic(name: 'usb_dp_wire');
+      final dm = Logic(name: 'usb_dm_wire');
+      final cyc = Logic(name: 'cyc');
+      final stb = Logic(name: 'stb');
+      final we = Logic(name: 'we');
+      final adr = Logic(name: 'adr', width: _addrWidth);
+      final datMosi = Logic(name: 'dat_mosi', width: _dataWidth);
+      final sel = Logic(name: 'sel', width: _dataWidth ~/ 8);
+
+      dut.input('clk').srcConnection! <= busClk;
+      dut.input('reset').srcConnection! <= busReset;
+      dut.input('usb_clk').srcConnection! <= usbClk;
+      dut.input('usb_reset').srcConnection! <= usbReset;
+      dut.inOut('usb_dp') <= dp;
+      dut.inOut('usb_dm') <= dm;
+      top.input('cyc_in').srcConnection! <= cyc;
+      top.input('stb_in').srcConnection! <= stb;
+      top.input('we_in').srcConnection! <= we;
+      top.input('adr_in').srcConnection! <= adr;
+      top.input('dat_mosi_in').srcConnection! <= datMosi;
+      top.input('sel_in').srcConnection! <= sel;
+
+      await top.build();
+
+      busReset.inject(1);
+      usbReset.inject(1);
+      dp.inject(1);
+      dm.inject(0);
+      cyc.inject(0);
+      stb.inject(0);
+      we.inject(0);
+      adr.inject(0);
+      datMosi.inject(0);
+      sel.inject(0);
+      Simulator.setMaxSimTime(4000000);
+      unawaited(Simulator.run());
+      await usbClk.nextPosedge;
+      await busClk.nextPosedge;
+      await busClk.nextPosedge;
+      busReset.inject(0);
+      usbReset.inject(0);
+      // Let RiverDfuSwSink's seen-usb-reset recovery window finish
+      // settling before touching any register.
+      for (var i = 0; i < 20; i++) {
+        await usbClk.nextPosedge;
+      }
+      for (var i = 0; i < 20; i++) {
+        await busClk.nextPosedge;
+      }
+
+      final wb = WbDriver(
+        top: top,
+        clk: busClk,
+        cyc: cyc,
+        stb: stb,
+        we: we,
+        adr: adr,
+        datMosi: datMosi,
+        sel: sel,
+      );
+
+      // CONTROL (0x04): usb_enable reads back. advance/clear_ack do not.
+      expect(await wb.read(0x04), equals(0));
+      await wb.write(0x04, 0x1); // usb_enable=1
+      expect(await wb.read(0x04), equals(0x1));
+      await wb.write(0x04, 0x7); // usb_enable=1, advance=1, clear_ack=1
+      expect(
+        await wb.read(0x04),
+        equals(0x1),
+        reason: 'advance/clear_ack are W1P/W1C, never read back set',
+      );
+
+      // usb_pullup mirrors usb_enable (the core's own pullup output is
+      // a constant 1).
+      expect(dut.output('usb_pullup').value.toBool(), isTrue);
+
+      // RXDATA/BYTES (0x08/0x0C): idle with usb held in reset.
+      expect(await wb.read(0x08), equals(0));
+      expect(await wb.read(0x0C), equals(0));
+
+      // STATUS (0x00) bit3: cleared starts low, and clear_ack on an
+      // already-clear bit is a harmless no-op.
+      expect(await wb.read(0x00) & 0x8, equals(0));
+      await wb.write(0x04, 0x5); // usb_enable=1, clear_ack=1
+      expect(await wb.read(0x00) & 0x8, equals(0));
+
+      await Simulator.endSimulation();
+    });
   });
 
   group('STATUS word bit layout', () {
@@ -479,19 +480,20 @@ Future<void> _runStatusBitLayoutScenario(int extraGap) async {
   // too, a real clear this time, not a reset. GETSTATUS then moves
   // dfuDNLOAD_SYNC on to dfuDNLOAD_IDLE (software mode is never
   // busy, so one poll is always enough).
-  await _controlWriteOneBlock(host, 1, _stdSetup(0x21, 1, 0, wLength: 1), [0x55]);
+  await _controlWriteOneBlock(host, 1, _stdSetup(0x21, 1, 0, wLength: 1), [
+    0x55,
+  ]);
   await _getStatus(host, 1);
 
   // The byte is now captured in the sink. Ack it over MMIO so the
   // device's sink is ready again before the end marker.
-  final afterByte = await _pollUntil(
-    wb,
-    busClk,
-    0x00,
-    (v) => v & 0x1 == 1,
-  );
+  final afterByte = await _pollUntil(wb, busClk, 0x00, (v) => v & 0x1 == 1);
   expect(afterByte & 0x1, equals(1), reason: 'rx_valid after DNLOAD');
-  expect(afterByte & 0x8, equals(8), reason: 'cleared after the fresh-download clear');
+  expect(
+    afterByte & 0x8,
+    equals(8),
+    reason: 'cleared after the fresh-download clear',
+  );
   expect(await wb.read(0x08), equals(0x55), reason: 'RXDATA');
   await wb.write(0x04, 0x2); // advance (bit1), no usb_enable
 
@@ -499,12 +501,7 @@ Future<void> _runStatusBitLayoutScenario(int extraGap) async {
   // sticky is never W1C'd here, so it is expected to still read 1.
   await _controlNoData(host, 1, _stdSetup(0x21, 1, 1));
 
-  final status = await _pollUntil(
-    wb,
-    busClk,
-    0x00,
-    (v) => v & 0x2 != 0,
-  );
+  final status = await _pollUntil(wb, busClk, 0x00, (v) => v & 0x2 != 0);
   expect(status & 0x1, equals(1), reason: 'bit0 rx_valid');
   expect(status & 0x2, equals(2), reason: 'bit1 dnload_done');
   expect(status & 0x4, equals(4), reason: 'bit2 configured');
@@ -715,8 +712,9 @@ class _UsbHost {
     driveDm.inject(0);
   }
 
-  Future<void> sendToken(int pid, int addr, int endp) =>
-      _driveSymbols(_usbEncode([_usbPidByte(pid), ..._usbTokenBytes(addr, endp)]));
+  Future<void> sendToken(int pid, int addr, int endp) => _driveSymbols(
+    _usbEncode([_usbPidByte(pid), ..._usbTokenBytes(addr, endp)]),
+  );
 
   Future<void> sendData(int pid, List<int> bytes) {
     final crc = _usbCrc16(bytes);
@@ -844,7 +842,8 @@ class _UsbHost {
     var offset = 0;
     var dataToggle = 1;
     while (offset < data.length) {
-      final end = offset +
+      final end =
+          offset +
           (data.length - offset > maxPacket ? maxPacket : data.length - offset);
       final chunk = data.sublist(offset, end);
       final pid = dataToggle == 1 ? 11 : 3;
@@ -1013,7 +1012,5 @@ Future<int> _pollUntil(
       await clk.nextPosedge;
     }
   }
-  throw StateError(
-    'poll timed out waiting on 0x${address.toRadixString(16)}',
-  );
+  throw StateError('poll timed out waiting on 0x${address.toRadixString(16)}');
 }

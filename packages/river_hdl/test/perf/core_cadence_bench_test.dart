@@ -171,94 +171,82 @@ void main() {
     await Simulator.reset();
   });
 
-  test(
-    'cadence: commit throughput on straight-line (bounded, no-X)',
-    () async {
-      final program = [
-        for (var i = 0; i < 24; i++) iimm((i & 0x3F) + 1, 0, 0x0, (i % 30) + 1),
-      ];
-      final (commits, _) = await runCore(program, cycles: 150);
-      final gaps = <int>[];
-      for (var i = 1; i < commits.length; i++) {
-        gaps.add(commits[i] - commits[i - 1]);
-      }
-      final steady = gaps.length > 6 ? gaps.sublist(3) : gaps;
-      final avg = steady.isEmpty
-          ? 0.0
-          : steady.reduce((a, b) => a + b) / steady.length;
-      // ignore: avoid_print
-      print(
-        '\n=== CADENCE: commits=${commits.length}/150 cyc, '
-        'steady commit period=${avg.toStringAsFixed(2)} '
-        '(slow advance ~3.0, fast advance ~1.0) ===\n',
-      );
-      expect(
-        commits.length,
-        greaterThan(20),
-        reason: 'must retire a steady stream (not wedge)',
-      );
-      // The LSQ-gated fast advance + independent stream should sustain ~1.0
-      // commit/cyc (the full front-end lift). Guard against cadence regressions.
-      expect(
-        avg,
-        lessThan(1.4),
-        reason: 'fast cadence should sustain ~1 commit/cyc (got $avg)',
-      );
-    },
-    timeout: Timeout(Duration(seconds: 120)),
-  );
+  test('cadence: commit throughput on straight-line (bounded, no-X)', () async {
+    final program = [
+      for (var i = 0; i < 24; i++) iimm((i & 0x3F) + 1, 0, 0x0, (i % 30) + 1),
+    ];
+    final (commits, _) = await runCore(program, cycles: 150);
+    final gaps = <int>[];
+    for (var i = 1; i < commits.length; i++) {
+      gaps.add(commits[i] - commits[i - 1]);
+    }
+    final steady = gaps.length > 6 ? gaps.sublist(3) : gaps;
+    final avg = steady.isEmpty
+        ? 0.0
+        : steady.reduce((a, b) => a + b) / steady.length;
+    // ignore: avoid_print
+    print(
+      '\n=== CADENCE: commits=${commits.length}/150 cyc, '
+      'steady commit period=${avg.toStringAsFixed(2)} '
+      '(slow advance ~3.0, fast advance ~1.0) ===\n',
+    );
+    expect(
+      commits.length,
+      greaterThan(20),
+      reason: 'must retire a steady stream (not wedge)',
+    );
+    // The LSQ-gated fast advance + independent stream should sustain ~1.0
+    // commit/cyc (the full front-end lift). Guard against cadence regressions.
+    expect(
+      avg,
+      lessThan(1.4),
+      reason: 'fast cadence should sustain ~1 commit/cyc (got $avg)',
+    );
+  }, timeout: Timeout(Duration(seconds: 120)));
 
   // x0 special-casing: a stream of canonical nops (addi x0,x0,0) must NOT
   // false-chain through x0. Without the x0-always-ready fix this serialises to
   // ~1.5 cyc/instr; with it, ~1.0. (Safe: the OoO path is integer-only.)
-  test(
-    'cadence: canonical nops do not false-chain through x0',
-    () async {
-      final program = [for (var i = 0; i < 40; i++) 0x00000013]; // addi x0,x0,0
-      final (commits, _) = await runCore(program, cycles: 120);
-      final gaps = <int>[];
-      for (var i = 1; i < commits.length; i++) {
-        gaps.add(commits[i] - commits[i - 1]);
-      }
-      final steady = gaps.length > 6 ? gaps.sublist(3) : gaps;
-      final avg = steady.isEmpty
-          ? 0.0
-          : steady.reduce((a, b) => a + b) / steady.length;
-      // ignore: avoid_print
-      print(
-        '\n=== NOP cadence: period=${avg.toStringAsFixed(2)} '
-        '(no x0 fix ~1.5, with x0 fix ~1.0) ===\n',
-      );
-      expect(
-        avg,
-        lessThan(1.4),
-        reason: 'nops must not false-chain through x0 (got $avg)',
-      );
-    },
-    timeout: Timeout(Duration(seconds: 120)),
-  );
+  test('cadence: canonical nops do not false-chain through x0', () async {
+    final program = [for (var i = 0; i < 40; i++) 0x00000013]; // addi x0,x0,0
+    final (commits, _) = await runCore(program, cycles: 120);
+    final gaps = <int>[];
+    for (var i = 1; i < commits.length; i++) {
+      gaps.add(commits[i] - commits[i - 1]);
+    }
+    final steady = gaps.length > 6 ? gaps.sublist(3) : gaps;
+    final avg = steady.isEmpty
+        ? 0.0
+        : steady.reduce((a, b) => a + b) / steady.length;
+    // ignore: avoid_print
+    print(
+      '\n=== NOP cadence: period=${avg.toStringAsFixed(2)} '
+      '(no x0 fix ~1.5, with x0 fix ~1.0) ===\n',
+    );
+    expect(
+      avg,
+      lessThan(1.4),
+      reason: 'nops must not false-chain through x0 (got $avg)',
+    );
+  }, timeout: Timeout(Duration(seconds: 120)));
 
   // THE LANDING TEST: a counted loop (backward-branch redirect) must execute
   // CORRECTLY at period 1. Loop 5 times to compute x1=5, store it to mem[0].
-  test(
-    'correctness: counted loop at period 1 -> mem[0]==5',
-    () async {
-      final program = [
-        iimm(0, 0, 0x0, 1), // addi x1,x0,0          @0
-        iimm(5, 0, 0x0, 2), // addi x2,x0,5          @4
-        iimm(1, 1, 0x0, 1), // addi x1,x1,1   (loop) @8
-        iimm(-1, 2, 0x0, 2), // addi x2,x2,-1        @12
-        btype(-8, 0, 2, 0x1), // bne x2,x0,@8        @16
-        stype(0, 1, 0, 0x2), // sw x1,0(x0)          @20
-      ];
-      final (commits, storage) = await runCore(program, cycles: 120);
-      final result = rd64(storage, 0);
-      // ignore: avoid_print
-      print(
-        '\n=== LOOP: commits=${commits.length}, mem[0]=$result (expect 5) ===\n',
-      );
-      expect(result, 5, reason: 'counted loop must compute x1=5 and store it');
-    },
-    timeout: Timeout(Duration(seconds: 120)),
-  );
+  test('correctness: counted loop at period 1 -> mem[0]==5', () async {
+    final program = [
+      iimm(0, 0, 0x0, 1), // addi x1,x0,0          @0
+      iimm(5, 0, 0x0, 2), // addi x2,x0,5          @4
+      iimm(1, 1, 0x0, 1), // addi x1,x1,1   (loop) @8
+      iimm(-1, 2, 0x0, 2), // addi x2,x2,-1        @12
+      btype(-8, 0, 2, 0x1), // bne x2,x0,@8        @16
+      stype(0, 1, 0, 0x2), // sw x1,0(x0)          @20
+    ];
+    final (commits, storage) = await runCore(program, cycles: 120);
+    final result = rd64(storage, 0);
+    // ignore: avoid_print
+    print(
+      '\n=== LOOP: commits=${commits.length}, mem[0]=$result (expect 5) ===\n',
+    );
+    expect(result, 5, reason: 'counted loop must compute x1=5 and store it');
+  }, timeout: Timeout(Duration(seconds: 120)));
 }

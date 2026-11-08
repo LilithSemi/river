@@ -60,28 +60,24 @@ void main() {
   const sBits = 0x40122; // SIE | SPIE | SPP | SUM
   const mBits = 0x1888; // MIE | MPIE | MPP=M
 
-  test(
-    'a mstatus write is visible through sstatus',
-    () async {
-      await Simulator.reset();
-      //   csrw mstatus,x11   x11 = SPP | SUM
-      //   csrr x5,sstatus    must show the same bits
-      final program = <int, int>{
-        0x00: 0x30059073, // csrw mstatus,x11
-        0x04: 0x100022f3, // csrr x5,sstatus
-        0x08: 0x00000013, // nop
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x5: 0x40100},
-        _rc1s(),
-        initRegisters: {Register.x11: 0x40100},
-        nextPc: 0x0c,
-        maxCycles: 30000,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 10)),
-  );
+  test('a mstatus write is visible through sstatus', () async {
+    await Simulator.reset();
+    //   csrw mstatus,x11   x11 = SPP | SUM
+    //   csrr x5,sstatus    must show the same bits
+    final program = <int, int>{
+      0x00: 0x30059073, // csrw mstatus,x11
+      0x04: 0x100022f3, // csrr x5,sstatus
+      0x08: 0x00000013, // nop
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x5: 0x40100},
+      _rc1s(),
+      initRegisters: {Register.x11: 0x40100},
+      nextPc: 0x0c,
+      maxCycles: 30000,
+    );
+  }, timeout: Timeout(Duration(minutes: 10)));
 
   test(
     'a sstatus write reaches mstatus and leaves MIE/MPIE/MPP alone',
@@ -110,44 +106,40 @@ void main() {
     timeout: Timeout(Duration(minutes: 10)),
   );
 
-  test(
-    'sret returns to the privilege mstatus.SPP names',
-    () async {
-      await Simulator.reset();
-      // M-mode sets up a return to S-mode through mstatus, which is how real
-      // firmware does it, then SRETs.
-      //   csrw mtvec,x13     x13 = 0xC0, the illegal-instruction handler
-      //   csrw sepc,x10      x10 = 0x40, the S entry
-      //   csrw mstatus,x11   x11 = SPP -> return to supervisor
-      //   sret
-      // 0x40 runs in S if SPP survived. csrr sepc is an S-level CSR, so in USER
-      // mode it traps and the core never reaches 0x4c.
-      final program = <int, int>{
-        0x00: 0x30569073, // csrw mtvec,x13
-        0x04: 0x14151073, // csrw sepc,x10
-        0x08: 0x30059073, // csrw mstatus,x11
-        0x0c: 0x10200073, // sret
-        0x40: 0x141023f3, // csrr x7,sepc
-        0x44: 0x05500413, // addi x8,x0,0x55
-        0x48: 0x00000013, // nop
-        0xC0: 0x06600493, // addi x9,x0,0x66   (only a fault gets here)
-        0xC4: 0x0000006F, // j .
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x7: 0x40, Register.x8: 0x55, Register.x9: 0},
-        _rc1s(),
-        initRegisters: {
-          Register.x13: 0xC0,
-          Register.x10: 0x40,
-          Register.x11: 0x100, // SPP = supervisor
-        },
-        nextPc: 0x4c,
-        maxCycles: 30000,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 10)),
-  );
+  test('sret returns to the privilege mstatus.SPP names', () async {
+    await Simulator.reset();
+    // M-mode sets up a return to S-mode through mstatus, which is how real
+    // firmware does it, then SRETs.
+    //   csrw mtvec,x13     x13 = 0xC0, the illegal-instruction handler
+    //   csrw sepc,x10      x10 = 0x40, the S entry
+    //   csrw mstatus,x11   x11 = SPP -> return to supervisor
+    //   sret
+    // 0x40 runs in S if SPP survived. csrr sepc is an S-level CSR, so in USER
+    // mode it traps and the core never reaches 0x4c.
+    final program = <int, int>{
+      0x00: 0x30569073, // csrw mtvec,x13
+      0x04: 0x14151073, // csrw sepc,x10
+      0x08: 0x30059073, // csrw mstatus,x11
+      0x0c: 0x10200073, // sret
+      0x40: 0x141023f3, // csrr x7,sepc
+      0x44: 0x05500413, // addi x8,x0,0x55
+      0x48: 0x00000013, // nop
+      0xC0: 0x06600493, // addi x9,x0,0x66   (only a fault gets here)
+      0xC4: 0x0000006F, // j .
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x7: 0x40, Register.x8: 0x55, Register.x9: 0},
+      _rc1s(),
+      initRegisters: {
+        Register.x13: 0xC0,
+        Register.x10: 0x40,
+        Register.x11: 0x100, // SPP = supervisor
+      },
+      nextPc: 0x4c,
+      maxCycles: 30000,
+    );
+  }, timeout: Timeout(Duration(minutes: 10)));
 
   test(
     'M-mode firmware can redirect a trap into S-mode through mstatus.SPP',
@@ -207,48 +199,44 @@ void main() {
     timeout: Timeout(Duration(minutes: 10)),
   );
 
-  test(
-    'a trap taken in S-mode pushes SPP/SPIE into mstatus',
-    () async {
-      await Simulator.reset();
-      // Delegate ecall-from-S (cause 9) to S, enter S, then ecall. M-mode sets
-      // SPP and SPIE, so the SRET leaves S-mode with SIE=1, SPIE=1, SPP=0
-      // (x7 = 0x22). The ecall then pushes: SIE<-0, SPIE<-old SIE=1, SPP<-1
-      // (x5 = 0x120). The two reads together show the push really happened.
-      //   csrw medeleg,x14   x14 = 1<<9
-      //   csrw stvec,x13     x13 = 0x80
-      //   csrw sepc,x10      x10 = 0x40
-      //   csrw mstatus,x11   x11 = SPP | SPIE
-      //   sret               -> S at 0x40
-      //   ecall              -> S at 0x80
-      //   csrr x5,sstatus    (mstatus is M-level, so S must not read it here)
-      final program = <int, int>{
-        0x00: 0x30271073, // csrw medeleg,x14
-        0x04: 0x30569073, // csrw mtvec,x13
-        0x08: 0x10569073, // csrw stvec,x13
-        0x0c: 0x14151073, // csrw sepc,x10
-        0x10: 0x30059073, // csrw mstatus,x11
-        0x14: 0x10200073, // sret
-        0x40: 0x100023f3, // csrr x7,sstatus
-        0x44: 0x00000073, // ecall
-        0x48: 0x00000013, // nop
-        0x80: 0x100022f3, // csrr x5,sstatus
-        0x84: 0x00000013, // nop
-      };
-      await coreTest(
-        _memString(program),
-        {Register.x7: 0x22, Register.x5: 0x120},
-        _rc1s(),
-        initRegisters: {
-          Register.x14: 1 << 9,
-          Register.x13: 0x80,
-          Register.x10: 0x40,
-          Register.x11: 0x120, // SPP | SPIE
-        },
-        nextPc: 0x88,
-        maxCycles: 30000,
-      );
-    },
-    timeout: Timeout(Duration(minutes: 10)),
-  );
+  test('a trap taken in S-mode pushes SPP/SPIE into mstatus', () async {
+    await Simulator.reset();
+    // Delegate ecall-from-S (cause 9) to S, enter S, then ecall. M-mode sets
+    // SPP and SPIE, so the SRET leaves S-mode with SIE=1, SPIE=1, SPP=0
+    // (x7 = 0x22). The ecall then pushes: SIE<-0, SPIE<-old SIE=1, SPP<-1
+    // (x5 = 0x120). The two reads together show the push really happened.
+    //   csrw medeleg,x14   x14 = 1<<9
+    //   csrw stvec,x13     x13 = 0x80
+    //   csrw sepc,x10      x10 = 0x40
+    //   csrw mstatus,x11   x11 = SPP | SPIE
+    //   sret               -> S at 0x40
+    //   ecall              -> S at 0x80
+    //   csrr x5,sstatus    (mstatus is M-level, so S must not read it here)
+    final program = <int, int>{
+      0x00: 0x30271073, // csrw medeleg,x14
+      0x04: 0x30569073, // csrw mtvec,x13
+      0x08: 0x10569073, // csrw stvec,x13
+      0x0c: 0x14151073, // csrw sepc,x10
+      0x10: 0x30059073, // csrw mstatus,x11
+      0x14: 0x10200073, // sret
+      0x40: 0x100023f3, // csrr x7,sstatus
+      0x44: 0x00000073, // ecall
+      0x48: 0x00000013, // nop
+      0x80: 0x100022f3, // csrr x5,sstatus
+      0x84: 0x00000013, // nop
+    };
+    await coreTest(
+      _memString(program),
+      {Register.x7: 0x22, Register.x5: 0x120},
+      _rc1s(),
+      initRegisters: {
+        Register.x14: 1 << 9,
+        Register.x13: 0x80,
+        Register.x10: 0x40,
+        Register.x11: 0x120, // SPP | SPIE
+      },
+      nextPc: 0x88,
+      maxCycles: 30000,
+    );
+  }, timeout: Timeout(Duration(minutes: 10)));
 }

@@ -52,30 +52,34 @@ void main() {
     });
 
     test('Dram.create with no train option builds a plain array', () {
-      final d = Dram.create(
-        const RiverDevice(
-          name: 'dram',
-          compatible: 'river,dram',
-          range: BusAddressRange(0x80000000, arraySize),
-        ),
-        const {},
-        RiverSoC(const RiverSoCConfig()),
-      ) as Dram;
+      final d =
+          Dram.create(
+                const RiverDevice(
+                  name: 'dram',
+                  compatible: 'river,dram',
+                  range: BusAddressRange(0x80000000, arraySize),
+                ),
+                const {},
+                RiverSoC(const RiverSoCConfig()),
+              )
+              as Dram;
       expect(d.trainable, isFalse);
     });
   });
 
   group('train=runtime', () {
     test('Dram.create with train=runtime builds the wb2 window', () {
-      final d = Dram.create(
-        const RiverDevice(
-          name: 'dram',
-          compatible: 'river,dram',
-          range: BusAddressRange(0x80000000, arraySize + ctrlSize),
-        ),
-        const {'train': 'runtime'},
-        RiverSoC(const RiverSoCConfig()),
-      ) as Dram;
+      final d =
+          Dram.create(
+                const RiverDevice(
+                  name: 'dram',
+                  compatible: 'river,dram',
+                  range: BusAddressRange(0x80000000, arraySize + ctrlSize),
+                ),
+                const {'train': 'runtime'},
+                RiverSoC(const RiverSoCConfig()),
+              )
+              as Dram;
       expect(d.trainable, isTrue);
     });
 

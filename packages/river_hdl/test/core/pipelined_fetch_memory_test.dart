@@ -115,26 +115,22 @@ void main() {
   final seq = [for (var i = 0; i < 16; i++) (0x00000013 | ((i + 1) << 20))];
 
   for (final readLatency in [1, 2]) {
-    test(
-      'real mem: in-order stream at readLatency $readLatency',
-      () async {
-        final (got, _) = await runRealMem(
-          seq,
-          count: 12,
-          readLatency: readLatency,
-          maxOutstanding: readLatency + 1,
-          depth: 1 << (readLatency + 2).bitLength,
-        );
-        expect(got.length, 12);
-        for (var i = 0; i < 12; i++) {
-          expect(got[i], (
-            i * 4,
-            seq[i],
-          ), reason: 'instr $i at readLatency $readLatency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40)),
-    );
+    test('real mem: in-order stream at readLatency $readLatency', () async {
+      final (got, _) = await runRealMem(
+        seq,
+        count: 12,
+        readLatency: readLatency,
+        maxOutstanding: readLatency + 1,
+        depth: 1 << (readLatency + 2).bitLength,
+      );
+      expect(got.length, 12);
+      for (var i = 0; i < 12; i++) {
+        expect(got[i], (
+          i * 4,
+          seq[i],
+        ), reason: 'instr $i at readLatency $readLatency');
+      }
+    }, timeout: Timeout(Duration(seconds: 40)));
   }
 
   // ROM init: contents loaded at reset (no write-port boot), the path the core

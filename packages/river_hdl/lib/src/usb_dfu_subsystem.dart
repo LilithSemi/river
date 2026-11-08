@@ -362,8 +362,9 @@ class RiverDfuSwSink extends BridgeModule {
     // cycle, and resetting this the instant the raw signals clear would
     // drop it a few cycles before busRecovering (and the `cleared` check
     // below) are actually done with it.
-    final recoveryActive = (busRecovering | busReset | usbResetSeenBus)
-        .named('recovery_active');
+    final recoveryActive = (busRecovering | busReset | usbResetSeenBus).named(
+      'recovery_active',
+    );
     final recoveryJointWithBusReset = Logic(
       name: 'recovery_joint_with_bus_reset_q',
     );
@@ -390,10 +391,8 @@ class RiverDfuSwSink extends BridgeModule {
     busRecoveringUsbSync.input('dst_clk').srcConnection! <= usbClk;
     busRecoveringUsbSync.input('dst_reset').srcConnection! <= usbReset;
     final busRecoveringSeenUsb = busRecoveringUsbSync.output('sync_out');
-    final sinkReady =
-        (producerToggle.eq(consumerInUsb) & ~busRecoveringSeenUsb).named(
-          'sw_sink_ready',
-        );
+    final sinkReady = (producerToggle.eq(consumerInUsb) & ~busRecoveringSeenUsb)
+        .named('sw_sink_ready');
 
     // clear: a fresh image or CLRSTATUS/ABORT. Crossed the same way as a
     // byte. The bus domain drops whatever it was holding and forces
@@ -542,10 +541,7 @@ class RiverDfuSwSink extends BridgeModule {
               dnloadDoneSticky < Const(0),
               prodSeen < producerInBus,
               consumerToggle < producerInBus,
-              If(
-                ~recoveryJointWithBusReset,
-                then: [clearedSticky < Const(1)],
-              ),
+              If(~recoveryJointWithBusReset, then: [clearedSticky < Const(1)]),
             ],
             orElse: [
               If(
@@ -811,7 +807,8 @@ class RiverDfuSubsystemSw extends BridgeModule
     // configured: a 1-bit level, so a plain double-flop sync cannot tear.
     final configuredSync = HarborCdcSync(name: 'configured_sync');
     addSubModule(configuredSync);
-    configuredSync.input('async_in').srcConnection! <= core.output('configured');
+    configuredSync.input('async_in').srcConnection! <=
+        core.output('configured');
     configuredSync.input('dst_clk').srcConnection! <= busClk;
     configuredSync.input('dst_reset').srcConnection! <= busReset;
     final configured = configuredSync.output('sync_out');
@@ -823,7 +820,10 @@ class RiverDfuSubsystemSw extends BridgeModule
     // raw, so it can keep moving the instant the next transfer is
     // accepted. Latch it into a bus-domain register on dst_valid instead
     // of reading it combinationally.
-    final dfuStateXing = HarborCdcHandshake(dataWidth: 4, name: 'dfu_state_xing');
+    final dfuStateXing = HarborCdcHandshake(
+      dataWidth: 4,
+      name: 'dfu_state_xing',
+    );
     addSubModule(dfuStateXing);
     dfuStateXing.input('src_clk').srcConnection! <= usbClk;
     dfuStateXing.input('src_reset').srcConnection! <= usbReset;

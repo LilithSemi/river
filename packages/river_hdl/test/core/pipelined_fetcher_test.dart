@@ -115,23 +115,19 @@ void main() {
   // Correctness: each instruction delivered with its PC, in order, across
   // latencies and outstanding depths.
   for (final latency in [0, 1, 2, 4, 8]) {
-    test(
-      'pipelined fetch: in-order stream at latency $latency',
-      () async {
-        final (got, _) = await runPipelined(
-          mem,
-          count: 12,
-          latency: latency,
-          maxOutstanding: 4,
-          depth: 8,
-        );
-        expect(got.length, 12);
-        for (var i = 0; i < 12; i++) {
-          expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
-        }
-      },
-      timeout: Timeout(Duration(seconds: 40 + latency * 2)),
-    );
+    test('pipelined fetch: in-order stream at latency $latency', () async {
+      final (got, _) = await runPipelined(
+        mem,
+        count: 12,
+        latency: latency,
+        maxOutstanding: 4,
+        depth: 8,
+      );
+      expect(got.length, 12);
+      for (var i = 0; i < 12; i++) {
+        expect(got[i], (i * 4, seq[i]), reason: 'instr $i lat $latency');
+      }
+    }, timeout: Timeout(Duration(seconds: 40 + latency * 2)));
   }
 
   // The point of the whole exercise: with enough outstanding reads, a multi-
@@ -183,48 +179,44 @@ void main() {
   // Quantify the fetchOutstanding knob: same engine, same pipelined memory, only
   // maxOutstanding changes. At a fetch latency L, outstanding=1 needs ~N*(L+1)
   // cycles (the FIFO drains between reads) while outstanding=L hides it to ~N+L.
-  test(
-    'benchmark: fetchOutstanding hides fetch latency',
-    () async {
-      const count = 16;
-      final rows = <String>[];
-      for (final latency in [1, 2, 4, 8]) {
-        final (g1, c1) = await runPipelined(
-          mem,
-          count: count,
-          latency: latency,
-          maxOutstanding: 1,
-          depth: 2,
-        );
-        final (gN, cN) = await runPipelined(
-          mem,
-          count: count,
-          latency: latency,
-          maxOutstanding: latency,
-          depth: 1 << (latency + 1).bitLength,
-        );
-        expect(g1.length, count);
-        expect(gN.length, count);
-        final speedup = (c1 / cN).toStringAsFixed(2);
-        rows.add(
-          'latency=$latency: outstanding=1 -> $c1 cyc,  '
-          'outstanding=$latency -> $cN cyc  (${speedup}x)',
-        );
-        // The knob must help (more so as latency grows) and never hurt.
-        expect(
-          cN,
-          lessThanOrEqualTo(c1),
-          reason: 'multi-outstanding slower at latency $latency',
-        );
-      }
-      // ignore: avoid_print
-      print(
-        '\n=== fetch throughput vs fetchOutstanding (16 instrs) ===\n'
-        '${rows.join('\n')}\n',
+  test('benchmark: fetchOutstanding hides fetch latency', () async {
+    const count = 16;
+    final rows = <String>[];
+    for (final latency in [1, 2, 4, 8]) {
+      final (g1, c1) = await runPipelined(
+        mem,
+        count: count,
+        latency: latency,
+        maxOutstanding: 1,
+        depth: 2,
       );
-    },
-    timeout: Timeout(Duration(seconds: 90)),
-  );
+      final (gN, cN) = await runPipelined(
+        mem,
+        count: count,
+        latency: latency,
+        maxOutstanding: latency,
+        depth: 1 << (latency + 1).bitLength,
+      );
+      expect(g1.length, count);
+      expect(gN.length, count);
+      final speedup = (c1 / cN).toStringAsFixed(2);
+      rows.add(
+        'latency=$latency: outstanding=1 -> $c1 cyc,  '
+        'outstanding=$latency -> $cN cyc  (${speedup}x)',
+      );
+      // The knob must help (more so as latency grows) and never hurt.
+      expect(
+        cN,
+        lessThanOrEqualTo(c1),
+        reason: 'multi-outstanding slower at latency $latency',
+      );
+    }
+    // ignore: avoid_print
+    print(
+      '\n=== fetch throughput vs fetchOutstanding (16 instrs) ===\n'
+      '${rows.join('\n')}\n',
+    );
+  }, timeout: Timeout(Duration(seconds: 90)));
 
   // Redirect mid-stream: flush + drain the in-flight (now stale) responses, then
   // deliver the resteered stream. The hard case for multi-outstanding (several

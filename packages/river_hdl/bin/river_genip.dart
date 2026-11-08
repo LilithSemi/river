@@ -35,7 +35,8 @@ Future<void> main(List<String> arguments) async {
     )
     ..addOption(
       'osc-freq',
-      help: 'External oscillator frequency (Hz). Defaults to the --board '
+      help:
+          'External oscillator frequency (Hz). Defaults to the --board '
           'figure, or 12 MHz when no board is given.',
     )
     ..addMultiOption(
